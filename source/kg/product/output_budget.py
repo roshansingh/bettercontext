@@ -2704,7 +2704,7 @@ def _compact_source_check(row: JsonObject) -> JsonObject:
 
 
 def _compact_coordinate(row: JsonObject) -> JsonObject:
-    keys = ("repo", "path", "line_start", "line_end")
+    keys = ("lead_id", "lead_kind", "repo", "path", "line_start", "line_end")
     return {key: row[key] for key in keys if key in row}
 
 
