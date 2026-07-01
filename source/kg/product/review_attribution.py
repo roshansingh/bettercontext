@@ -13,6 +13,15 @@ LEAD_LIST_KINDS = {
     "source_coordinates": "source_coordinate",
 }
 
+# Mapping from lead list field name to its singular _count key in available/returned dicts.
+LEAD_COUNT_KEYS = {
+    "changed_symbols": "changed_symbol_count",
+    "direct_callers": "direct_caller_count",
+    "direct_callees": "direct_callee_count",
+    "transitive_callers": "transitive_caller_count",
+    "source_coordinates": "source_coordinate_count",
+}
+
 
 def review_stable_id(prefix: str, row: JsonObject, *, fallback_kind: str) -> str:
     existing = row.get(f"{prefix}_id")
@@ -70,9 +79,9 @@ def add_review_lead_ids(leads: JsonObject) -> JsonObject:
 def review_lead_counts(leads: JsonObject) -> JsonObject:
     """Count rows actually present in a review_leads dict (returned counts)."""
     counts: JsonObject = {}
-    for field, kind in LEAD_LIST_KINDS.items():
+    for field in LEAD_LIST_KINDS:
         value = leads.get(field)
-        counts[field] = len(value) if isinstance(value, list) else 0
+        counts[LEAD_COUNT_KEYS[field]] = len(value) if isinstance(value, list) else 0
     return counts
 
 
@@ -86,9 +95,9 @@ def review_available_counts(
 ) -> JsonObject:
     """Capture unbounded available counts before any section limit is applied."""
     return {
-        "changed_symbols": len(changed_symbols),
-        "direct_callers": len(direct_callers),
-        "direct_callees": len(direct_callees),
-        "transitive_callers": len(transitive_callers),
-        "source_coordinates": len(source_coordinates),
+        "changed_symbol_count": len(changed_symbols),
+        "direct_caller_count": len(direct_callers),
+        "direct_callee_count": len(direct_callees),
+        "transitive_caller_count": len(transitive_callers),
+        "source_coordinate_count": len(source_coordinates),
     }
