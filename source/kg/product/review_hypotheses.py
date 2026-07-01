@@ -7,6 +7,9 @@ _TEST_PATH_SEGMENTS = frozenset({"test", "tests", "spec", "specs", "__tests__"})
 _CONFIG_EXTENSIONS = frozenset({".json", ".yaml", ".yml", ".toml", ".ini", ".env"})
 _CONFIG_BASENAMES = frozenset({"Dockerfile"})
 _STYLESHEET_EXTENSIONS = frozenset({".css", ".scss", ".sass", ".less"})
+_CONFIDENCE_RANK = {"strong": 2, "medium": 1, "weak": 0}
+_FRAMEWORK_IMPACT_KEYS = ("changed_models", "model_fields", "model_relations", "serializers", "views", "tasks")
+_RUNTIME_SURFACE_KEYS = ("endpoints", "endpoint_consumers", "event_channels", "deploy_mappings")
 
 
 def review_hypotheses_for_context(
@@ -23,12 +26,18 @@ def review_hypotheses_for_context(
     review_lead_status: JsonObject,
 ) -> list[JsonObject]:
     low_coverage = review_lead_status.get("coverage_status") == "low_coverage"
+    has_surface_signal = bool(
+        _has_framework_signal(framework_impact)
+        or _has_runtime_signal(runtime_surfaces)
+        or _has_application_signal(application_impact)
+    )
     hypotheses: list[JsonObject] = []
     h = _direct_call_contract_drift(
         changed_symbols=changed_symbols,
         direct_callers=direct_callers,
         direct_callees=direct_callees,
         review_leads=review_leads,
+        has_surface_signal=has_surface_signal,
     )
     if h:
         hypotheses.append(h)
@@ -57,12 +66,38 @@ def review_hypotheses_for_context(
     )
     if h:
         hypotheses.append(h)
+    hypotheses.sort(
+        key=lambda row: (
+            -len(row.get("supporting_lead_ids") or []),
+            -len(row.get("evidence_refs") or []),
+            -_CONFIDENCE_RANK.get(str(row.get("confidence")), 0),
+            str(row.get("risk_type") or ""),
+        )
+    )
     return hypotheses
+
+
+def _has_framework_signal(framework_impact: JsonObject) -> bool:
+    return any(framework_impact.get(key) for key in _FRAMEWORK_IMPACT_KEYS)
+
+
+def _has_runtime_signal(runtime_surfaces: dict[str, list[JsonObject]]) -> bool:
+    return any(runtime_surfaces.get(key) for key in _RUNTIME_SURFACE_KEYS)
+
+
+def _has_application_signal(application_impact: JsonObject) -> bool:
+    same_repo_surfaces = application_impact.get("same_repo_surfaces")
+    runtime_facts = application_impact.get("runtime_facts")
+    return bool(
+        (isinstance(same_repo_surfaces, dict) and any(same_repo_surfaces.values()))
+        or (isinstance(runtime_facts, list) and runtime_facts)
+    )
 
 
 def _make_hypothesis(
     risk_type: str,
     confidence: str,
+    why: str,
     evidence_refs: list[JsonObject],
     source_checks: list[str],
     supporting_lead_ids: list[str],
@@ -70,6 +105,7 @@ def _make_hypothesis(
     row: JsonObject = {
         "risk_type": risk_type,
         "confidence": confidence,
+        "why": why,
         "evidence_refs": evidence_refs,
         "source_checks": source_checks,
         "supporting_lead_ids": supporting_lead_ids,
@@ -126,6 +162,7 @@ def _direct_call_contract_drift(
     direct_callers: list[JsonObject],
     direct_callees: list[JsonObject],
     review_leads: JsonObject,
+    has_surface_signal: bool,
 ) -> JsonObject | None:
     if not changed_symbols:
         return None
@@ -135,7 +172,7 @@ def _direct_call_contract_drift(
     lead_ids = _lead_ids_for_fields(review_leads, lead_fields)
     if not lead_ids:
         return None
-    confidence = "strong" if (direct_callers and direct_callees) else "medium"
+    confidence = "strong" if ((direct_callers or direct_callees) and has_surface_signal) else "medium"
     evidence_refs = _evidence_refs_from_leads(review_leads, ("direct_callers", "direct_callees"))
     source_checks = [
         "Verify callers still satisfy the changed symbol's pre/post-conditions.",
@@ -144,6 +181,7 @@ def _direct_call_contract_drift(
     return _make_hypothesis(
         risk_type="direct_call_contract_drift",
         confidence=confidence,
+        why="Changed symbols have direct callers or callees whose call contracts can drift with this change.",
         evidence_refs=evidence_refs,
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
@@ -155,12 +193,10 @@ def _framework_contract_drift(
     framework_impact: JsonObject,
     review_leads: JsonObject,
 ) -> JsonObject | None:
-    framework_keys = ("changed_models", "model_fields", "model_relations", "serializers", "views", "tasks")
-    has_framework = any(framework_impact.get(k) for k in framework_keys)
-    if not has_framework:
+    if not _has_framework_signal(framework_impact):
         return None
     evidence_refs: list[JsonObject] = []
-    for key in framework_keys:
+    for key in _FRAMEWORK_IMPACT_KEYS:
         rows = framework_impact.get(key)
         if isinstance(rows, list):
             for row in rows[:3]:
@@ -177,10 +213,11 @@ def _framework_contract_drift(
         "Inspect framework-generated schema migrations and serializer output for drift.",
         "Verify view/task handlers still align with updated model contracts.",
     ]
-    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "direct_callers", "direct_callees"))
+    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="framework_contract_drift",
         confidence="medium",
+        why="Framework-declared models, serializers, views, or tasks are affected by the changed code.",
         evidence_refs=evidence_refs[:5],
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
@@ -192,12 +229,10 @@ def _runtime_endpoint_or_event_contract_drift(
     runtime_surfaces: dict[str, list[JsonObject]],
     review_leads: JsonObject,
 ) -> JsonObject | None:
-    runtime_keys = ("endpoints", "endpoint_consumers", "event_channels", "deploy_mappings")
-    has_runtime = any(runtime_surfaces.get(k) for k in runtime_keys)
-    if not has_runtime:
+    if not _has_runtime_signal(runtime_surfaces):
         return None
     evidence_refs: list[JsonObject] = []
-    for key in runtime_keys:
+    for key in _RUNTIME_SURFACE_KEYS:
         rows = runtime_surfaces.get(key) or []
         for row in rows[:2]:
             if isinstance(row, dict):
@@ -213,10 +248,11 @@ def _runtime_endpoint_or_event_contract_drift(
         "Verify endpoint request/response contracts match caller expectations.",
         "Check event channel producers and consumers for schema compatibility.",
     ]
-    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "direct_callers", "direct_callees"))
+    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="runtime_endpoint_or_event_contract_drift",
         confidence="medium",
+        why="The changed repo exposes runtime endpoints, event channels, or deploy mappings that can carry the change to other services.",
         evidence_refs=evidence_refs[:5],
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
@@ -228,14 +264,10 @@ def _application_surface_contract_drift(
     application_impact: JsonObject,
     review_leads: JsonObject,
 ) -> JsonObject | None:
+    if not _has_application_signal(application_impact):
+        return None
     same_repo_surfaces = application_impact.get("same_repo_surfaces")
     runtime_facts = application_impact.get("runtime_facts")
-    has_application = bool(
-        (isinstance(same_repo_surfaces, dict) and any(same_repo_surfaces.values()))
-        or (isinstance(runtime_facts, list) and runtime_facts)
-    )
-    if not has_application:
-        return None
     evidence_refs: list[JsonObject] = []
     if isinstance(same_repo_surfaces, dict):
         for surface_key, rows in same_repo_surfaces.items():
@@ -263,10 +295,11 @@ def _application_surface_contract_drift(
         "Inspect same-repo application surfaces (APIs, models, workers) for exposure drift.",
         "Check runtime facts for contract assumptions that changed symbols may violate.",
     ]
-    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "direct_callers", "direct_callees"))
+    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="application_surface_contract_drift",
         confidence="medium",
+        why="Same-repo application surfaces or runtime facts overlap the changed code and can shift application-level contracts.",
         evidence_refs=evidence_refs[:5],
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
@@ -319,10 +352,11 @@ def _test_or_config_masks_runtime_change(
         "Verify test or config changes do not mask a runtime behavioral change.",
         "Check whether changed config values alter runtime contracts.",
     ]
-    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "direct_callers", "direct_callees"))
+    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="test_or_config_masks_runtime_change",
-        confidence="medium",
+        confidence="weak",
+        why="Test or config files changed alongside code leads; a runtime behavioral change may be masked by test or config edits.",
         evidence_refs=evidence_refs,
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
@@ -345,11 +379,11 @@ def _low_coverage_stylesheet_gap(
         "Inspect stylesheet changes manually; KG has limited coverage of CSS/styling contracts.",
     ]
     lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "source_coordinates"))
-    supporting = lead_ids[:10] if lead_ids else [f"stylesheet:{f}" for f in stylesheet_files[:3]]
     return _make_hypothesis(
         risk_type="low_coverage_stylesheet_gap",
-        confidence="medium",
+        confidence="weak",
+        why="Stylesheet files changed but the KG has low coverage of styling contracts, so impact must be inspected manually.",
         evidence_refs=evidence_refs,
         source_checks=source_checks,
-        supporting_lead_ids=supporting,
+        supporting_lead_ids=lead_ids[:10],
     )

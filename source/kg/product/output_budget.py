@@ -2728,7 +2728,7 @@ def _compact_coordinate(row: JsonObject) -> JsonObject:
 
 def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
     compact: JsonObject = {}
-    for key in ("hypothesis_id", "risk_type", "confidence"):
+    for key in ("hypothesis_id", "risk_type", "confidence", "why"):
         if key in row:
             compact[key] = row[key]
     evidence_refs = row.get("evidence_refs")
