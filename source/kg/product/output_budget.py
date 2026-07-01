@@ -128,6 +128,8 @@ _REVIEW_BUDGET_BACKFILL_LIST_PATHS: tuple[tuple[str, ...], ...] = (
     ("review_answer_packet", "top_direct_callers"),
     ("review_answer_packet", "top_direct_callees"),
     ("review_answer_packet", "top_transitive_callers"),
+    ("review_hypotheses",),
+    ("review_answer_packet", "top_review_hypotheses"),
 )
 _PLANNING_BUDGET_ADVICE = (
     "Use runtime_architecture.answer_packet.investigation_brief as the source-inspection head start, then use narrower "
@@ -574,6 +576,11 @@ def _compact_review_detail(result: JsonObject, *, limit: int) -> tuple[JsonObjec
         kept_evidence = evidence[:limit]
         _record_truncated(truncated_sections, "evidence", original=len(evidence), kept=len(kept_evidence))
         compact["evidence"] = kept_evidence
+    review_hypotheses = result.get("review_hypotheses")
+    if isinstance(review_hypotheses, list):
+        kept_hypotheses = [_compact_review_hypothesis(row) for row in review_hypotheses[:limit] if isinstance(row, dict)]
+        _record_truncated(truncated_sections, "review_hypotheses", original=len(review_hypotheses), kept=len(kept_hypotheses))
+        compact["review_hypotheses"] = kept_hypotheses
     answer_packet = result.get("review_answer_packet")
     if isinstance(answer_packet, dict):
         compact["review_answer_packet"] = _compact_review_answer_packet(
@@ -1214,6 +1221,17 @@ def _compact_review_answer_packet(
             if truncated_sections is not None:
                 _record_truncated(truncated_sections, f"review_answer_packet.{field}", original=len(rows), kept=len(kept))
             compact[field] = kept
+    top_hypotheses = value.get("top_review_hypotheses")
+    if isinstance(top_hypotheses, list):
+        kept_hypotheses = [_compact_review_hypothesis(row) for row in top_hypotheses[:limit] if isinstance(row, dict)]
+        if truncated_sections is not None:
+            _record_truncated(
+                truncated_sections,
+                "review_answer_packet.top_review_hypotheses",
+                original=len(top_hypotheses),
+                kept=len(kept_hypotheses),
+            )
+        compact["top_review_hypotheses"] = kept_hypotheses
     for field in ("runtime", "framework", "application", "runtime_surfaces", "framework_impact", "application_impact"):
         nested = value.get(field)
         if isinstance(nested, dict):
@@ -2706,6 +2724,23 @@ def _compact_source_check(row: JsonObject) -> JsonObject:
 def _compact_coordinate(row: JsonObject) -> JsonObject:
     keys = ("lead_id", "lead_kind", "repo", "path", "line_start", "line_end")
     return {key: row[key] for key in keys if key in row}
+
+
+def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
+    compact: JsonObject = {}
+    for key in ("hypothesis_id", "risk_type", "confidence"):
+        if key in row:
+            compact[key] = row[key]
+    evidence_refs = row.get("evidence_refs")
+    if isinstance(evidence_refs, list):
+        compact["evidence_refs"] = evidence_refs[:3]
+    source_checks = row.get("source_checks")
+    if isinstance(source_checks, list):
+        compact["source_checks"] = source_checks[:2]
+    supporting_lead_ids = row.get("supporting_lead_ids")
+    if isinstance(supporting_lead_ids, list):
+        compact["supporting_lead_ids"] = supporting_lead_ids[:5]
+    return compact
 
 
 def _compact_diff_anchor(value: object) -> JsonObject:

@@ -25,6 +25,7 @@ from source.kg.product.review_attribution import (
     review_available_counts,
     review_lead_counts,
 )
+from source.kg.product.review_hypotheses import review_hypotheses_for_context
 from source.kg.product.runtime_architecture import ENDPOINT_PATH_SHAPE_MATCH_BASIS, runtime_architecture_packet
 from source.kg.query.call_site import call_site_from_qualifier
 from source.kg.query.snapshot import KgSnapshot
@@ -2939,6 +2940,19 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     )
     review_answer_packet["repo_resolution"] = repo_resolution
     review_answer_packet["review_lead_status"] = review_lead_packet["review_lead_status"]
+    review_hypotheses = review_hypotheses_for_context(
+        changed_files=changed_files,
+        changed_symbols=changed_symbols_in_scope,
+        direct_callers=direct_callers_in_scope,
+        direct_callees=direct_callees_in_scope,
+        transitive_callers=transitive_callers_in_scope,
+        framework_impact=framework_impact,
+        application_impact=application_impact,
+        runtime_surfaces=runtime_surfaces,
+        review_leads=review_lead_packet["review_leads"],
+        review_lead_status=review_lead_packet["review_lead_status"],
+    )
+    review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     result = {
         "status": status,
         "repo": repo,
@@ -3000,6 +3014,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
             framework_impact.get("tasks", []),
             application_impact.get("runtime_facts", []),
         ),
+        "review_hypotheses": review_hypotheses,
         "next_actions": next_actions,
     }
     if _review_context_should_compact_unanchored(
@@ -3175,6 +3190,7 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
         },
         "repo_dependencies": repo_dependencies,
         "source_coordinates": stamped_source_coordinates,
+        "review_hypotheses": [],
         "answerability": answerability,
         "coverage_warnings": result.get("coverage_warnings", []),
         "unsupported_scopes": result.get("unsupported_scopes", []),

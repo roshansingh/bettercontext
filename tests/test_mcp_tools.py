@@ -5260,6 +5260,44 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(handler.sys_version, "")
         self.assertEqual(handler.version_string(fake_handler), "supercontext-local/0.1.0")
 
+    def test_review_context_emits_direct_call_contract_hypothesis(self) -> None:
+        kg = _review_context_fixture_with_changed_call_edges()
+        result = call_tool(
+            kg,
+            "review_context",
+            {
+                "repo": "payments",
+                "changed_files": ["payments/checkout.py"],
+                "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+            },
+        )
+
+        hypotheses = result["review_hypotheses"]
+        self.assertTrue(hypotheses)
+        first = hypotheses[0]
+        self.assertRegex(first["hypothesis_id"], r"^hypothesis:")
+        self.assertEqual(first["risk_type"], "direct_call_contract_drift")
+        self.assertIn(first["confidence"], {"medium", "strong"})
+        self.assertTrue(first["evidence_refs"])
+        self.assertTrue(first["source_checks"])
+        self.assertTrue(first["supporting_lead_ids"])
+        self.assertTrue(
+            set(first["supporting_lead_ids"]).issubset(
+                {
+                    row["lead_id"]
+                    for field in ("direct_callers", "direct_callees", "transitive_callers")
+                    for row in result["review_leads"].get(field, [])
+                }
+            )
+        )
+
+
+def _review_context_fixture_with_changed_call_edges() -> KgSnapshot:
+    ctx = _fixture_snapshot(upstream_checkout_caller=True)
+    kg = ctx.__enter__()
+    kg._tmpdir_ctx = ctx  # type: ignore[attr-defined]  # prevent GC of tmpdir
+    return kg
+
 
 class _constructor_reverse_impact_snapshot:
     def __enter__(self) -> KgSnapshot:
