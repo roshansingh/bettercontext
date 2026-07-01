@@ -20,6 +20,11 @@ from source.kg.product.output_budget import (
     enforce_reverse_impact_budget,
     enforce_service_brief_budget,
 )
+from source.kg.product.review_attribution import (
+    add_review_lead_ids,
+    review_available_counts,
+    review_lead_counts,
+)
 from source.kg.product.runtime_architecture import ENDPOINT_PATH_SHAPE_MATCH_BASIS, runtime_architecture_packet
 from source.kg.query.call_site import call_site_from_qualifier
 from source.kg.query.snapshot import KgSnapshot
@@ -3038,7 +3043,14 @@ def _review_context_lead_packet(
     }
     if not useful:
         status["reason"] = "no symbol anchors, changed symbols, or direct/transitive impact edges"
-    leads: JsonObject = {
+    available = review_available_counts(
+        changed_symbols=changed_symbols,
+        direct_callers=direct_callers,
+        direct_callees=direct_callees,
+        transitive_callers=transitive_callers,
+        source_coordinates=source_coordinates,
+    )
+    leads_pre: JsonObject = {
         "changed_files": changed_files[:PLANNING_CONTEXT_SECTION_LIMIT],
         "changed_symbols": changed_symbols[:PLANNING_CONTEXT_SECTION_LIMIT],
         "direct_callers": direct_callers[:PLANNING_CONTEXT_SECTION_LIMIT],
@@ -3046,6 +3058,9 @@ def _review_context_lead_packet(
         "transitive_callers": transitive_callers[:PLANNING_CONTEXT_SECTION_LIMIT],
         "source_coordinates": source_coordinates[:PLANNING_CONTEXT_SECTION_LIMIT],
     }
+    leads = add_review_lead_ids(leads_pre)
+    status["available"] = available
+    status["returned"] = review_lead_counts(leads)
     return {"review_lead_status": status, "review_leads": leads}
 
 
@@ -3104,6 +3119,7 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
     )
     review_lead_status = review_lead_packet["review_lead_status"]
     review_leads = review_lead_packet["review_leads"]
+    stamped_source_coordinates = review_leads.get("source_coordinates") if isinstance(review_leads.get("source_coordinates"), list) else source_coordinates
     omitted_counts = _review_context_omitted_context_counts(result)
     packet_summary = dict(packet.get("summary", {})) if isinstance(packet.get("summary"), dict) else {}
     packet_summary["packet_mode"] = "diff_anchor_only"
@@ -3158,7 +3174,7 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
             "repo_dependencies": repo_dependencies,
         },
         "repo_dependencies": repo_dependencies,
-        "source_coordinates": source_coordinates,
+        "source_coordinates": stamped_source_coordinates,
         "answerability": answerability,
         "coverage_warnings": result.get("coverage_warnings", []),
         "unsupported_scopes": result.get("unsupported_scopes", []),

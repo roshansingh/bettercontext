@@ -3942,6 +3942,42 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(packet["review_lead_status"]["changed_anchor_count"], 1)
         self.assertNotIn("reason", packet["review_lead_status"])
 
+    def test_review_context_leads_have_stable_ids_and_kinds(self) -> None:
+        with _fixture_snapshot(upstream_checkout_caller=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                },
+            )
+
+        for field, expected_kind in (
+            ("changed_symbols", "changed_symbol"),
+            ("direct_callers", "direct_caller"),
+            ("direct_callees", "direct_callee"),
+        ):
+            row = result["review_leads"][field][0]
+            self.assertEqual(row["lead_kind"], expected_kind)
+            self.assertRegex(row["lead_id"], rf"^lead:{expected_kind}:")
+
+        with _fixture_snapshot(upstream_checkout_caller=True) as kg2:
+            repeat = call_tool(
+                kg2,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                },
+            )
+        self.assertEqual(
+            result["review_leads"]["direct_callers"][0]["lead_id"],
+            repeat["review_leads"]["direct_callers"][0]["lead_id"],
+        )
+
     def test_review_context_changed_ranges_use_symbol_evidence_span(self) -> None:
         with _fixture_snapshot(
             symbol_without_end_line=True,
@@ -4074,7 +4110,7 @@ class McpToolsTest(unittest.TestCase):
         self.assertNotIn("framework_impact", result)
         self.assertEqual(result["omitted_context"]["counts"]["application_impact.cross_repo_name_leads"], 1)
         self.assertEqual(result["candidate_leads"]["status"], "empty")
-        self.assertLess(len(canonical_json(result)), 8_000)
+        self.assertLess(len(canonical_json(result)), 9_000)
         self.assertTrue(any("include_unlinked_leads=true" in action for action in result["next_actions"]))
 
     def test_review_context_file_anchor_only_can_opt_into_broad_unlinked_leads(self) -> None:

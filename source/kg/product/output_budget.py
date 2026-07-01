@@ -4,6 +4,7 @@ from copy import deepcopy
 
 from source.kg.core.models import JsonObject, canonical_json
 from source.kg.product.evidence_score import rank_rows, score_key
+from source.kg.product.review_attribution import review_lead_counts
 
 
 # Fleet runtime architecture questions need a compact head-start packet that
@@ -830,6 +831,11 @@ def _sync_review_lead_status_from_packet(result: JsonObject) -> None:
             "file_anchor_count": file_anchor_count,
         }
     )
+    # Preserve the pre-compaction available counts; recompute returned from current packet.
+    available = status.get("available")
+    if isinstance(available, dict):
+        synced_status["available"] = available
+    synced_status["returned"] = review_lead_counts(review_leads)
     result["review_lead_status"] = synced_status
     packet = result.get("review_answer_packet")
     if isinstance(packet, dict):
@@ -2248,6 +2254,8 @@ def _compact_relation_rows(value: object, *, limit: int) -> list[JsonObject]:
         if not isinstance(row, dict):
             continue
         compact_row = {
+            "lead_id": row.get("lead_id"),
+            "lead_kind": row.get("lead_kind"),
             "predicate": row.get("predicate"),
             "depth": row.get("depth"),
             "traversal": row.get("traversal"),
@@ -2260,7 +2268,7 @@ def _compact_relation_rows(value: object, *, limit: int) -> list[JsonObject]:
         bridge = _compact_constructor_bridge(row.get("via_constructor_bridge"))
         if bridge:
             compact_row["via_constructor_bridge"] = bridge
-        rows.append(compact_row)
+        rows.append({k: v for k, v in compact_row.items() if v is not None})
     return rows
 
 
@@ -2329,6 +2337,8 @@ def _compact_symbol(value: object) -> JsonObject:
     if not isinstance(value, dict):
         return {}
     keys = (
+        "lead_id",
+        "lead_kind",
         "symbol_id",
         "display_name",
         "qualified_name",
