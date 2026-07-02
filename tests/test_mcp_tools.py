@@ -10,6 +10,7 @@ from pathlib import Path
 
 from source.kg.core.models import Coverage, Entity, Evidence, Fact, canonical_json
 from source.kg.core.store import JsonlKgStore
+from source.kg.product.review_attribution import add_review_lead_ids
 from source.kg.product.application_impact import application_impact_packet
 from source.kg.product.mcp_tools import (
     ENDPOINT_PATH_SHAPE_MATCH_BASIS,
@@ -5266,17 +5267,207 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(handler.sys_version, "")
         self.assertEqual(handler.version_string(fake_handler), "supercontext-local/0.1.0")
 
-    def test_review_context_emits_direct_call_contract_hypothesis(self) -> None:
-        kg = _review_context_fixture_with_changed_call_edges()
-        result = call_tool(
-            kg,
-            "review_context",
-            {
-                "repo": "payments",
-                "changed_files": ["payments/checkout.py"],
-                "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+    def test_review_context_budget_compaction_preserves_lead_ids_and_hypothesis_refs(self) -> None:
+        # Build a result with pre-stamped review_leads and hypotheses whose
+        # supporting_lead_ids reference those lead IDs. Force compaction and assert
+        # every surviving review_leads row has a lead_id and every hypothesis's
+        # supporting_lead_ids is a subset of the lead IDs still in the packet.
+        leads_pre = {
+            "changed_symbols": [
+                {
+                    "qualified_name": f"pkg.mod.sym_{i}",
+                    "repo": "repo",
+                    "path": f"pkg/mod_{i}.py",
+                    "line": i,
+                    "payload": "x" * 300,
+                }
+                for i in range(40)
+            ],
+            "direct_callers": [
+                {
+                    "predicate": "CALLS",
+                    "caller_symbol": {"qualified_name": f"pkg.caller_{i}", "repo": "repo", "path": f"pkg/c_{i}.py", "line": i},
+                    "evidence": [{"bytes_ref": {"repo": "repo", "path": f"pkg/c_{i}.py", "line_start": i, "line_end": i}}],
+                    "payload": "x" * 300,
+                }
+                for i in range(40)
+            ],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [
+                {"repo": "repo", "path": f"pkg/mod_{i}.py", "line_start": i, "line_end": i}
+                for i in range(40)
+            ],
+        }
+        stamped = add_review_lead_ids(leads_pre)
+        all_lead_ids = [
+            row["lead_id"]
+            for field in ("changed_symbols", "direct_callers", "source_coordinates")
+            for row in stamped.get(field, [])
+            if isinstance(row, dict) and "lead_id" in row
+        ]
+        hypothesis = {
+            "hypothesis_id": "hypothesis:test:abc123",
+            "risk_type": "direct_call_contract_drift",
+            "confidence": "medium",
+            "why": "test",
+            "evidence_refs": [],
+            "source_checks": ["check it"],
+            "supporting_lead_ids": all_lead_ids[:5],
+        }
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"changed_symbol_count": 40, "direct_caller_count": 40},
+            "review_lead_status": {
+                "coverage_status": "useful",
+                "recommended_action": "use_supercontext_packet",
+                "changed_anchor_count": 0,
+                "changed_symbol_count": 40,
+                "direct_impact_count": 40,
+                "transitive_impact_count": 0,
+                "source_coordinate_count": 40,
+                "file_anchor_count": 0,
             },
-        )
+            "review_answer_packet": {
+                "status": "found",
+                "summary": {"changed_symbol_count": 40},
+                "top_changed_symbols": stamped["changed_symbols"][:5],
+                "top_direct_callers": stamped["direct_callers"][:5],
+                "top_direct_callees": [],
+                "top_transitive_callers": [],
+                "top_review_hypotheses": [hypothesis],
+            },
+            "review_leads": stamped,
+            "diff_anchors": [],
+            "changed_symbols": stamped["changed_symbols"],
+            "changed_file_symbols": [],
+            "direct_callers": stamped["direct_callers"],
+            "direct_callees": [],
+            "direct_callers_of_changed_symbols": stamped["direct_callers"],
+            "direct_callees_from_changed_symbols": [],
+            "transitive_callers": [],
+            "source_coordinates": stamped["source_coordinates"],
+            "review_hypotheses": [hypothesis],
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "next_actions": [],
+            "answerability": {"status": "answerable"},
+        }
+        # Use a budget that forces compaction but is large enough for the minimal packet.
+        budgeted = enforce_review_context_budget(result, max_chars=30_000)
+
+        self.assertTrue(budgeted.get("output_budget", {}).get("truncated"))
+        review_leads = budgeted.get("review_leads", {})
+        surviving_lead_ids = {
+            row["lead_id"]
+            for field in ("changed_symbols", "direct_callers", "source_coordinates")
+            for row in review_leads.get(field, [])
+            if isinstance(row, dict)
+        }
+        for field in ("changed_symbols", "direct_callers", "source_coordinates"):
+            for row in review_leads.get(field, []):
+                self.assertIn("lead_id", row, f"review_leads.{field} row missing lead_id after compaction")
+        hypotheses = budgeted.get("review_hypotheses") or []
+        for hyp in hypotheses:
+            for sid in (hyp.get("supporting_lead_ids") or []):
+                self.assertIn(sid, surviving_lead_ids, f"dangling supporting_lead_id {sid!r} not in surviving leads")
+
+    def test_review_lead_only_packet_includes_hypotheses(self) -> None:
+        # Force lead-only fallback by making the packet very large and checking
+        # that review_hypotheses survives in the output.
+        leads_pre = {
+            "changed_symbols": [
+                {"qualified_name": f"pkg.sym_{i}", "repo": "repo", "path": f"pkg/m_{i}.py", "line": i}
+                for i in range(5)
+            ],
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+        }
+        stamped = add_review_lead_ids(leads_pre)
+        lead_ids = [r["lead_id"] for r in stamped["changed_symbols"] if isinstance(r, dict)]
+        hypothesis = {
+            "hypothesis_id": "hypothesis:direct_call_contract_drift:aaa",
+            "risk_type": "direct_call_contract_drift",
+            "confidence": "medium",
+            "why": "test hypothesis",
+            "evidence_refs": [{"repo": "repo", "path": "pkg/m_0.py"}],
+            "source_checks": ["check"],
+            "supporting_lead_ids": lead_ids[:2],
+        }
+        # Build a fat result so the lead-only path is reached.
+        fat_rows = [
+            {
+                "predicate": "CALLS",
+                "caller_symbol": {"qualified_name": f"pkg.c_{i}", "repo": "repo", "path": f"pkg/c_{i}.py", "line": i},
+                "evidence": [{"bytes_ref": {"repo": "repo", "path": f"pkg/c_{i}.py", "line_start": i, "line_end": i}}],
+                "payload": "x" * 2_000,
+            }
+            for i in range(200)
+        ]
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"changed_symbol_count": 5, "direct_caller_count": 200},
+            "review_lead_status": {
+                "coverage_status": "useful",
+                "recommended_action": "use_supercontext_packet",
+                "changed_anchor_count": 0,
+                "changed_symbol_count": 5,
+                "direct_impact_count": 200,
+                "transitive_impact_count": 0,
+                "source_coordinate_count": 0,
+                "file_anchor_count": 0,
+            },
+            "review_answer_packet": {
+                "status": "found",
+                "summary": {"changed_symbol_count": 5},
+                "top_changed_symbols": stamped["changed_symbols"],
+                "top_direct_callers": fat_rows[:5],
+                "top_direct_callees": [],
+                "top_transitive_callers": [],
+                "top_review_hypotheses": [hypothesis],
+            },
+            "review_leads": stamped,
+            "diff_anchors": [],
+            "changed_symbols": stamped["changed_symbols"],
+            "changed_file_symbols": [],
+            "direct_callers": fat_rows,
+            "direct_callees": fat_rows,
+            "direct_callers_of_changed_symbols": fat_rows,
+            "direct_callees_from_changed_symbols": fat_rows,
+            "transitive_callers": fat_rows,
+            "source_coordinates": [],
+            "review_hypotheses": [hypothesis],
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "next_actions": [],
+            "answerability": {"status": "answerable"},
+        }
+        # Use a budget large enough to hold the lead-only skeleton + one compact hypothesis
+        # but small enough to force the lead-only path (the fat_rows dominate the full packet).
+        budgeted = enforce_review_context_budget(result, max_chars=8_000)
+
+        self.assertIn("review_hypotheses", budgeted, "review_hypotheses missing from lead-only packet")
+        hyps = budgeted["review_hypotheses"]
+        self.assertTrue(hyps, "review_hypotheses is empty in lead-only packet")
+        self.assertEqual(hyps[0]["risk_type"], "direct_call_contract_drift")
+
+    def test_review_context_emits_direct_call_contract_hypothesis(self) -> None:
+        with _fixture_snapshot(upstream_checkout_caller=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                },
+            )
 
         hypotheses = result["review_hypotheses"]
         self.assertTrue(hypotheses)
@@ -5331,12 +5522,6 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(result["review_hypotheses"][0]["risk_type"], "low_coverage_stylesheet_gap")
         self.assertIn("stylesheet", result["review_hypotheses"][0]["why"].lower())
 
-
-def _review_context_fixture_with_changed_call_edges() -> KgSnapshot:
-    ctx = _fixture_snapshot(upstream_checkout_caller=True)
-    kg = ctx.__enter__()
-    kg._tmpdir_ctx = ctx  # type: ignore[attr-defined]  # prevent GC of tmpdir
-    return kg
 
 
 class _constructor_reverse_impact_snapshot:
