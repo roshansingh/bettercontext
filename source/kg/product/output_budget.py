@@ -773,6 +773,13 @@ def _review_lead_only_budget_packet(
         "unsupported_review_scopes": compact.get("unsupported_review_scopes", []),
         "next_actions": compact.get("next_actions", []),
     }
+    compacted_hypotheses = [
+        _compact_review_hypothesis(row)
+        for row in (compact.get("review_hypotheses") or [])
+        if isinstance(row, dict)
+    ]
+    if compacted_hypotheses:
+        lead_only["review_hypotheses"] = compacted_hypotheses
     _sync_review_lead_status_from_packet(lead_only)
     _attach_detail_budget_metadata(
         lead_only,
