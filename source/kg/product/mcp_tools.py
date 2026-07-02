@@ -2881,11 +2881,11 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     # review_leads, and hypotheses — so IDs survive budget compaction without re-derivation.
     _stamped_in_scope = add_review_lead_ids(
         {
-            "changed_symbols": changed_symbols_in_scope[:PLANNING_CONTEXT_SECTION_LIMIT],
-            "direct_callers": direct_callers_in_scope[:PLANNING_CONTEXT_SECTION_LIMIT],
-            "direct_callees": direct_callees_in_scope[:PLANNING_CONTEXT_SECTION_LIMIT],
-            "transitive_callers": transitive_callers_in_scope[:PLANNING_CONTEXT_SECTION_LIMIT],
-            "source_coordinates": source_coordinates[:PLANNING_CONTEXT_SECTION_LIMIT],
+            "changed_symbols": changed_symbols_in_scope,
+            "direct_callers": direct_callers_in_scope,
+            "direct_callees": direct_callees_in_scope,
+            "transitive_callers": transitive_callers_in_scope,
+            "source_coordinates": source_coordinates,
         }
     )
     changed_symbols_in_scope = _stamped_in_scope["changed_symbols"]

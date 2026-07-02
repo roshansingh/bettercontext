@@ -5456,6 +5456,7 @@ class McpToolsTest(unittest.TestCase):
         hyps = budgeted["review_hypotheses"]
         self.assertTrue(hyps, "review_hypotheses is empty in lead-only packet")
         self.assertEqual(hyps[0]["risk_type"], "direct_call_contract_drift")
+        self.assertLessEqual(len(canonical_json(budgeted)), 8_000)
 
     def test_review_context_emits_direct_call_contract_hypothesis(self) -> None:
         with _fixture_snapshot(upstream_checkout_caller=True) as kg:
@@ -5522,6 +5523,47 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(result["review_hypotheses"][0]["risk_type"], "low_coverage_stylesheet_gap")
         self.assertIn("stylesheet", result["review_hypotheses"][0]["why"].lower())
 
+    def test_review_context_no_ranges_non_code_file_emits_empty_hypotheses(self) -> None:
+        # C2 regression: no changed_ranges + non-code file against an endpoint-bearing fixture
+        # must not emit runtime hypotheses even when the service has endpoints in the KG.
+        with _fixture_snapshot(app_surface=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {"repo": "payments", "changed_files": ["docs/README.md"]},
+            )
+        self.assertEqual(result["review_lead_status"]["coverage_status"], "low_coverage")
+        self.assertEqual(result["review_hypotheses"], [])
+
+    def test_review_context_producer_stamps_full_lists_before_slicing(self) -> None:
+        # Finding 1: producer-time stamping must use full in-scope lists so that
+        # summary counts and available counts reflect all callers (>5), not a
+        # truncated slice. extra_callers=6 + upstream_checkout_caller=True yields 7
+        # direct callers (verified by find_callers); the budget enforcer may then
+        # compact the top-level list, but summary/available must still show 7.
+        with _fixture_snapshot(upstream_checkout_caller=True, extra_callers=6) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                },
+            )
+        # summary.direct_caller_count must reflect all 7 callers, not a truncated 5
+        self.assertGreater(result["summary"]["direct_caller_count"], 5, "summary count must reflect full caller list")
+        # available count must also reflect the full list
+        available = result["review_lead_status"]["available"]
+        self.assertGreater(available["direct_caller_count"], 5, "available count must reflect full caller list")
+        # available >= returned (budget enforcer may compact the list)
+        returned = result["review_lead_status"]["returned"]
+        self.assertLessEqual(returned["direct_caller_count"], available["direct_caller_count"])
+        # all lead_ids in the lead packet must be a subset of top-level direct_callers lead_ids
+        top_level_lead_ids = {row["lead_id"] for row in result["direct_callers"] if isinstance(row, dict) and "lead_id" in row}
+        lead_packet_lead_ids = {row["lead_id"] for row in result["review_leads"].get("direct_callers", []) if isinstance(row, dict) and "lead_id" in row}
+        self.assertTrue(lead_packet_lead_ids, "lead packet direct_callers must be non-empty")
+        self.assertTrue(lead_packet_lead_ids.issubset(top_level_lead_ids), "lead packet lead_ids must be a subset of top-level lead_ids")
 
 
 class _constructor_reverse_impact_snapshot:
@@ -5870,6 +5912,7 @@ class _fixture_snapshot:
     def __init__(
         self,
         extra_consumers: int = 0,
+        extra_callers: int = 0,
         extra_package_importers: int = 0,
         extra_charge_card_symbol: bool = False,
         duplicate_endpoint_fact: bool = False,
@@ -5900,6 +5943,7 @@ class _fixture_snapshot:
         symbol_repo: str = "payments",
     ) -> None:
         self.extra_consumers = extra_consumers
+        self.extra_callers = extra_callers
         self.extra_package_importers = extra_package_importers
         self.extra_charge_card_symbol = extra_charge_card_symbol
         self.duplicate_endpoint_fact = duplicate_endpoint_fact
@@ -6346,6 +6390,21 @@ class _fixture_snapshot:
             )
             for index in range(self.extra_package_importers)
         ]
+        extra_caller_symbols = [
+            Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "payments",
+                    "module": f"payments.extra_{index}",
+                    "qualname": f"extra_caller_{index}",
+                    "symbol_kind": "function",
+                },
+                properties={"path": f"payments/extra_{index}.py", "line": index + 1, "end_line": index + 2},
+            )
+            for index in range(self.extra_callers)
+        ]
+        extra_caller_facts = [Fact("CALLS", sym.entity_id, caller.entity_id) for sym in extra_caller_symbols]
         extra_consume_facts = [Fact("CONSUMES_EVENT", extra_service.entity_id, channel.entity_id) for extra_service in extra_services]
         extra_import_facts = [
             Fact(
@@ -6552,6 +6611,7 @@ class _fixture_snapshot:
             *runtime_targets,
             *extra_services,
             *extra_modules,
+            *extra_caller_symbols,
         ]
         facts = [
             call_fact,
@@ -6575,6 +6635,7 @@ class _fixture_snapshot:
             *([endpoint_fact] if self.duplicate_endpoint_fact else []),
             *extra_consume_facts,
             *extra_import_facts,
+            *extra_caller_facts,
         ]
         JsonlKgStore(root).write(
             entities=entities,
