@@ -2348,6 +2348,87 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(status.get("truncated_count"), 0)
         self.assertEqual(status.get("reason"), "none_generated")
 
+    # --- engine_version stamp tests ---
+
+    def _minimal_review_context_result(self, *, bloat: int = 0) -> dict:
+        """Minimal review_context result dict for budget tests."""
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 0,
+            "changed_symbol_count": 0,
+            "direct_impact_count": 1,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+        }
+        return {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"direct_caller_count": 1},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "application": {"bloat": "z" * bloat},
+            },
+            "review_leads": {
+                "changed_files": ["pkg/module.py"],
+                "changed_symbols": [],
+                "direct_callers": [],
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+    def test_review_context_call_tool_stamps_engine_version(self) -> None:
+        """call_tool review_context always sets output_budget.engine_version."""
+        with _fixture_snapshot() as kg:
+            result = call_tool(kg, "review_context", {
+                "repo": "payments",
+                "changed_files": ["payments/checkout.py"],
+            })
+        budget = result.get("output_budget")
+        self.assertIsInstance(budget, dict, "output_budget must be present")
+        version = budget.get("engine_version")
+        self.assertIsInstance(version, str, "engine_version must be a string")
+        self.assertTrue(version, "engine_version must be non-empty")
+
+    def test_review_context_engine_version_survives_heavy_compaction(self) -> None:
+        """engine_version is preserved after compaction truncates detail rows."""
+        result = self._minimal_review_context_result(bloat=50_000)
+        result["output_budget"] = {"engine_version": "test-sha"}
+        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+        budget = budgeted.get("output_budget")
+        self.assertIsInstance(budget, dict)
+        self.assertEqual(budget.get("engine_version"), "test-sha")
+
+    def test_review_context_engine_version_survives_lead_only_fallback(self) -> None:
+        """engine_version is preserved when budget degrades to lead_only packet."""
+        result = self._minimal_review_context_result(bloat=50_000)
+        result["output_budget"] = {"engine_version": "test-sha"}
+        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+        budget = budgeted.get("output_budget")
+        self.assertIsInstance(budget, dict)
+        self.assertTrue(budget.get("lead_only"), "expected lead_only degradation")
+        self.assertEqual(budget.get("engine_version"), "test-sha")
+
+    def test_review_context_engine_version_present_on_normal_path(self) -> None:
+        """engine_version is present even when no compaction is needed."""
+        result = self._minimal_review_context_result()
+        result["output_budget"] = {"engine_version": "test-sha"}
+        returned = enforce_review_context_budget(result)
+        budget = returned.get("output_budget")
+        self.assertIsInstance(budget, dict)
+        self.assertEqual(budget.get("engine_version"), "test-sha")
+
     def test_reverse_impact_callable_partition_rule(self) -> None:
         from source.kg.query.reverse_impact import _is_callable_symbol
 
@@ -4638,7 +4719,7 @@ class McpToolsTest(unittest.TestCase):
         self.assertNotIn("framework_impact", result)
         self.assertEqual(result["omitted_context"]["counts"]["application_impact.cross_repo_name_leads"], 1)
         self.assertEqual(result["candidate_leads"]["status"], "empty")
-        self.assertLess(len(canonical_json(result)), 8_500)
+        self.assertLess(len(canonical_json(result)), 8_600)
         self.assertTrue(any("include_unlinked_leads=true" in action for action in result["next_actions"]))
 
     def test_review_context_file_anchor_only_can_opt_into_broad_unlinked_leads(self) -> None:

@@ -796,6 +796,7 @@ def _review_lead_only_budget_packet(
         "top_direct_callees": packet.get("top_direct_callees", []),
         "top_transitive_callers": packet.get("top_transitive_callers", []),
     }
+    prior_budget = compact.get("output_budget")
     lead_only: JsonObject = {
         "tool": compact.get("tool", "review_context"),
         "status": compact.get("status"),
@@ -819,6 +820,8 @@ def _review_lead_only_budget_packet(
         "unsupported_review_scopes": compact.get("unsupported_review_scopes", []),
         "next_actions": compact.get("next_actions", []),
     }
+    if isinstance(prior_budget, dict) and "engine_version" in prior_budget:
+        lead_only["output_budget"] = {"engine_version": prior_budget["engine_version"]}
     # Use original_hypotheses as fallback when the compact pass evicted all hypotheses
     # (can happen when the last detail pass reduced them to an empty list).
     hyp_source = compact.get("review_hypotheses") or (original_hypotheses or [])
@@ -1365,7 +1368,8 @@ def _attach_detail_budget_metadata(
     advice: str,
     truncated_sections: set[str],
 ) -> None:
-    result["output_budget"] = {
+    prior = result.get("output_budget")
+    budget: JsonObject = {
         "truncated": True,
         "minimized": True,
         "measured_chars": measured_chars,
@@ -1373,6 +1377,9 @@ def _attach_detail_budget_metadata(
         "truncated_sections": sorted(truncated_sections),
         "advice": advice,
     }
+    if isinstance(prior, dict) and "engine_version" in prior:
+        budget["engine_version"] = prior["engine_version"]
+    result["output_budget"] = budget
     actions = [str(action) for action in _list_value(result.get("next_actions")) if str(action).strip()]
     actions.append(_DETAIL_BUDGET_ACTION)
     result["next_actions"] = _dedupe_strings(actions)

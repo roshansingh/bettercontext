@@ -8,6 +8,7 @@ from source.kg.core.display import display_entity
 from source.kg.core.models import JsonObject, canonical_json
 from source.kg.file_formats._shared.common import normalize_endpoint_path_shape
 from source.kg.product.application_impact import application_impact_packet
+from source.kg.product.engine_version import engine_version
 from source.kg.product.authz_surface import authz_surface_packet
 from source.kg.product.framework_impact import framework_impact_packet
 from source.kg.product.ownership_context import ownership_context_packet
@@ -252,6 +253,7 @@ def call_tool(kg: KgSnapshot, name: str, arguments: JsonObject | None = None) ->
             preserve_planning_sections=True,
         )
     if name == "review_context":
+        payload.setdefault("output_budget", {})["engine_version"] = engine_version()
         return enforce_review_context_budget(payload)
     if name == "reverse_impact":
         return enforce_reverse_impact_budget(payload)
