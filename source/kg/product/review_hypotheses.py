@@ -810,14 +810,14 @@ def _test_locks_in_regression(
 
 
 def _changed_symbol_entity_ids(changed_symbols: list[JsonObject]) -> set[str]:
-    """Return the set of entity_ids for changed-symbol rows.
+    """Return the set of entity ids for changed-symbol rows.
 
-    Symbol rows from _symbol_result carry 'entity_id' directly.  Synthetic
+    _symbol_result rows carry 'symbol_id' (= entity["entity_id"]).  Synthetic
     test rows may omit it; those rows simply contribute nothing to the set.
     """
     ids: set[str] = set()
     for sym in changed_symbols:
-        eid = sym.get("entity_id")
+        eid = sym.get("symbol_id")
         if isinstance(eid, str) and eid:
             ids.add(eid)
     return ids
@@ -927,7 +927,8 @@ def _lead_ids_for_signal_subjects(
         lid = row.get("lead_id")
         if not isinstance(lid, str) or not lid:
             continue
-        eid = row.get("entity_id")
+        # Stamped review_leads rows carry symbol_id (= entity["entity_id"] from _symbol_result).
+        eid = row.get("symbol_id")
         if isinstance(eid, str) and eid in sig_entity_ids:
             lead_ids.append(lid)
             continue

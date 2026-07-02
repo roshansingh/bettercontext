@@ -2941,33 +2941,70 @@ def _is_broad_context_label(label: str) -> bool:
 
 
 def _evict_broad_context_to_fit(result: JsonObject, *, max_chars: int) -> set[str]:
-    """Evict rows from broad application/runtime/framework sections until the packet fits.
+    """Evict rows to fund anchor repair or hypothesis restoration, following packet priority.
 
-    N2 targeted eviction: only broad-context lists (application_impact, framework_impact,
-    runtime_surfaces, and their answer-packet mirrors) are shrunk. Hypothesis lists, lead
-    rows, coordinates, and anchors are untouched. Returns the labels of lists that lost rows.
+    Priority order (highest keep-priority first):
+      hypotheses > leads/anchors > coordinates > diff_anchors > inspection_areas >
+      broad context (application_impact/framework_impact/runtime_surfaces and their
+      answer-packet mirrors) > boilerplate/inventory (duplicated answer-packet contracts,
+      changed_surface rows, surface_status rows, changed_file_symbols inventory).
+
+    When broad context is exhausted and the packet still exceeds the target, this
+    function continues to the boilerplate tier:
+      1. Remove claim_contract and scope_contract from review_answer_packet (they are
+         already present at top-level; dropping the nested copies is pure dedup).
+      2. Evict rows from changed_surface (symbols/files sub-lists) — largest first.
+      3. Evict rows from surface_status — the global list.
+      4. Evict rows from changed_file_symbols — the global inventory list.
+
+    Hypothesis lists and their answer-packet mirror are protected throughout.
+    Returns the labels of lists/fields that had rows/keys removed.
     """
     evicted: set[str] = set()
     guard = 0
     while _current_chars(result) > max_chars and guard < 5_000:
         guard += 1
-        # Protect hypotheses while finding the broad-context victim
+        # Protect hypotheses while finding the victim
         protected = result.pop("review_hypotheses", None)
         answer_packet = result.get("review_answer_packet")
         protected_mirror = None
         if isinstance(answer_packet, dict):
             protected_mirror = answer_packet.pop("top_review_hypotheses", None)
-        # Only consider broad-context lists as victims
+        # Tier 1: broad-context lists
         target = _largest_broad_context_row_list(result)
         if protected is not None:
             result["review_hypotheses"] = protected
         if isinstance(answer_packet, dict) and protected_mirror is not None:
             answer_packet["top_review_hypotheses"] = protected_mirror
-        if target is None:
-            break
-        label, rows = target
-        rows.pop()
-        evicted.add(label)
+        if target is not None:
+            label, rows = target
+            rows.pop()
+            evicted.add(label)
+            continue
+        # Tier 2: boilerplate/inventory — only reached when broad context is empty.
+        # 2a. Duplicated contract dicts in review_answer_packet (already at top-level).
+        if isinstance(answer_packet, dict):
+            for dup_key in ("claim_contract", "scope_contract"):
+                if dup_key in answer_packet:
+                    del answer_packet[dup_key]
+                    evicted.add(f"review_answer_packet.{dup_key}")
+                    break
+            else:
+                # 2b. changed_surface sub-lists, surface_status, changed_file_symbols.
+                tier2 = _largest_boilerplate_row_list(result)
+                if tier2 is None:
+                    break
+                label2, rows2 = tier2
+                rows2.pop()
+                evicted.add(label2)
+        else:
+            # No answer_packet — go straight to tier-2 row lists.
+            tier2 = _largest_boilerplate_row_list(result)
+            if tier2 is None:
+                break
+            label2, rows2 = tier2
+            rows2.pop()
+            evicted.add(label2)
     return evicted
 
 
@@ -2994,6 +3031,56 @@ def _largest_broad_context_row_list(node: object) -> tuple[str, list] | None:
                             best_size, best = size, (child_label, value)
                 # Only recurse into broad-context subtrees (or root dict)
                 if not label or _is_broad_context_label(child_label) or label == "review_answer_packet":
+                    stack.append((child_label, value))
+        elif isinstance(current, list):
+            for index, item in enumerate(current):
+                stack.append((f"{label}[{index}]", item))
+    return best
+
+
+# Boilerplate/inventory labels eligible for tier-2 eviction by _evict_broad_context_to_fit.
+# Priority order within this tier (largest first): changed_surface sub-lists > surface_status
+# > changed_file_symbols.  Never evict: review_leads lists, review_hypotheses, source_coordinates,
+# review_lead_status, review_hypothesis_status, output_budget, summary, answerability, repo_resolution.
+_BOILERPLATE_EVICTION_LABELS = frozenset(
+    {
+        "changed_surface",
+        "surface_status",
+        "changed_file_symbols",
+    }
+)
+
+
+def _largest_boilerplate_row_list(node: object) -> tuple[str, list] | None:
+    """Find the largest boilerplate/inventory row list eligible for tier-2 eviction.
+
+    Targets changed_surface (its symbols/files sub-lists), surface_status, and
+    changed_file_symbols — in that priority order (largest first, as the inner walk
+    returns the biggest list). review_leads, review_hypotheses, anchors, coordinates,
+    and contracts are never targeted here.
+    """
+    best_size = 0
+    best: tuple[str, list] | None = None
+    stack: list[tuple[str, object]] = [("", node)]
+    while stack:
+        label, current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in _HARD_CAP_PROTECTED_KEYS or (not label and key in _HARD_CAP_PROTECTED_TOPLEVEL):
+                    continue
+                child_label = f"{label}.{key}" if label else key
+                root = child_label.split(".")[0]
+                if root not in _BOILERPLATE_EVICTION_LABELS:
+                    # Recurse into changed_surface to reach its sub-lists
+                    if (not label and key == "changed_surface") or (label == "changed_surface"):
+                        stack.append((child_label, value))
+                    continue
+                if isinstance(value, list) and value and any(isinstance(x, dict) for x in value):
+                    size = len(canonical_json(value))
+                    if size > best_size:
+                        best_size, best = size, (child_label, value)
+                # Recurse into changed_surface sub-dicts
+                if isinstance(value, (dict, list)):
                     stack.append((child_label, value))
         elif isinstance(current, list):
             for index, item in enumerate(current):

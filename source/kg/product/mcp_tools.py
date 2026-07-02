@@ -3337,8 +3337,9 @@ def _review_context_risk_signals(
     hypothesis builder can extract paths without a separate KG lookup).
 
     Scoping rules:
-      1. subject_id directly matches the entity_id of a changed-symbol row
-         (matched_by_subject) → included regardless of range filters.
+      1. subject_id directly matches the symbol_id of a changed-symbol row
+         (symbol_id = entity["entity_id"] from _symbol_result; matched_by_subject)
+         → included regardless of range filters.
       2. evidence bytes_ref.repo must equal *repo* (case-insensitive suffix
          match, same logic as _review_context_repo_matches).
       3. evidence bytes_ref.path must match a normalized changed file path.
@@ -3348,9 +3349,10 @@ def _review_context_risk_signals(
          match alone is sufficient (no range filter applied).
     """
     # Index changed context.
+    # _symbol_result rows carry symbol_id (= entity["entity_id"]); not entity_id.
     changed_entity_ids: set[str] = set()
     for sym in changed_symbols:
-        eid = sym.get("entity_id")
+        eid = sym.get("symbol_id")
         if isinstance(eid, str) and eid:
             changed_entity_ids.add(eid)
 

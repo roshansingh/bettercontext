@@ -7625,8 +7625,8 @@ class ReviewContextRiskSignalScopeTest(unittest.TestCase):
             signal_line_end=60,
         )
         entity_id = kg._test_subject_entity_id  # type: ignore[attr-defined]
-        # Supply a changed_symbols row with the matching entity_id.
-        changed_sym = {"entity_id": entity_id, "qualname": "do_work", "path": "pkg/worker.py"}
+        # Supply a changed_symbols row using symbol_id (_symbol_result shape); entity_id absent.
+        changed_sym = {"symbol_id": entity_id, "qualname": "do_work", "path": "pkg/worker.py"}
         results = _review_context_risk_signals(
             kg,
             repo="repo-a",
@@ -7634,7 +7634,7 @@ class ReviewContextRiskSignalScopeTest(unittest.TestCase):
             changed_files=["pkg/worker.py"],
             range_filters={"pkg/worker.py": [(1, 10)]},
         )
-        # subject_id directly matches → included regardless of range mismatch
+        # subject_id directly matches symbol_id → included regardless of range mismatch
         self.assertEqual(len(results), 1, f"subject-matched signal must be included: {results}")
 
     def test_in_range_signal_included(self) -> None:
@@ -7674,6 +7674,361 @@ class ReviewContextRiskSignalScopeTest(unittest.TestCase):
             range_filters={"pkg/worker.py": [(1, 10)]},
         )
         self.assertEqual(len(results), 1, f"dotslash evidence path must be normalized and matched: {results}")
+
+
+def _build_multi_file_risk_kg(
+    test_case: unittest.TestCase,
+    *,
+    n_files: int = 5,
+    signal_file_index: int = 2,
+    signal_line: int = 50,
+    changed_line: int = 5,
+) -> tuple[KgSnapshot, list[Entity]]:
+    """Build a KG with n_files changed symbols and one code_risk_signal on symbol[signal_file_index].
+
+    The signal line (signal_line) intentionally does NOT overlap the changed_range
+    (changed_line), so only subject-match can retrieve the signal.
+    """
+    tmpdir = tempfile.mkdtemp()
+    test_case.addCleanup(shutil.rmtree, tmpdir, True)
+    root = Path(tmpdir)
+    symbols: list[Entity] = []
+    for i in range(n_files):
+        sym = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": "default",
+                "repo": "testrepo",
+                "module": f"pkg.module_{i}",
+                "qualname": f"fn_{i}",
+                "symbol_kind": "function",
+            },
+            properties={"path": f"pkg/module_{i}.py", "line": 1, "end_line": 100},
+        )
+        symbols.append(sym)
+    target = symbols[signal_file_index]
+    signal_fact = Fact(
+        predicate="code_risk_signal",
+        subject_id=target.entity_id,
+        object_id=target.entity_id,
+        qualifier={
+            "risk_family": "swallowed_exception",
+            "exception_type": "bare",
+            "qualname": f"fn_{signal_file_index}",
+            "line": signal_line,
+        },
+    )
+    ev = Evidence(
+        target_type="fact",
+        target_id=signal_fact.fact_id,
+        derivation_class="deterministic_static",
+        source_system="test",
+        source_ref={"extractor": "test"},
+        bytes_ref={
+            "repo": "testrepo",
+            "commit_sha": "abc",
+            "path": f"pkg/module_{signal_file_index}.py",
+            "line_start": signal_line,
+            "line_end": signal_line,
+        },
+        confidence=1.0,
+    )
+    JsonlKgStore(root).write(
+        entities=symbols,
+        facts=[],
+        support_facts=[signal_fact],
+        evidence=[ev],
+        coverage=[],
+        manifest={"version": 1, "repo_name": "testrepo", "repo_path": str(root)},
+    )
+    return KgSnapshot(root), symbols
+
+
+class TestR2SubjectMatchViaSymbolId(unittest.TestCase):
+    """R2 regression: _review_context_risk_signals must match subject_id against symbol_id.
+
+    Inversion evidence: prior code read entity_id (absent on real _symbol_result rows);
+    fixed to read symbol_id. Signals whose subject entity IS a changed symbol must be
+    retrieved even when their evidence lines don't overlap the changed hunks.
+    """
+
+    def test_subject_match_fires_despite_non_overlapping_hunk(self) -> None:
+        """Signal on line 50 included via subject-match when changed_range covers line 1-10."""
+        kg, symbols = _build_multi_file_risk_kg(
+            self,
+            n_files=5,
+            signal_file_index=2,
+            signal_line=50,
+            changed_line=5,
+        )
+        target = symbols[2]
+        # changed_symbols uses symbol_id (real _symbol_result shape, NOT entity_id)
+        changed_sym = {
+            "symbol_id": target.entity_id,
+            "qualname": "fn_2",
+            "path": "pkg/module_2.py",
+        }
+        results = _review_context_risk_signals(
+            kg,
+            repo="testrepo",
+            changed_symbols=[changed_sym],
+            changed_files=[f"pkg/module_{i}.py" for i in range(5)],
+            range_filters={"pkg/module_2.py": [(1, 10)]},
+        )
+        # Signal is on line 50, range covers 1-10 → no line overlap.
+        # Subject match via symbol_id must still fire.
+        self.assertEqual(len(results), 1, "subject-match must fire despite non-overlapping hunk")
+        self.assertEqual(results[0].get("subject_id"), target.entity_id)
+
+    def test_subject_match_does_not_fire_when_symbol_id_absent(self) -> None:
+        """When changed_symbols row lacks symbol_id, out-of-range signal is excluded.
+
+        Inversion: a row with entity_id (old shape) must also NOT match — confirms the
+        fabrication that shipped R2 is gone.
+        """
+        kg, symbols = _build_multi_file_risk_kg(
+            self,
+            n_files=5,
+            signal_file_index=2,
+            signal_line=50,
+        )
+        # Row with entity_id (old broken shape) must NOT match
+        changed_sym_old = {
+            "entity_id": symbols[2].entity_id,
+            "qualname": "fn_2",
+            "path": "pkg/module_2.py",
+        }
+        results_old = _review_context_risk_signals(
+            kg,
+            repo="testrepo",
+            changed_symbols=[changed_sym_old],
+            changed_files=["pkg/module_2.py"],
+            range_filters={"pkg/module_2.py": [(1, 10)]},
+        )
+        self.assertEqual(results_old, [], "entity_id (old shape) must not match — confirms old bug is gone")
+
+    def test_end_to_end_subject_match_multi_file(self) -> None:
+        """call_tool review_context: signal fires via subject-match; changed_symbol_count > 1.
+
+        Builds 5 changed files with symbols. Signal on module_2.py line 50; changed ranges
+        cover line 1-10 of each file (no overlap). changed_symbol_count must be > 1 and the
+        swallowed_exception_state_drift family must appear in review_hypotheses.
+        """
+        kg, _syms = _build_multi_file_risk_kg(
+            self,
+            n_files=5,
+            signal_file_index=2,
+            signal_line=50,
+        )
+        changed_files = [f"pkg/module_{i}.py" for i in range(5)]
+        changed_ranges = [{"path": f"pkg/module_{i}.py", "start_line": 1, "end_line": 10} for i in range(5)]
+        result = call_tool(
+            kg,
+            "review_context",
+            {"repo": "testrepo", "changed_files": changed_files, "changed_ranges": changed_ranges, "limit": 20},
+        )
+        # Non-vacuous: must have retained more than 1 cluster
+        leads = result.get("review_leads") or {}
+        sym_rows = leads.get("changed_symbols") or []
+        self.assertGreater(len(sym_rows), 1, "must retain >1 changed-symbol row across 5 files")
+        # Detector must fire via subject-match despite no hunk overlap
+        hypotheses = result.get("review_hypotheses") or []
+        risk_types = [h.get("risk_type") for h in hypotheses]
+        self.assertIn(
+            "swallowed_exception_state_drift",
+            risk_types,
+            f"swallowed_exception_state_drift must fire via subject-match; got {risk_types}",
+        )
+
+
+class TestR1FundingBoilerplateVictim(unittest.TestCase):
+    """R1 regression: anchor repair must succeed when the only evictable mass is boilerplate.
+
+    Builds a packet whose broad-context sections are empty but whose boilerplate/inventory
+    sections (changed_surface rows, surface_status, changed_file_symbols, duplicated
+    answer-packet contracts) consume enough bytes to leave no room for cluster anchors.
+    Asserts that the cap is held and the anchors are still present.
+    """
+
+    def _build_boilerplate_heavy_packet(self, n_clusters: int = 5, *, max_chars: int) -> dict:
+        """Construct a review_context-shaped packet with empty broad context and fat boilerplate."""
+        # Build a multi-cluster changed_symbols list
+        changed_symbols = []
+        for i in range(n_clusters):
+            changed_symbols.append({
+                "symbol_id": f"ent_{i:04x}",
+                "lead_id": f"lead:changed_symbol:ent_{i:04x}",
+                "lead_kind": "changed_symbol",
+                "display_name": f"mod_{i}.fn_{i}",
+                "qualified_name": f"mod_{i}.fn_{i}",
+                "qualname": f"fn_{i}",
+                "path": f"src/module_{i}.py",
+                "line": 10,
+                "end_line": 50,
+                "evidence": [],
+            })
+        # Build fat surface_status rows (boilerplate) — padded to push packet over 40K cap
+        surface_status = [
+            {
+                "surface": f"api_surface_{j}",
+                "status": "unsupported_or_unlinked",
+                "reason": "A" * 600,
+                "detail": "B" * 400,
+            }
+            for j in range(40)
+        ]
+        # Build fat changed_file_symbols inventory (boilerplate)
+        changed_file_symbols = [
+            {
+                "symbol_id": f"cfs_{j}",
+                "display_name": f"FileSym_{j}",
+                "qualified_name": f"mod.FileSym_{j}",
+                "path": "src/big_file.py",
+                "line": j * 5,
+                "evidence": [{"bytes_ref": {"path": "src/big_file.py", "line_start": j * 5}}],
+            }
+            for j in range(50)
+        ]
+        # Build fat changed_surface rows
+        changed_surface = {
+            "files": [
+                {"path": f"src/module_{i}.py", "symbol_count": 3, "detail": "D" * 200}
+                for i in range(30)
+            ],
+            "symbols": [
+                {"path": f"src/module_{i}.py", "display_name": f"fn_{i}", "line": 10, "detail": "E" * 100}
+                for i in range(30)
+            ],
+        }
+        review_leads = {
+            "changed_symbols": changed_symbols,
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+        }
+        review_lead_status = {
+            "coverage_status": "ok",
+            "changed_anchor_count": n_clusters,
+            "changed_symbol_count": n_clusters,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+            "available": {
+                "changed_symbol_count": n_clusters,
+                "direct_caller_count": 0,
+                "direct_callee_count": 0,
+                "transitive_caller_count": 0,
+                "source_coordinate_count": 0,
+            },
+        }
+        answer_packet: dict = {
+            "status": "found",
+            "summary": {"changed_symbol_count": n_clusters},
+            # Duplicated contracts (already at top level — pure boilerplate in answer_packet)
+            "claim_contract": {"note": "C" * 500},
+            "scope_contract": {"note": "S" * 500},
+            "top_changed_symbols": [dict(s) for s in changed_symbols[:3]],
+            "top_diff_anchors": [],
+            "top_direct_callers": [],
+            "top_direct_callees": [],
+            "top_transitive_callers": [],
+            "surface_status": surface_status[:5],
+            "review_lead_status": review_lead_status,
+        }
+        diff_anchors = [
+            {
+                "anchor_type": "symbol",
+                "path": f"src/module_{i}.py",
+                "display_name": f"fn_{i}",
+                "line": 10,
+            }
+            for i in range(n_clusters)
+        ]
+        packet: dict = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "testrepo",
+            "summary": {
+                "changed_symbol_count": n_clusters,
+                "diff_anchor_count": n_clusters,
+                "symbol_anchor_count": n_clusters,
+                "file_anchor_count": 0,
+                "direct_caller_count": 0,
+                "direct_callee_count": 0,
+                "transitive_caller_count": 0,
+                "framework_model_count": 0,
+                "framework_relation_count": 0,
+                "app_surface_count": 0,
+                "app_runtime_fact_count": 0,
+                "app_cross_repo_lead_count": 0,
+                "candidate_or_unlinked_event_fact_count": 0,
+                "detail_limit": 20,
+                "requested_limit": 20,
+            },
+            "review_answer_packet": answer_packet,
+            "review_lead_status": review_lead_status,
+            "review_leads": review_leads,
+            "diff_anchors": diff_anchors,
+            "changed_symbols": list(changed_symbols),
+            "changed_file_symbols": changed_file_symbols,
+            "surface_status": surface_status,
+            "changed_surface": changed_surface,
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            # No broad context (empty: application_impact, framework_impact, runtime_surfaces)
+            "application_impact": {"same_repo_surfaces": {}},
+            "framework_impact": {},
+            "runtime_surfaces": {},
+            "output_budget": {"engine_version": "test"},
+            "answerability": {"status": "found"},
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "next_actions": [],
+            "proven_facts": {},
+            "candidate_leads": {},
+            "coverage_gaps": [],
+            "inspection_areas": [],
+            "packet_contract": {},
+            "claim_contract": {"note": "C" * 500},
+            "scope_contract": {"note": "S" * 500},
+        }
+        return packet
+
+    def test_cap_held_when_only_boilerplate_evictable(self) -> None:
+        """When broad context is empty, boilerplate/inventory must fund the cap."""
+        packet = self._build_boilerplate_heavy_packet(n_clusters=5, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        from source.kg.core.models import canonical_json
+        original_size = len(canonical_json(packet))
+        # Only meaningful if original exceeds cap
+        if original_size <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed cap — increase boilerplate mass")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result_size = len(canonical_json(result))
+        self.assertLessEqual(result_size, REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
+
+    def test_anchors_restored_after_boilerplate_eviction(self) -> None:
+        """Cluster anchors must survive even when broad context is empty.
+
+        Inversion: before R1 fix, repair gave up because _evict_broad_context_to_fit
+        only targeted broad-context sections and returned empty when they were absent.
+        With the fix, boilerplate sections (claim_contract dup, surface_status,
+        changed_file_symbols) are the next tier and fund the anchor restoration.
+        """
+        n_clusters = 5
+        packet = self._build_boilerplate_heavy_packet(n_clusters=n_clusters, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        from source.kg.core.models import canonical_json
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result_size = len(canonical_json(result))
+        self.assertLessEqual(result_size, REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
+        # At least some anchors must survive
+        retained = (result.get("review_leads") or {}).get("changed_symbols") or []
+        self.assertTrue(retained, "review_leads.changed_symbols must be non-empty after boilerplate eviction")
 
 
 if __name__ == "__main__":

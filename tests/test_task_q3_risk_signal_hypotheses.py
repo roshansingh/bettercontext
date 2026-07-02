@@ -45,7 +45,8 @@ def _base_context(**overrides):
     return ctx
 
 
-def _sym(qualname: str, path: str, entity_id: str | None = None, lead_id: str | None = None) -> dict:
+def _sym(qualname: str, path: str, symbol_id: str | None = None, lead_id: str | None = None) -> dict:
+    """Build a changed-symbol row matching _symbol_result shape (symbol_id, not entity_id)."""
     row = {
         "qualname": qualname,
         "display_name": f"mod.{qualname}",
@@ -53,8 +54,8 @@ def _sym(qualname: str, path: str, entity_id: str | None = None, lead_id: str | 
         "kind": "function",
         "path": path,
     }
-    if entity_id:
-        row["entity_id"] = entity_id
+    if symbol_id:
+        row["symbol_id"] = symbol_id
     if lead_id:
         row["lead_id"] = lead_id
     return row
@@ -111,14 +112,14 @@ class TestAsyncSideEffectLifecycleDrift(unittest.TestCase):
         return review_hypotheses_for_context(**_base_context(**ctx_overrides))
 
     def test_positive_async_callback_in_iteration_fires(self):
-        sym = _sym("handleList", "src/handler.ts", entity_id="eid-1", lead_id="lead-1")
+        sym = _sym("handleList", "src/handler.ts", symbol_id="eid-1", lead_id="lead-1")
         sig = _risk_signal("async_callback_in_iteration", "eid-1", path="src/handler.ts", callee="processBatch")
         hypotheses = self._call(
             changed_symbols=[sym],
             direct_callers=[_edge("PageHandler", "handleList", "lead-edge-1")],
             risk_signals=[sig],
             review_leads={
-                "changed_symbols": [{"lead_id": "lead-1", "path": "src/handler.ts", "entity_id": "eid-1"}],
+                "changed_symbols": [{"lead_id": "lead-1", "path": "src/handler.ts", "symbol_id": "eid-1"}],
                 "direct_callers": [{"lead_id": "lead-edge-1"}],
             },
         )
@@ -136,12 +137,12 @@ class TestAsyncSideEffectLifecycleDrift(unittest.TestCase):
         self.assertTrue(h["hypothesis_id"].startswith("hypothesis:async_side_effect_lifecycle_drift:"))
 
     def test_positive_unawaited_async_call_fires(self):
-        sym = _sym("mutate", "src/mutate.ts", entity_id="eid-2", lead_id="lead-2")
+        sym = _sym("mutate", "src/mutate.ts", symbol_id="eid-2", lead_id="lead-2")
         sig = _risk_signal("unawaited_async_call", "eid-2", path="src/mutate.ts", callee="saveRow")
         hypotheses = self._call(
             changed_symbols=[sym],
             risk_signals=[sig],
-            review_leads={"changed_symbols": [{"lead_id": "lead-2", "path": "src/mutate.ts", "entity_id": "eid-2"}]},
+            review_leads={"changed_symbols": [{"lead_id": "lead-2", "path": "src/mutate.ts", "symbol_id": "eid-2"}]},
         )
         risk_types = [h["risk_type"] for h in hypotheses]
         self.assertIn("async_side_effect_lifecycle_drift", risk_types)
@@ -164,14 +165,14 @@ class TestAsyncSideEffectLifecycleDrift(unittest.TestCase):
         self.assertEqual(h.get("supporting_lead_ids", []), [])
 
     def test_positive_confidence_medium_when_lead_and_direct_edge(self):
-        sym = _sym("processItem", "src/proc.ts", entity_id="eid-3", lead_id="lead-3")
+        sym = _sym("processItem", "src/proc.ts", symbol_id="eid-3", lead_id="lead-3")
         sig = _risk_signal("async_callback_in_iteration", "eid-3", path="src/proc.ts")
         hypotheses = self._call(
             changed_symbols=[sym],
             direct_callers=[_edge("Caller", "processItem", "lead-edge-3")],
             risk_signals=[sig],
             review_leads={
-                "changed_symbols": [{"lead_id": "lead-3", "path": "src/proc.ts", "entity_id": "eid-3"}],
+                "changed_symbols": [{"lead_id": "lead-3", "path": "src/proc.ts", "symbol_id": "eid-3"}],
             },
         )
         h = next((h for h in hypotheses if h["risk_type"] == "async_side_effect_lifecycle_drift"), None)
@@ -179,19 +180,19 @@ class TestAsyncSideEffectLifecycleDrift(unittest.TestCase):
         self.assertEqual(h["confidence"], "medium")
 
     def test_positive_confidence_weak_when_no_direct_edge(self):
-        sym = _sym("doWork", "src/work.ts", entity_id="eid-4", lead_id="lead-4")
+        sym = _sym("doWork", "src/work.ts", symbol_id="eid-4", lead_id="lead-4")
         sig = _risk_signal("unawaited_async_call", "eid-4", path="src/work.ts")
         hypotheses = self._call(
             changed_symbols=[sym],
             risk_signals=[sig],
-            review_leads={"changed_symbols": [{"lead_id": "lead-4", "path": "src/work.ts", "entity_id": "eid-4"}]},
+            review_leads={"changed_symbols": [{"lead_id": "lead-4", "path": "src/work.ts", "symbol_id": "eid-4"}]},
         )
         h = next((h for h in hypotheses if h["risk_type"] == "async_side_effect_lifecycle_drift"), None)
         self.assertIsNotNone(h)
         self.assertEqual(h["confidence"], "weak")
 
     def test_negative_no_signals_family_absent(self):
-        sym = _sym("handleList", "src/handler.ts", entity_id="eid-5", lead_id="lead-5")
+        sym = _sym("handleList", "src/handler.ts", symbol_id="eid-5", lead_id="lead-5")
         hypotheses = self._call(
             changed_symbols=[sym],
             direct_callers=[_edge("Caller", "handleList", "lead-edge-5")],
@@ -201,7 +202,7 @@ class TestAsyncSideEffectLifecycleDrift(unittest.TestCase):
         self.assertNotIn("async_side_effect_lifecycle_drift", risk_types)
 
     def test_negative_signal_on_unchanged_entity_absent(self):
-        sym = _sym("handleList", "src/handler.ts", entity_id="eid-6")
+        sym = _sym("handleList", "src/handler.ts", symbol_id="eid-6")
         # Signal subject_id is different entity — NOT in changed symbols
         sig = _risk_signal("async_callback_in_iteration", "eid-UNRELATED", path="src/other.ts")
         hypotheses = self._call(
@@ -213,7 +214,7 @@ class TestAsyncSideEffectLifecycleDrift(unittest.TestCase):
         self.assertNotIn("async_side_effect_lifecycle_drift", risk_types)
 
     def test_negative_signal_on_unchanged_file_absent(self):
-        # changed_symbols has no entity_id (so entity match won't fire);
+        # changed_symbols has no symbol_id (so entity match won't fire);
         # signal evidence path is NOT in changed_symbols paths
         sym = _sym("handleList", "src/changed.ts")
         sig = _risk_signal("unawaited_async_call", "eid-X", path="src/unchanged.ts")
@@ -225,7 +226,7 @@ class TestAsyncSideEffectLifecycleDrift(unittest.TestCase):
         self.assertNotIn("async_side_effect_lifecycle_drift", risk_types)
 
     def test_negative_low_coverage_gate_respected(self):
-        sym = _sym("handleList", "src/handler.ts", entity_id="eid-lc")
+        sym = _sym("handleList", "src/handler.ts", symbol_id="eid-lc")
         sig = _risk_signal("async_callback_in_iteration", "eid-lc", path="src/handler.ts")
         hypotheses = self._call(
             changed_files=["src/handler.css"],  # stylesheet for low_coverage_stylesheet_gap
@@ -237,7 +238,7 @@ class TestAsyncSideEffectLifecycleDrift(unittest.TestCase):
         self.assertNotIn("async_side_effect_lifecycle_drift", risk_types)
 
     def test_positive_why_contains_callee_name(self):
-        sym = _sym("fn", "src/a.ts", entity_id="eid-why")
+        sym = _sym("fn", "src/a.ts", symbol_id="eid-why")
         sig = _risk_signal("unawaited_async_call", "eid-why", path="src/a.ts", callee="persistRecord")
         hypotheses = self._call(changed_symbols=[sym], risk_signals=[sig], review_leads={})
         h = next((h for h in hypotheses if h["risk_type"] == "async_side_effect_lifecycle_drift"), None)
@@ -245,8 +246,8 @@ class TestAsyncSideEffectLifecycleDrift(unittest.TestCase):
         self.assertIn("persistRecord", h["why"])
 
     def test_positive_path_fallback_match_via_evidence_path(self):
-        # Symbol has no entity_id; match via evidence path in changed_symbols paths
-        sym = _sym("processItems", "src/list.ts")  # no entity_id
+        # Symbol has no symbol_id; match via evidence path in changed_symbols paths
+        sym = _sym("processItems", "src/list.ts")  # no symbol_id
         sig = _risk_signal("async_callback_in_iteration", "eid-path", path="src/list.ts")
         hypotheses = self._call(
             changed_symbols=[sym],
@@ -263,7 +264,7 @@ class TestSwallowedExceptionStateDrift(unittest.TestCase):
         return review_hypotheses_for_context(**_base_context(**ctx_overrides))
 
     def test_positive_swallowed_exception_fires(self):
-        sym = _sym("savePayment", "payments/processor.py", entity_id="eid-se-1", lead_id="lead-se-1")
+        sym = _sym("savePayment", "payments/processor.py", symbol_id="eid-se-1", lead_id="lead-se-1")
         sig = _risk_signal("swallowed_exception", "eid-se-1", path="payments/processor.py",
                            callee="", qualname="savePayment")
         hypotheses = self._call(
@@ -271,7 +272,7 @@ class TestSwallowedExceptionStateDrift(unittest.TestCase):
             direct_callers=[_edge("Caller", "savePayment", "lead-edge-se-1")],
             risk_signals=[sig],
             review_leads={
-                "changed_symbols": [{"lead_id": "lead-se-1", "path": "payments/processor.py", "entity_id": "eid-se-1"}],
+                "changed_symbols": [{"lead_id": "lead-se-1", "path": "payments/processor.py", "symbol_id": "eid-se-1"}],
             },
         )
         risk_types = [h["risk_type"] for h in hypotheses]
@@ -288,14 +289,14 @@ class TestSwallowedExceptionStateDrift(unittest.TestCase):
         self.assertTrue(h["hypothesis_id"].startswith("hypothesis:swallowed_exception_state_drift:"))
 
     def test_positive_confidence_medium_lead_plus_edge(self):
-        sym = _sym("processOrder", "orders/handler.py", entity_id="eid-se-2", lead_id="lead-se-2")
+        sym = _sym("processOrder", "orders/handler.py", symbol_id="eid-se-2", lead_id="lead-se-2")
         sig = _risk_signal("swallowed_exception", "eid-se-2", path="orders/handler.py")
         hypotheses = self._call(
             changed_symbols=[sym],
             direct_callees=[_edge("processOrder", "db_write", "lead-edge-se-2")],
             risk_signals=[sig],
             review_leads={
-                "changed_symbols": [{"lead_id": "lead-se-2", "path": "orders/handler.py", "entity_id": "eid-se-2"}],
+                "changed_symbols": [{"lead_id": "lead-se-2", "path": "orders/handler.py", "symbol_id": "eid-se-2"}],
             },
         )
         h = next((h for h in hypotheses if h["risk_type"] == "swallowed_exception_state_drift"), None)
@@ -303,19 +304,19 @@ class TestSwallowedExceptionStateDrift(unittest.TestCase):
         self.assertEqual(h["confidence"], "medium")
 
     def test_positive_confidence_weak_no_direct_edge(self):
-        sym = _sym("cleanupJob", "jobs/cleanup.py", entity_id="eid-se-3", lead_id="lead-se-3")
+        sym = _sym("cleanupJob", "jobs/cleanup.py", symbol_id="eid-se-3", lead_id="lead-se-3")
         sig = _risk_signal("swallowed_exception", "eid-se-3", path="jobs/cleanup.py")
         hypotheses = self._call(
             changed_symbols=[sym],
             risk_signals=[sig],
-            review_leads={"changed_symbols": [{"lead_id": "lead-se-3", "path": "jobs/cleanup.py", "entity_id": "eid-se-3"}]},
+            review_leads={"changed_symbols": [{"lead_id": "lead-se-3", "path": "jobs/cleanup.py", "symbol_id": "eid-se-3"}]},
         )
         h = next((h for h in hypotheses if h["risk_type"] == "swallowed_exception_state_drift"), None)
         self.assertIsNotNone(h)
         self.assertEqual(h["confidence"], "weak")
 
     def test_negative_no_signals_family_absent(self):
-        sym = _sym("savePayment", "payments/processor.py", entity_id="eid-se-4")
+        sym = _sym("savePayment", "payments/processor.py", symbol_id="eid-se-4")
         hypotheses = self._call(
             changed_symbols=[sym],
             risk_signals=[],
@@ -324,21 +325,21 @@ class TestSwallowedExceptionStateDrift(unittest.TestCase):
         self.assertNotIn("swallowed_exception_state_drift", risk_types)
 
     def test_negative_async_signal_does_not_trigger_swallowed(self):
-        sym = _sym("fn", "src/f.ts", entity_id="eid-se-5")
+        sym = _sym("fn", "src/f.ts", symbol_id="eid-se-5")
         sig = _risk_signal("async_callback_in_iteration", "eid-se-5", path="src/f.ts")
         hypotheses = self._call(changed_symbols=[sym], risk_signals=[sig])
         risk_types = [h["risk_type"] for h in hypotheses]
         self.assertNotIn("swallowed_exception_state_drift", risk_types)
 
     def test_negative_signal_on_unchanged_entity_absent(self):
-        sym = _sym("fn", "src/f.py", entity_id="eid-se-6")
+        sym = _sym("fn", "src/f.py", symbol_id="eid-se-6")
         sig = _risk_signal("swallowed_exception", "eid-UNRELATED", path="src/other.py")
         hypotheses = self._call(changed_symbols=[sym], risk_signals=[sig])
         risk_types = [h["risk_type"] for h in hypotheses]
         self.assertNotIn("swallowed_exception_state_drift", risk_types)
 
     def test_negative_low_coverage_gate_respected(self):
-        sym = _sym("fn", "src/f.py", entity_id="eid-se-lc")
+        sym = _sym("fn", "src/f.py", symbol_id="eid-se-lc")
         sig = _risk_signal("swallowed_exception", "eid-se-lc", path="src/f.py")
         hypotheses = self._call(
             changed_files=["src/style.css"],
@@ -350,7 +351,7 @@ class TestSwallowedExceptionStateDrift(unittest.TestCase):
         self.assertNotIn("swallowed_exception_state_drift", risk_types)
 
     def test_positive_why_contains_qualname(self):
-        sym = _sym("retryOp", "src/retry.py", entity_id="eid-se-why")
+        sym = _sym("retryOp", "src/retry.py", symbol_id="eid-se-why")
         sig = _risk_signal("swallowed_exception", "eid-se-why", path="src/retry.py", qualname="retryOp")
         hypotheses = self._call(changed_symbols=[sym], risk_signals=[sig], review_leads={})
         h = next((h for h in hypotheses if h["risk_type"] == "swallowed_exception_state_drift"), None)
