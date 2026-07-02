@@ -3261,7 +3261,12 @@ function collectKafkaEvents(sourceFile) {
 //   (documented limitation).
 //
 // Both signals carry { signal, qualname, callee, line } and are capped at 3
-// per enclosing symbol (lowest line first).
+// per enclosing symbol (lowest line first) across both families combined.
+//
+// Limitation: collectAsyncFunctionNames only captures top-level async function
+// declarations and top-level async arrow/function-expression variable bindings;
+// async methods on classes and async functions nested inside other functions are
+// not captured, so unawaited_async_call will not fire for those callees.
 
 function collectAsyncFunctionNames(sourceFile) {
   // Return a Set of top-level async function names declared in this file.
@@ -3396,10 +3401,11 @@ function isInsidePromiseAll(callNode) {
 }
 
 function applySignalCap(rawSignals) {
-  // Group by qualname, keep lowest 3 lines per symbol.
+  // Group by qualname only — cap is 3 signals combined across all families per
+  // enclosing symbol, lowest line first.
   const bySymbol = new Map();
   for (const sig of rawSignals) {
-    const key = `${sig.signal}:${sig.qualname}`;
+    const key = sig.qualname;
     if (!bySymbol.has(key)) bySymbol.set(key, []);
     bySymbol.get(key).push(sig);
   }
@@ -3436,7 +3442,8 @@ function collectAsyncLifecycleSignals(sourceFile, symbols) {
       !isReturnedContext(node) &&
       !isThenCatchChained(node) &&
       !isAssignedContext(node) &&
-      !isInsidePromiseAll(node)
+      !isInsidePromiseAll(node) &&
+      !(node.parent != null && ts.isVoidExpression(node.parent))  // void fn() is intentional discard
     ) {
       const name = callName(node.expression, sourceFile);
       // Only the leaf name for same-file check (no dots = top-level call)

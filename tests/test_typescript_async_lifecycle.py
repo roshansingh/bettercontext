@@ -99,6 +99,32 @@ export async function batchProcess(ids: string[]): Promise<void> {
 }
 """
 
+# Cap test (mixed families): 2 forEach(async) + 2 unawaited calls — only 3 combined
+# saveRecord is declared async at module level so unawaited_async_call fires for it.
+_CAP_MIXED = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export async function mixedWork(ids: string[]): Promise<void> {
+  ids.forEach(async (id) => { await fetch('/a/' + id); });
+  ids.forEach(async (id) => { await fetch('/b/' + id); });
+  saveRecord('x');
+  saveRecord('y');
+}
+"""
+
+# Negative: void operator — intentional discard, must not fire unawaited_async_call
+_VOID_DISCARD = """\
+async function save(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export function triggerSave(id: string): void {
+  void save(id);
+}
+"""
+
 
 def _build(files: dict[str, str]) -> tuple[list[dict], list[dict], list[dict]]:
     """Write files to a tempdir, run build_kg, return (support_facts, evidence, coverage)."""
@@ -187,6 +213,12 @@ class UnawaitedAsyncCallTest(unittest.TestCase):
         signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
         self.assertEqual(signals, [], f"cross-file call must not emit a signal: {signals}")
 
+    def test_void_discard_emits_no_signal(self) -> None:
+        # void save(id) is an intentional discard — must not fire unawaited_async_call
+        sf, _, _ = _build({"discard.ts": _VOID_DISCARD})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertEqual(signals, [], f"void discard must not emit unawaited_async_call: {signals}")
+
 
 @unittest.skipIf(not NODE_AVAILABLE, "node not available")
 class SignalCapTest(unittest.TestCase):
@@ -212,6 +244,23 @@ class SignalCapTest(unittest.TestCase):
         self.assertEqual(len(lines), 3)
         # The 4th call at the highest line should be absent
         self.assertNotIn(max(lines) + 1, lines)
+
+    def test_cap_is_combined_across_families(self) -> None:
+        # 2 async_callback_in_iteration + 2 unawaited_async_call in one symbol;
+        # total must be exactly 3, not 4 (which the old per-family cap would allow).
+        sf, _, _ = _build({"mixed.ts": _CAP_MIXED})
+        signals = [
+            s for s in _risk_signals(sf)
+            if s["qualifier"]["qualname"] == "mixedWork"
+        ]
+        self.assertEqual(
+            len(signals), 3,
+            f"expected 3 combined (cross-family cap), got {len(signals)}: {signals}",
+        )
+        # Inversion check: the old key `signal:qualname` would produce 4 (2+2).
+        # If this assertion passes with 3 it proves the cap is not per-family.
+        families_present = {s["qualifier"]["risk_family"] for s in signals}
+        self.assertGreater(len(families_present), 0, "no signals at all")
 
 
 @unittest.skipIf(not NODE_AVAILABLE, "node not available")
