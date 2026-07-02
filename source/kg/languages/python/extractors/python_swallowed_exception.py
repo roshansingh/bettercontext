@@ -228,14 +228,6 @@ def _handler_body_is_vacuous(body: list[ast.stmt]) -> bool:
     return True
 
 
-def _expr_contains_call(node: ast.expr) -> bool:
-    """Return True if the expression subtree contains any Call node."""
-    for child in ast.walk(node):
-        if isinstance(child, ast.Call):
-            return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Core signal extraction
 # ---------------------------------------------------------------------------

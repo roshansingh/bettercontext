@@ -3,6 +3,12 @@ from __future__ import annotations
 from source.kg.core.models import JsonObject
 from source.kg.product.review_attribution import hypothesis_stable_id
 
+
+def _normalize_path(path: str) -> str:
+	"""Normalize path for comparison: backslash→forward slash, strip "./" prefix."""
+	return path.replace("\\", "/").lstrip("./")
+
+
 _TEST_PATH_SEGMENTS = frozenset({"test", "tests", "spec", "specs", "__tests__"})
 _CONFIG_EXTENSIONS = frozenset({".json", ".yaml", ".yml", ".toml", ".ini", ".env"})
 _CONFIG_BASENAMES = frozenset({"Dockerfile"})
@@ -817,7 +823,7 @@ def _changed_symbol_paths(changed_symbols: list[JsonObject]) -> set[str]:
     for sym in changed_symbols:
         p = sym.get("path")
         if isinstance(p, str) and p:
-            paths.add(p)
+            paths.add(_normalize_path(p))
     return paths
 
 
@@ -842,7 +848,7 @@ def _signal_matches_changed_context(
         br = ev.get("bytes_ref")
         if isinstance(br, dict):
             p = br.get("path")
-            if isinstance(p, str) and p in changed_paths:
+            if isinstance(p, str) and _normalize_path(p) in changed_paths:
                 return True
     return False
 
@@ -894,7 +900,7 @@ def _lead_ids_for_signal_subjects(
             if isinstance(br, dict):
                 p = br.get("path")
                 if isinstance(p, str) and p:
-                    sig_paths.add(p)
+                    sig_paths.add(_normalize_path(p))
 
     lead_ids: list[str] = []
     for row in review_leads.get("changed_symbols") or []:
@@ -908,8 +914,9 @@ def _lead_ids_for_signal_subjects(
             lead_ids.append(lid)
             continue
         p = row.get("path")
-        if isinstance(p, str) and p in sig_paths:
-            lead_ids.append(lid)
+        if isinstance(p, str) and p:
+            if _normalize_path(p) in sig_paths:
+                lead_ids.append(lid)
     return lead_ids
 
 
