@@ -379,6 +379,135 @@ class TestHookGateRenderMismatch(unittest.TestCase):
         risk_types = [h["risk_type"] for h in hypotheses]
         self.assertNotIn("hook_gate_render_mismatch", risk_types)
 
+    def test_hook_edge_to_plain_utility_not_in_supporting_lead_ids(self):
+        # Hook has one edge to a component (valid consumer) and one edge to a plain lowercase
+        # utility function.  The utility edge must NOT appear in supporting_lead_ids, and
+        # confidence must reflect the consumer edge (medium), not the utility edge.
+        hypotheses = self._call(
+            changed_files=["src/useAuth.ts"],
+            changed_symbols=[_sym("useAuth", "src/useAuth.ts", lead_id="lead-hook-1")],
+            direct_callers=[
+                _edge("Dashboard", "useAuth", "lead-consumer-edge"),   # hook ↔ component
+                _edge("utilHelper", "useAuth", "lead-utility-edge"),   # hook ↔ plain utility
+            ],
+            review_leads={
+                "changed_symbols": [{"lead_id": "lead-hook-1", "path": "src/useAuth.ts"}],
+                "direct_callers": [
+                    {
+                        "lead_id": "lead-consumer-edge",
+                        "subject": "mod.Dashboard",
+                        "object": "mod.useAuth",
+                    },
+                    {
+                        "lead_id": "lead-utility-edge",
+                        "subject": "mod.utilHelper",
+                        "object": "mod.useAuth",
+                    },
+                ],
+            },
+        )
+        hyp = next(h for h in hypotheses if h["risk_type"] == "hook_gate_render_mismatch")
+        slids = set(hyp["supporting_lead_ids"])
+        self.assertIn("lead-hook-1", slids)
+        self.assertIn("lead-consumer-edge", slids)
+        self.assertNotIn("lead-utility-edge", slids)
+        self.assertEqual(hyp["confidence"], "medium")
+
+    def test_hook_edge_only_to_plain_utility_yields_no_consumer_edge_confidence(self):
+        # Hook has only an edge to a lowercase utility — no component/hook endpoint.
+        # Confidence must be weak (no consumer edge), and the utility edge lead_id must
+        # be absent from supporting_lead_ids.
+        hypotheses = self._call(
+            changed_files=["src/useFormat.ts"],
+            changed_symbols=[_sym("useFormat", "src/useFormat.ts", lead_id="lead-hook-2")],
+            direct_callers=[_edge("formatHelper", "useFormat", "lead-utility-only")],
+            review_leads={
+                "changed_symbols": [{"lead_id": "lead-hook-2", "path": "src/useFormat.ts"}],
+                "direct_callers": [
+                    {
+                        "lead_id": "lead-utility-only",
+                        "subject": "mod.formatHelper",
+                        "object": "mod.useFormat",
+                    }
+                ],
+            },
+        )
+        hyp = next(h for h in hypotheses if h["risk_type"] == "hook_gate_render_mismatch")
+        self.assertEqual(hyp["confidence"], "weak")
+        self.assertNotIn("lead-utility-only", set(hyp["supporting_lead_ids"]))
+
+
+class TestEvidenceRefsFromFactRows(unittest.TestCase):
+    """Regression: _evidence_refs_from_leads must extract coordinates from relation rows."""
+
+    def _call(self, **ctx_overrides):
+        return review_hypotheses_for_context(**_base_context(**ctx_overrides))
+
+    def _fact_row(self, lead_id: str, subject: str, object_: str, path: str, line_start: int) -> dict:
+        """Build a realistic _fact_result-shaped caller row with evidence bytes_ref."""
+        return {
+            "lead_id": lead_id,
+            "predicate": "CALLS",
+            "subject": subject,
+            "object": object_,
+            "qualifier": {},
+            "evidence": [
+                {
+                    "target_id": "fact-123",
+                    "bytes_ref": {
+                        "repo": "myrepo",
+                        "path": path,
+                        "line_start": line_start,
+                        "line_end": line_start + 2,
+                    },
+                }
+            ],
+        }
+
+    def test_evidence_refs_from_fact_rows_include_path_and_line_from_bytes_ref(self):
+        # Hypothesis built from realistic _fact_result caller rows.
+        # evidence_refs must contain path + line_start pulled from bytes_ref,
+        # and also carry subject/object/predicate strings.
+        caller_row = self._fact_row(
+            lead_id="lead-caller-1",
+            subject="api.create_order",
+            object_="payments.charge",
+            path="api/orders.py",
+            line_start=42,
+        )
+        hypotheses = self._call(
+            changed_files=["payments/charge.py"],
+            changed_symbols=[
+                {
+                    "qualname": "charge",
+                    "display_name": "payments.charge",
+                    "qualified_name": "payments.charge",
+                    "path": "payments/charge.py",
+                }
+            ],
+            direct_callers=[
+                {"subject": "mod.create_order", "object": "mod.charge"}
+            ],
+            direct_callees=[],
+            review_leads={
+                "changed_symbols": [{"lead_id": "lead-sym-1", "path": "payments/charge.py"}],
+                "direct_callers": [caller_row],
+            },
+        )
+        hyp = next(
+            (h for h in hypotheses if h["risk_type"] == "direct_call_contract_drift"), None
+        )
+        self.assertIsNotNone(hyp, "direct_call_contract_drift hypothesis not emitted")
+        refs = hyp["evidence_refs"]
+        self.assertTrue(refs, "evidence_refs is empty")
+        caller_ref = next((r for r in refs if r.get("lead_id") == "lead-caller-1"), None)
+        self.assertIsNotNone(caller_ref, "no ref for lead-caller-1 in evidence_refs")
+        self.assertEqual(caller_ref.get("path"), "api/orders.py")
+        self.assertEqual(caller_ref.get("line_start"), 42)
+        self.assertEqual(caller_ref.get("predicate"), "CALLS")
+        self.assertEqual(caller_ref.get("subject"), "api.create_order")
+        self.assertEqual(caller_ref.get("object"), "payments.charge")
+
 
 class TestTestLocksInRegression(unittest.TestCase):
     """Family: test_locks_in_regression"""

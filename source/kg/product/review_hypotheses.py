@@ -162,17 +162,49 @@ def _evidence_refs_from_leads(review_leads: JsonObject, fields: tuple[str, ...])
             lead_id = row.get("lead_id")
             if isinstance(lead_id, str) and lead_id:
                 ref["lead_id"] = lead_id
+            # Flat coordinate fields present on symbol rows.
             for key in ("repo", "path", "line_start", "line_end", "qualified_name", "qualname"):
                 val = row.get(key)
                 if val is not None:
                     ref[key] = val
-            caller = row.get("caller_symbol") or row.get("subject")
+            # Relation-row fields: predicate/subject/object are always present on _fact_result rows.
+            for key in ("predicate", "subject", "object"):
+                val = row.get(key)
+                if isinstance(val, str) and val:
+                    ref[key] = val
+            # When flat path/line_start are absent (relation rows), pull from first evidence bytes_ref.
+            if "path" not in ref or "line_start" not in ref:
+                evidence_list = row.get("evidence")
+                if isinstance(evidence_list, list):
+                    for ev in evidence_list:
+                        if not isinstance(ev, dict):
+                            continue
+                        bytes_ref = ev.get("bytes_ref")
+                        if not isinstance(bytes_ref, dict):
+                            continue
+                        for coord_key in ("repo", "path", "line_start", "line_end"):
+                            if coord_key not in ref:
+                                val = bytes_ref.get(coord_key)
+                                if val is not None:
+                                    ref[coord_key] = val
+                        if "path" in ref:
+                            break
+            # Fallback: call_site carries qualifier-level source coordinates.
+            if "path" not in ref and "line_start" not in ref:
+                call_site = row.get("call_site")
+                if isinstance(call_site, dict):
+                    for coord_key in ("repo", "path", "line_start", "line_end"):
+                        if coord_key not in ref:
+                            val = call_site.get(coord_key)
+                            if val is not None:
+                                ref[coord_key] = val
+            caller = row.get("caller_symbol") or (row.get("subject") if isinstance(row.get("subject"), dict) else None)
             if isinstance(caller, dict):
                 for key in ("qualified_name", "qualname", "repo", "path"):
                     val = caller.get(key)
                     if val is not None:
                         ref[f"caller_{key}"] = val
-            callee = row.get("callee_symbol") or row.get("object")
+            callee = row.get("callee_symbol") or (row.get("object") if isinstance(row.get("object"), dict) else None)
             if isinstance(callee, dict):
                 for key in ("qualified_name", "qualname", "repo", "path"):
                     val = callee.get(key)
@@ -622,8 +654,19 @@ def _hook_gate_render_mismatch(
             obj_ = str(row.get("object") or "")
             subj_seg = subj.rsplit(".", 1)[-1]
             obj_seg = obj_.rsplit(".", 1)[-1]
-            hook_touched = (subj in hook_names or subj_seg in hook_names or obj_ in hook_names or obj_seg in hook_names)
-            if hook_touched:
+            # Mirror the consumer-edge detector: only include edges where one end
+            # is a hook name and the other end is a component or hook.
+            is_consumer_edge = (
+                (
+                    (obj_ in hook_names or obj_seg in hook_names)
+                    and (_is_component_name(subj_seg) or _is_hook_name(subj_seg))
+                )
+                or (
+                    (subj in hook_names or subj_seg in hook_names)
+                    and (_is_component_name(obj_seg) or _is_hook_name(obj_seg))
+                )
+            )
+            if is_consumer_edge:
                 lead_ids.append(lid)
     confidence = "medium" if has_consumer_edge else "weak"
     source_checks = [
