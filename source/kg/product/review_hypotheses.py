@@ -7,6 +7,8 @@ _TEST_PATH_SEGMENTS = frozenset({"test", "tests", "spec", "specs", "__tests__"})
 _CONFIG_EXTENSIONS = frozenset({".json", ".yaml", ".yml", ".toml", ".ini", ".env"})
 _CONFIG_BASENAMES = frozenset({"Dockerfile"})
 _STYLESHEET_EXTENSIONS = frozenset({".css", ".scss", ".sass", ".less"})
+_FRONTEND_COMPONENT_EXTENSIONS = frozenset({".tsx", ".jsx"})
+_FRONTEND_HOOK_EXTENSIONS = frozenset({".ts", ".tsx", ".js", ".jsx"})
 _CONFIDENCE_RANK = {"strong": 2, "medium": 1, "weak": 0}
 _FRAMEWORK_IMPACT_KEYS = ("changed_models", "model_fields", "model_relations", "serializers", "views", "tasks")
 _RUNTIME_SURFACE_KEYS = ("endpoints", "endpoint_consumers", "event_channels", "deploy_mappings")
@@ -58,6 +60,31 @@ def review_hypotheses_for_context(
     if h:
         hypotheses.append(h)
     h = _test_or_config_masks_runtime_change(
+        changed_files=changed_files,
+        changed_symbols=changed_symbols,
+        direct_callers=direct_callers,
+        direct_callees=direct_callees,
+        review_leads=review_leads,
+    )
+    if h:
+        hypotheses.append(h)
+    h = _component_list_render_identity_drift(
+        changed_symbols=changed_symbols,
+        direct_callers=direct_callers,
+        direct_callees=direct_callees,
+        review_leads=review_leads,
+    )
+    if h:
+        hypotheses.append(h)
+    h = _hook_gate_render_mismatch(
+        changed_symbols=changed_symbols,
+        direct_callers=direct_callers,
+        direct_callees=direct_callees,
+        review_leads=review_leads,
+    )
+    if h:
+        hypotheses.append(h)
+    h = _test_locks_in_regression(
         changed_files=changed_files,
         changed_symbols=changed_symbols,
         direct_callers=direct_callers,
@@ -383,6 +410,162 @@ def _low_coverage_stylesheet_gap(
         risk_type="low_coverage_stylesheet_gap",
         confidence="weak",
         why="Stylesheet files changed but the KG has low coverage of styling contracts, so impact must be inspected manually.",
+        evidence_refs=evidence_refs,
+        source_checks=source_checks,
+        supporting_lead_ids=lead_ids[:10],
+    )
+
+
+def _path_extension(path: str) -> str:
+    dot_pos = path.rfind(".")
+    return path[dot_pos:] if dot_pos >= 0 else ""
+
+
+def _is_component_symbol(sym: JsonObject) -> bool:
+    name = sym.get("name") or ""
+    path = sym.get("path") or ""
+    return bool(name) and name[0].isupper() and _path_extension(path) in _FRONTEND_COMPONENT_EXTENSIONS
+
+
+def _is_hook_symbol(sym: JsonObject) -> bool:
+    name = sym.get("name") or ""
+    path = sym.get("path") or ""
+    return (
+        len(name) > 3
+        and name.startswith("use")
+        and name[3].isupper()
+        and _path_extension(path) in _FRONTEND_HOOK_EXTENSIONS
+    )
+
+
+def _is_component_name(name: str) -> bool:
+    return bool(name) and name[0].isupper()
+
+
+def _is_hook_name(name: str) -> bool:
+    return len(name) > 3 and name.startswith("use") and name[3].isupper()
+
+
+def _component_list_render_identity_drift(
+    *,
+    changed_symbols: list[JsonObject],
+    direct_callers: list[JsonObject],
+    direct_callees: list[JsonObject],
+    review_leads: JsonObject,
+) -> JsonObject | None:
+    component_syms = [s for s in changed_symbols if _is_component_symbol(s)]
+    if not component_syms:
+        return None
+    if not direct_callers and not direct_callees:
+        return None
+    evidence_refs: list[JsonObject] = []
+    for sym in component_syms[:5]:
+        ref: JsonObject = {}
+        for key in ("path", "name", "kind"):
+            val = sym.get(key)
+            if val is not None:
+                ref[key] = val
+        if ref:
+            evidence_refs.append(ref)
+    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "direct_callers", "direct_callees"))
+    confidence = "medium" if lead_ids else "weak"
+    source_checks = [
+        "Inspect changed component render paths for list keys and branch parity.",
+        "Check computed values against rendered output to detect identity drift.",
+    ]
+    return _make_hypothesis(
+        risk_type="component_list_render_identity_drift",
+        confidence=confidence,
+        why="Changed component symbols have call edges; list/child rendering identity (keys, memoization, branch parity) may have drifted.",
+        evidence_refs=evidence_refs,
+        source_checks=source_checks,
+        supporting_lead_ids=lead_ids[:10],
+    )
+
+
+def _hook_gate_render_mismatch(
+    *,
+    changed_symbols: list[JsonObject],
+    direct_callers: list[JsonObject],
+    direct_callees: list[JsonObject],
+    review_leads: JsonObject,
+) -> JsonObject | None:
+    hook_syms = [s for s in changed_symbols if _is_hook_symbol(s)]
+    if not hook_syms:
+        return None
+    hook_names = {s.get("name") for s in hook_syms if s.get("name")}
+    has_consumer_edge = False
+    for edge in direct_callers:
+        subj = edge.get("subject") or ""
+        obj_ = edge.get("object") or ""
+        if obj_ in hook_names and (_is_component_name(subj) or _is_hook_name(subj)):
+            has_consumer_edge = True
+            break
+        if subj in hook_names and (_is_component_name(obj_) or _is_hook_name(obj_)):
+            has_consumer_edge = True
+            break
+    if not has_consumer_edge:
+        for edge in direct_callees:
+            subj = edge.get("subject") or ""
+            obj_ = edge.get("object") or ""
+            if subj in hook_names and (_is_component_name(obj_) or _is_hook_name(obj_)):
+                has_consumer_edge = True
+                break
+            if obj_ in hook_names and (_is_component_name(subj) or _is_hook_name(subj)):
+                has_consumer_edge = True
+                break
+    evidence_refs: list[JsonObject] = []
+    for sym in hook_syms[:5]:
+        ref: JsonObject = {}
+        for key in ("path", "name", "kind"):
+            val = sym.get(key)
+            if val is not None:
+                ref[key] = val
+        if ref:
+            evidence_refs.append(ref)
+    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "direct_callers", "direct_callees"))
+    confidence = "medium" if has_consumer_edge else "weak"
+    source_checks = [
+        "Compare hook return contract against each consuming call site's usage and render gate.",
+        "Verify components consuming this hook handle all return states, including loading and error.",
+    ]
+    return _make_hypothesis(
+        risk_type="hook_gate_render_mismatch",
+        confidence=confidence,
+        why="A changed hook may have a shifted gate or permission contract; components consuming it may diverge in rendered output.",
+        evidence_refs=evidence_refs,
+        source_checks=source_checks,
+        supporting_lead_ids=lead_ids[:10],
+    )
+
+
+def _test_locks_in_regression(
+    *,
+    changed_files: list[str],
+    changed_symbols: list[JsonObject],
+    direct_callers: list[JsonObject],
+    direct_callees: list[JsonObject],
+    review_leads: JsonObject,
+) -> JsonObject | None:
+    has_test_file = any(_is_test_file(f) for f in changed_files)
+    if not has_test_file:
+        return None
+    non_test_syms = [s for s in changed_symbols if not _is_test_file(s.get("path") or "")]
+    if not non_test_syms:
+        return None
+    if not direct_callers and not direct_callees:
+        return None
+    test_files = [f for f in changed_files if _is_test_file(f)]
+    evidence_refs: list[JsonObject] = [{"path": f} for f in test_files[:5]]
+    source_checks = [
+        "Verify updated tests exercise behavior (interaction and outcome), not just presence or text.",
+        "Check whether test assertions reflect new invariants or lock in a regression.",
+    ]
+    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
+    return _make_hypothesis(
+        risk_type="test_locks_in_regression",
+        confidence="weak",
+        why="Updated test files and changed code symbols share call edges; updated tests may assert the new (possibly broken) behavior.",
         evidence_refs=evidence_refs,
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
