@@ -4388,6 +4388,7 @@ def _review_context_surface_status(
 
 
 _REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN = 200
+_REVIEW_CONTEXT_SOURCE_INSPECTION_TERMS_MAX = 12
 
 
 def _review_context_unknown_surface_status_row(
@@ -4396,7 +4397,7 @@ def _review_context_unknown_surface_status_row(
     changed_symbols: list[JsonObject],
 ) -> JsonObject:
     token = token[:_REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN]
-    words = [w for w in token.replace("-", "_").replace(" ", "_").split("_") if w]
+    words = [w for w in token.replace("-", "_").replace(" ", "_").split("_") if w and len(w) >= 2]
     terms: list[str] = []
     seen: set[str] = set()
     for t in [token] + words:
@@ -4408,10 +4409,12 @@ def _review_context_unknown_surface_status_row(
         if name and name not in seen:
             terms.append(name)
             seen.add(name)
+            if len(terms) >= _REVIEW_CONTEXT_SOURCE_INSPECTION_TERMS_MAX:
+                break
     return {
         "surface": token,
         "status": "unsupported_or_unlinked",
-        "source_inspection_terms": terms,
+        "source_inspection_terms": terms[:_REVIEW_CONTEXT_SOURCE_INSPECTION_TERMS_MAX],
     }
 
 

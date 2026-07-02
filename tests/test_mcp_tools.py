@@ -3922,6 +3922,31 @@ class McpToolsTest(unittest.TestCase):
         for term in unknown_rows[0]["source_inspection_terms"]:
             self.assertLessEqual(len(term), 200)
 
+    def test_review_context_unknown_surface_pathological_separators(self) -> None:
+        # pathological token with many single-char components → no 1-char terms, capped at 12
+        pathological_token = "a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r_s_t"
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "requested_surfaces": [pathological_token],
+                    "limit": 10,
+                },
+            )
+
+        unknown_rows = [r for r in result["surface_status"] if r.get("status") == "unsupported_or_unlinked"]
+        self.assertEqual(len(unknown_rows), 1)
+        row = unknown_rows[0]
+        terms = row["source_inspection_terms"]
+        # no 1-char terms
+        for term in terms:
+            self.assertGreaterEqual(len(term), 2, f"Found 1-char term: {term}")
+        # capped at 12
+        self.assertLessEqual(len(terms), 12)
+
     def test_review_context_surfaces_path_matched_endpoint_consumers(self) -> None:
         with _fixture_snapshot(endpoint_consumer=True) as kg:
             result = call_tool(
