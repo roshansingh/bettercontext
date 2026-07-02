@@ -34,16 +34,25 @@ def hypothesis_stable_id(
     tuples from evidence_refs so every distinct evidence set gets a distinct ID, while the
     same inputs always produce the same ID regardless of call order.
     """
-    coord_tuples = sorted(
+    def _line_sort_key(v: object) -> tuple[bool, int, str]:
+        """Deterministic sort key for a line number that may be None, int, or str."""
+        if v is None:
+            return (True, 0, "")
+        if isinstance(v, int):
+            return (False, v, "")
+        return (False, 0, str(v))
+
+    raw_coords = [
         (
-            ref.get("repo") or "",
-            ref.get("path") or "",
+            str(ref.get("repo") or ""),
+            str(ref.get("path") or ""),
             ref.get("line_start"),
             ref.get("line_end"),
         )
         for ref in evidence_refs
         if isinstance(ref, dict)
-    )
+    ]
+    coord_tuples = sorted(raw_coords, key=lambda t: (t[0], t[1], _line_sort_key(t[2]), _line_sort_key(t[3])))
     payload: JsonObject = {
         "risk_type": risk_type,
         "supporting_lead_ids": sorted(supporting_lead_ids),

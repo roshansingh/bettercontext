@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import unittest
 
-from source.kg.product.mcp_tools import REVIEW_CONTEXT_SURFACES, _review_context_surface_status
+from source.kg.product.mcp_tools import (
+    REVIEW_CONTEXT_SURFACES,
+    _REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN,
+    _review_context_surface_status,
+    _review_context_unknown_surface_status_row,
+)
 from source.kg.product.output_budget import enforce_review_context_budget
 from source.kg.product.review_attribution import hypothesis_stable_id
 from source.kg.core.models import canonical_json
@@ -60,6 +65,18 @@ class TestHypothesisStableIdIsEvidenceSpecific(unittest.TestCase):
     def test_empty_leads_and_refs_still_produces_stable_id(self):
         id1 = hypothesis_stable_id("test_risk", [], [])
         id2 = hypothesis_stable_id("test_risk", [], [])
+        self.assertEqual(id1, id2)
+        self.assertTrue(id1.startswith("hypothesis:test_risk:"))
+
+    def test_mixed_none_int_line_start_no_exception(self):
+        # Regression: refs sharing repo+path with None and int line_start must not raise TypeError.
+        refs = [
+            {"repo": "svc", "path": "src/a.py", "line_start": None, "line_end": 10},
+            {"repo": "svc", "path": "src/a.py", "line_start": 3, "line_end": None},
+            {"repo": "svc", "path": "src/a.py", "line_start": "5", "line_end": 7},
+        ]
+        id1 = hypothesis_stable_id("test_risk", ["lead-1"], refs)
+        id2 = hypothesis_stable_id("test_risk", ["lead-1"], refs)
         self.assertEqual(id1, id2)
         self.assertTrue(id1.startswith("hypothesis:test_risk:"))
 
@@ -188,6 +205,23 @@ class TestSupportingLeadIdsReconciliationAfterEviction(unittest.TestCase):
         for hyp in hyps:
             if hyp.get("risk_type") == "direct_call_contract_drift":
                 self.assertEqual(hyp["hypothesis_id"], original_id)
+
+
+class TestUnknownSurfaceSymbolNameTruncation(unittest.TestCase):
+    """Regression: symbol-derived terms in unknown surface rows must be capped at 200 chars."""
+
+    def test_long_qualified_name_is_truncated_in_terms(self):
+        long_qualname = "a.very.long." + "x" * 250
+        row = _review_context_unknown_surface_status_row(
+            "authz",
+            changed_symbols=[{"qualified_name": long_qualname}],
+        )
+        for term in row["source_inspection_terms"]:
+            self.assertLessEqual(
+                len(term),
+                _REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN,
+                f"term exceeds {_REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN} chars: {term!r}",
+            )
 
 
 if __name__ == "__main__":

@@ -4404,7 +4404,7 @@ def _review_context_unknown_surface_status_row(
             terms.append(t)
             seen.add(t)
     for row in changed_symbols[:5]:
-        name = str(row.get("qualified_name") or row.get("qualname") or "")
+        name = str(row.get("qualified_name") or row.get("qualname") or "")[:_REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN]
         if name and name not in seen:
             terms.append(name)
             seen.add(name)
