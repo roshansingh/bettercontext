@@ -826,6 +826,15 @@ def _review_lead_only_budget_packet(
 
 
 def _sync_review_lead_status_from_packet(result: JsonObject) -> None:
+    """Sync review_lead_status counts from the current review_leads rows.
+
+    N1 coherence rule: answer-packet top_* rows are always a subset of review_leads rows;
+    returned counts count review_leads. After syncing counts, clip any answer-packet top_*
+    list to only the rows whose lead_id still exists in the corresponding review_leads list
+    — so top_changed_symbols ⊆ review_leads.changed_symbols, etc. Rows without a lead_id
+    are kept as-is (they cannot be cross-referenced). This is the single authoritative
+    coherence checkpoint called after every eviction step.
+    """
     status = result.get("review_lead_status")
     if not isinstance(status, dict):
         return
@@ -882,6 +891,54 @@ def _sync_review_lead_status_from_packet(result: JsonObject) -> None:
     packet = result.get("review_answer_packet")
     if isinstance(packet, dict):
         packet["review_lead_status"] = synced_status
+        # N1: clip answer-packet top_* to the rows mirrored in review_leads.
+        # Rows without a lead_id have no cross-reference and are kept as-is.
+        _clip_answer_packet_top_to_review_leads(packet, review_leads)
+
+
+# Map from answer-packet field → review_leads field for N1 coherence clipping.
+_ANSWER_PACKET_TO_REVIEW_LEADS_FIELD = {
+    "top_changed_symbols": "changed_symbols",
+    "top_direct_callers": "direct_callers",
+    "top_direct_callees": "direct_callees",
+    "top_transitive_callers": "transitive_callers",
+}
+
+
+def _clip_answer_packet_top_to_review_leads(
+    answer_packet: JsonObject, review_leads: JsonObject
+) -> None:
+    """N1: Clip each answer-packet top_* list to only rows present in review_leads.
+
+    Rows without a lead_id are kept as-is (they carry no cross-reference). Rows with a
+    lead_id are kept only if that lead_id appears in the corresponding review_leads list.
+    This prevents the incoherence where top_changed_symbols shows a symbol that was
+    evicted from review_leads.changed_symbols, which would make returned counts lie.
+    """
+    for ap_field, rl_field in _ANSWER_PACKET_TO_REVIEW_LEADS_FIELD.items():
+        ap_rows = answer_packet.get(ap_field)
+        if not isinstance(ap_rows, list):
+            continue
+        rl_rows = review_leads.get(rl_field)
+        if not isinstance(rl_rows, list):
+            # review_leads field absent or non-list → all rows without lead_id survive.
+            surviving_ids: set[str] = set()
+        else:
+            surviving_ids = {
+                row["lead_id"]
+                for row in rl_rows
+                if isinstance(row, dict) and isinstance(row.get("lead_id"), str) and row["lead_id"]
+            }
+        clipped = [
+            row
+            for row in ap_rows
+            if isinstance(row, dict) and (
+                not isinstance(row.get("lead_id"), str)
+                or not row.get("lead_id")
+                or row["lead_id"] in surviving_ids
+            )
+        ]
+        answer_packet[ap_field] = clipped
 
 
 def enforce_reverse_impact_budget(
@@ -2827,6 +2884,95 @@ def _protect_review_hypotheses_floor(
     return result
 
 
+_REVIEW_BROAD_CONTEXT_KEYS = frozenset(
+    {
+        "application_impact",
+        "framework_impact",
+        "runtime_surfaces",
+        "impact",
+    }
+)
+
+
+def _is_broad_context_label(label: str) -> bool:
+    """Return True if the dotted path label is a broad application/runtime/framework section.
+
+    Both the top-level keys (e.g. ``application_impact``) and their mirrors inside
+    ``review_answer_packet`` (e.g. ``review_answer_packet.application``) qualify as
+    broad-context victims, so hypotheses can be funded before inspecting signal-heavy
+    lead/coordinate/anchor sections.
+    """
+    root = label.split(".")[0]
+    if root in _REVIEW_BROAD_CONTEXT_KEYS:
+        return True
+    if root == "review_answer_packet":
+        inner = label.split(".", 2)[1] if label.count(".") >= 1 else ""
+        broad_ap_keys = {"application", "framework", "runtime", "runtime_surfaces", "framework_impact", "application_impact"}
+        return inner in broad_ap_keys
+    return False
+
+
+def _evict_broad_context_to_fit(result: JsonObject, *, max_chars: int) -> set[str]:
+    """Evict rows from broad application/runtime/framework sections until the packet fits.
+
+    N2 targeted eviction: only broad-context lists (application_impact, framework_impact,
+    runtime_surfaces, and their answer-packet mirrors) are shrunk. Hypothesis lists, lead
+    rows, coordinates, and anchors are untouched. Returns the labels of lists that lost rows.
+    """
+    evicted: set[str] = set()
+    guard = 0
+    while _current_chars(result) > max_chars and guard < 5_000:
+        guard += 1
+        # Protect hypotheses while finding the broad-context victim
+        protected = result.pop("review_hypotheses", None)
+        answer_packet = result.get("review_answer_packet")
+        protected_mirror = None
+        if isinstance(answer_packet, dict):
+            protected_mirror = answer_packet.pop("top_review_hypotheses", None)
+        # Only consider broad-context lists as victims
+        target = _largest_broad_context_row_list(result)
+        if protected is not None:
+            result["review_hypotheses"] = protected
+        if isinstance(answer_packet, dict) and protected_mirror is not None:
+            answer_packet["top_review_hypotheses"] = protected_mirror
+        if target is None:
+            break
+        label, rows = target
+        rows.pop()
+        evicted.add(label)
+    return evicted
+
+
+def _largest_broad_context_row_list(node: object) -> tuple[str, list] | None:
+    """Find the largest broad-context (application/runtime/framework) list in the packet.
+
+    Only searches inside ``_REVIEW_BROAD_CONTEXT_KEYS`` sections and their
+    ``review_answer_packet.*`` mirrors, leaving lead/coordinate/anchor sections untouched.
+    """
+    best_size = 0
+    best: tuple[str, list] | None = None
+    stack: list[tuple[str, object]] = [("", node)]
+    while stack:
+        label, current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in _HARD_CAP_PROTECTED_KEYS or (not label and key in _HARD_CAP_PROTECTED_TOPLEVEL):
+                    continue
+                child_label = f"{label}.{key}" if label else key
+                if isinstance(value, list) and value and any(isinstance(x, dict) for x in value):
+                    if _is_broad_context_label(child_label):
+                        size = len(canonical_json(value))
+                        if size > best_size:
+                            best_size, best = size, (child_label, value)
+                # Only recurse into broad-context subtrees (or root dict)
+                if not label or _is_broad_context_label(child_label) or label == "review_answer_packet":
+                    stack.append((child_label, value))
+        elif isinstance(current, list):
+            for index, item in enumerate(current):
+                stack.append((f"{label}[{index}]", item))
+    return best
+
+
 def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]:
     """Evict rows from the largest non-hypothesis row list until the packet fits.
 
@@ -2872,7 +3018,10 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
       answer_packet_returned_count — mirror survivors in review_answer_packet.top_review_hypotheses
       truncated_count — available - returned
       reason — "none_generated" | "budget" | "low_coverage" | null
+      available_risk_types — sorted list of risk_type strings from the pre-budget generated set
+        (not truncated by budget; bounded at 12 entries; empty when no hypotheses generated)
     """
+    _MAX_AVAILABLE_RISK_TYPES = 12
     available = len(original_hypotheses)
     returned = len([h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)])
     answer_packet = result.get("review_answer_packet")
@@ -2894,12 +3043,16 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
         reason = "budget"
     else:
         reason = None
+    available_risk_types = sorted(
+        {str(h.get("risk_type") or "") for h in original_hypotheses if isinstance(h, dict) and h.get("risk_type")}
+    )[:_MAX_AVAILABLE_RISK_TYPES]
     result["review_hypothesis_status"] = {
         "available_count": available,
         "returned_count": returned,
         "answer_packet_returned_count": mirror_count,
         "truncated_count": truncated_count,
         "reason": reason,
+        "available_risk_types": available_risk_types,
     }
 
 
@@ -2949,6 +3102,55 @@ def _reconcile_hypothesis_lead_ids(result: JsonObject) -> None:
                     hyp["supporting_lead_ids"] = [lid for lid in lead_ids if lid in surviving]
 
 
+_REVIEW_HYPOTHESIS_HEADROOM_TARGET = 3
+
+
+def _restore_hypotheses_up_to_target(
+    result: JsonObject,
+    original_hypotheses: list[JsonObject],
+    *,
+    max_chars: int,
+    target: int,
+) -> set[str]:
+    """N2: Evict broad-context rows to fund up to ``target`` compacted hypotheses.
+
+    Priority order: hypotheses > leads > coordinates > anchors > inspection areas >
+    broad context. This step only evicts from broad application/runtime/framework sections
+    (and their answer-packet mirrors) — never from lead/coordinate/anchor sections.
+    Returns the set of section labels that had rows evicted.
+    """
+    if not original_hypotheses:
+        return set()
+    current_hyps = [h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)]
+    if len(current_hyps) >= min(target, len(original_hypotheses)):
+        return set()
+    evicted: set[str] = set()
+    # Try to restore hypotheses one by one (compacted), evicting broad context as needed.
+    for hyp in original_hypotheses[len(current_hyps) : target]:
+        compact_hyp = _compact_review_hypothesis(hyp)
+        hyp_cost = len(canonical_json(compact_hyp))
+        # Evict broad-context rows until there is room for this hypothesis.
+        broad_evicted = _evict_broad_context_to_fit(
+            result, max_chars=max(1, max_chars - hyp_cost - _HARD_CAP_AREA_RESERVE // 4)
+        )
+        evicted |= broad_evicted
+        # Re-check budget after broad eviction.
+        if _current_chars(result) + hyp_cost > max_chars:
+            break
+        # Append the hypothesis to the top-level list.
+        hyp_list = result.get("review_hypotheses")
+        if not isinstance(hyp_list, list):
+            result["review_hypotheses"] = [compact_hyp]
+        else:
+            hyp_list.append(compact_hyp)
+        if _current_chars(result) > max_chars:
+            # Didn't fit after all — roll back.
+            if isinstance(result.get("review_hypotheses"), list):
+                result["review_hypotheses"].pop()
+            break
+    return evicted
+
+
 def _finalize_review_hypothesis_budget(
     result: JsonObject, original_hypotheses: list[JsonObject], *, max_chars: int
 ) -> None:
@@ -2957,7 +3159,24 @@ def _finalize_review_hypothesis_budget(
     The status metadata is added after the budget passes measured the packet, so its extra
     chars must be paid for by evicting broad rows — never by exceeding the cap and never by
     dropping the protected hypotheses. Mutates ``result`` in place.
+
+    N2: Before syncing the mirror, attempt to restore up to min(3, available) compacted
+    hypotheses by evicting broad application/runtime/framework context first. This ensures
+    Grafana-shaped packets (modest headroom, fat broad sections) return top-3 hypotheses
+    instead of just the floor-of-1.
     """
+    # N2: Evict broad context to fund up to _REVIEW_HYPOTHESIS_HEADROOM_TARGET hypotheses.
+    broad_evicted = _restore_hypotheses_up_to_target(
+        result,
+        original_hypotheses,
+        max_chars=max_chars,
+        target=_REVIEW_HYPOTHESIS_HEADROOM_TARGET,
+    )
+    if broad_evicted:
+        _sync_review_lead_status_from_packet(result)
+        budget = result.get("output_budget")
+        if isinstance(budget, dict):
+            budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | broad_evicted)
     # Sync mirror within budget: keep as many top-level hypotheses as fit in the mirror,
     # starting from the highest-ranked (first). If none fit, mirror is empty — recorded in status.
     _sync_review_hypothesis_mirror_within_budget(result, max_chars=max_chars)
