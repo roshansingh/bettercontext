@@ -312,8 +312,7 @@ def _collect_signals_from_file(
                         continue
                     if not _handler_body_is_vacuous(handler.body):
                         continue
-                    h_line = getattr(handler, "lineno", enclosing.line)
-                    h_end = getattr(handler, "end_lineno", h_line)
+                    h_line, h_end = _node_line_span(handler)
                     signals.append(_Signal(
                         enclosing_entity=enclosing.entity,
                         enclosing_qualname=enclosing.qualname,

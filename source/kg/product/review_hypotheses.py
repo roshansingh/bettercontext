@@ -886,10 +886,9 @@ def _evidence_refs_from_risk_signals(signals: list[JsonObject]) -> list[JsonObje
 
 def _lead_ids_for_signal_subjects(
     signals: list[JsonObject],
-    changed_symbols: list[JsonObject],
     review_leads: JsonObject,
 ) -> list[str]:
-    """Return lead_ids from changed_symbols whose path/entity matches a signal subject."""
+    """Return lead_ids from review_leads["changed_symbols"] whose entity/path matches a signal subject."""
     sig_entity_ids: set[str] = set()
     sig_paths: set[str] = set()
     for sig in signals:
@@ -982,9 +981,7 @@ def _async_side_effect_lifecycle_drift(
     if not matching:
         return None
     evidence_refs = _evidence_refs_from_risk_signals(matching)
-    lead_ids = _lead_ids_for_signal_subjects(
-        matching, changed_symbols, review_leads
-    )
+    lead_ids = _lead_ids_for_signal_subjects(matching, review_leads)
     has_direct_edge = bool(direct_callers or direct_callees)
     confidence = "medium" if (lead_ids and has_direct_edge) else "weak"
     source_checks = [
@@ -1025,9 +1022,7 @@ def _swallowed_exception_state_drift(
     if not matching:
         return None
     evidence_refs = _evidence_refs_from_risk_signals(matching)
-    lead_ids = _lead_ids_for_signal_subjects(
-        matching, changed_symbols, review_leads
-    )
+    lead_ids = _lead_ids_for_signal_subjects(matching, review_leads)
     has_direct_edge = bool(direct_callers or direct_callees)
     confidence = "medium" if (lead_ids and has_direct_edge) else "weak"
     source_checks = [
