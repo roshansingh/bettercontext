@@ -2876,6 +2876,23 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     direct_callers_in_scope = public_direct_callers if changed_ranges else []
     direct_callees_in_scope = public_direct_callees if changed_ranges else []
     transitive_callers_in_scope = public_transitive_callers if changed_ranges else []
+    # Stamp lead_id / lead_kind on the in-scope lists before the lead packet and before
+    # building the result dict. The same stamped rows are used everywhere — top-level fields,
+    # review_leads, and hypotheses — so IDs survive budget compaction without re-derivation.
+    _stamped_in_scope = add_review_lead_ids(
+        {
+            "changed_symbols": changed_symbols_in_scope[:PLANNING_CONTEXT_SECTION_LIMIT],
+            "direct_callers": direct_callers_in_scope[:PLANNING_CONTEXT_SECTION_LIMIT],
+            "direct_callees": direct_callees_in_scope[:PLANNING_CONTEXT_SECTION_LIMIT],
+            "transitive_callers": transitive_callers_in_scope[:PLANNING_CONTEXT_SECTION_LIMIT],
+            "source_coordinates": source_coordinates[:PLANNING_CONTEXT_SECTION_LIMIT],
+        }
+    )
+    changed_symbols_in_scope = _stamped_in_scope["changed_symbols"]
+    direct_callers_in_scope = _stamped_in_scope["direct_callers"]
+    direct_callees_in_scope = _stamped_in_scope["direct_callees"]
+    transitive_callers_in_scope = _stamped_in_scope["transitive_callers"]
+    source_coordinates = _stamped_in_scope["source_coordinates"]
     summary = _review_context_summary(
         changed_files=changed_files,
         changed_symbols=changed_symbols_in_scope,
@@ -6438,7 +6455,7 @@ _TOOLS: dict[str, McpTool] = {
             "framework_impact includes parser-backed support facts for Django/Celery model fields, model relations, serializers, view/model bindings, tasks, and bounded model relationship paths when present. "
             "authz_surface is available from planning_context/get_service_brief for endpoint-to-handler permission evidence; use source inspection for dynamic middleware or framework defaults not represented in the packet. "
             "application_impact groups changed app/package namespace surfaces into API/model/serializer/worker/scheduled-job sections, app-scoped runtime facts, and unlinked cross-repo name leads that require separate verification when those sections are present or explicitly requested. "
-            "review_hypotheses contains hypothesis_id-tagged candidate source-inspection leads with risk_type, confidence, and evidence_refs; read them as inspection candidates, not proven facts. "
+            "review_hypotheses contains hypothesis_id-tagged candidates with risk_type, confidence, and evidence_refs. "
             "Use it when you know the changed files and need deterministic static review context before drilling into narrower MCP tools. "
             "Large packets are bounded: when output_budget is present the detail rows were compacted to a coordinate-bearing head start, so inspect source coordinates or call narrower changed_ranges/exact tools for omitted detail. "
             "Does not infer deploy blockers unless explicitly requested, summarize diffs with an LLM, or invent cross-repo and runtime-only impact. "

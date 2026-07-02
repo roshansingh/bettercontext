@@ -26,6 +26,13 @@ def review_hypotheses_for_context(
     review_lead_status: JsonObject,
 ) -> list[JsonObject]:
     low_coverage = review_lead_status.get("coverage_status") == "low_coverage"
+    if low_coverage:
+        h = _low_coverage_stylesheet_gap(
+            changed_files=changed_files,
+            low_coverage=True,
+            review_leads=review_leads,
+        )
+        return [h] if h else []
     has_surface_signal = bool(
         _has_framework_signal(framework_impact)
         or _has_runtime_signal(runtime_surfaces)
@@ -59,13 +66,6 @@ def review_hypotheses_for_context(
     )
     if h:
         hypotheses.append(h)
-    h = _low_coverage_stylesheet_gap(
-        changed_files=changed_files,
-        low_coverage=low_coverage,
-        review_leads=review_leads,
-    )
-    if h:
-        hypotheses.append(h)
     hypotheses.sort(
         key=lambda row: (
             -len(row.get("supporting_lead_ids") or []),
@@ -74,7 +74,7 @@ def review_hypotheses_for_context(
             str(row.get("risk_type") or ""),
         )
     )
-    return hypotheses
+    return hypotheses[:5]
 
 
 def _has_framework_signal(framework_impact: JsonObject) -> bool:
@@ -216,7 +216,7 @@ def _framework_contract_drift(
     lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="framework_contract_drift",
-        confidence="medium",
+        confidence="medium" if lead_ids else "weak",
         why="Framework-declared models, serializers, views, or tasks are affected by the changed code.",
         evidence_refs=evidence_refs[:5],
         source_checks=source_checks,
@@ -251,7 +251,7 @@ def _runtime_endpoint_or_event_contract_drift(
     lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="runtime_endpoint_or_event_contract_drift",
-        confidence="medium",
+        confidence="medium" if lead_ids else "weak",
         why="The changed repo exposes runtime endpoints, event channels, or deploy mappings that can carry the change to other services.",
         evidence_refs=evidence_refs[:5],
         source_checks=source_checks,
@@ -298,7 +298,7 @@ def _application_surface_contract_drift(
     lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="application_surface_contract_drift",
-        confidence="medium",
+        confidence="medium" if lead_ids else "weak",
         why="Same-repo application surfaces or runtime facts overlap the changed code and can shift application-level contracts.",
         evidence_refs=evidence_refs[:5],
         source_checks=source_checks,

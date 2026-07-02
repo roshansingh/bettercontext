@@ -50,7 +50,12 @@ def review_stable_id(prefix: str, row: JsonObject, *, fallback_kind: str) -> str
         if row.get(key) not in (None, "", [], {})
     }
     if not payload:
-        payload = {"fallback_kind": fallback_kind, "row": str(row)}
+        stable_projection = {
+            key: row.get(key)
+            for key in ("lead_kind", "risk_type", "predicate", "subject", "object", "repo", "path")
+            if row.get(key) not in (None, "", [], {})
+        }
+        payload = {"fallback_kind": fallback_kind, "projection": stable_projection}
     digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:16]
     return f"{prefix}:{fallback_kind}:{digest}"
 
