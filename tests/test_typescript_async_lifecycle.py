@@ -366,6 +366,18 @@ class UnawaitedAsyncCallTest(unittest.TestCase):
         signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
         self.assertEqual(signals, [], f"Promise.all with paren arrow must not emit unawaited_async_call: {signals}")
 
+    def test_promise_all_paren_argument_emits_no_signal(self) -> None:
+        # await Promise.all((ids.map(id => processItem(id)))) — paren AROUND the map
+        # call, mid-walk — parens must be transparent anywhere in the upward walk
+        source = _PROMISE_ALL.replace(
+            "await Promise.all(ids.map((id) => processItem(id)));",
+            "await Promise.all((ids.map((id) => processItem(id))));",
+        )
+        self.assertIn("Promise.all((ids.map", source)
+        sf, _, _ = _build({"saver.ts": source})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertEqual(signals, [], f"Promise.all((...map(...))) must not emit unawaited_async_call: {signals}")
+
 
 @unittest.skipIf(not NODE_AVAILABLE, "node not available")
 class SignalCapTest(unittest.TestCase):

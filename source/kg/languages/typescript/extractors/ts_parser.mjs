@@ -3425,7 +3425,12 @@ function isInsidePromiseAll(callNode) {
       // Any other call: stop
       return false;
     }
-    if (ts.isArrayLiteralExpression(node) || ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+    if (
+      ts.isArrayLiteralExpression(node) ||
+      ts.isArrowFunction(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isParenthesizedExpression(node)  // parens are transparent anywhere in the walk
+    ) {
       node = node.parent;
       continue;
     }
