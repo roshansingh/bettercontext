@@ -364,25 +364,29 @@ class TestExtremePressureClusterDrop(unittest.TestCase):
             )
 
     def test_one_anchor_per_cluster_before_second_row(self):
-        """Core P1 rule: no cluster keeps a 2nd row while another original cluster has 0,
-        at a cap where one-anchor-per-cluster fits."""
+        """Core P1 rule: no cluster keeps a 2nd row while another original cluster has 0.
+
+        Uses a 9k cap where the reviewer probe confirmed uncovered={module_3, module_4},
+        so the ``if uncovered`` branch fires and the assertion is non-vacuous.
+        """
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=12_000)
-        self.assertLessEqual(len(canonical_json(result)), 12_000)
+        result = enforce_review_context_budget(packet, max_chars=9_000)
+        self.assertLessEqual(len(canonical_json(result)), 9_000)
         review_leads = result.get("review_leads") or {}
         changed_symbols = [r for r in (review_leads.get("changed_symbols") or []) if isinstance(r, dict)]
-        self.assertTrue(changed_symbols, "no changed_symbols retained at 12k cap")
+        self.assertTrue(changed_symbols, "no changed_symbols retained at 9k cap")
         counts: dict = {}
         for row in changed_symbols:
             p = row.get("path")
             counts[p] = counts.get(p, 0) + 1
         uncovered = self._ORIGINAL_PATHS - set(counts)
         doubled = {p for p, c in counts.items() if c >= 2}
-        if uncovered:
-            self.assertFalse(
-                doubled,
-                f"clusters {doubled} keep >= 2 rows while clusters {uncovered} have no anchor",
-            )
+        # Non-vacuous: at 9k the fixture leaves uncovered clusters (module_3, module_4).
+        self.assertTrue(uncovered, f"expected uncovered clusters at 9k cap; counts={counts}")
+        self.assertFalse(
+            doubled,
+            f"clusters {doubled} keep >= 2 rows while clusters {uncovered} have no anchor",
+        )
 
     def test_truthful_omitted_counts(self):
         """P2 omitted counts must equal pre-budget totals minus retained rows."""
@@ -453,14 +457,38 @@ class TestTruncationSummaryShape(unittest.TestCase):
         if not truncated:
             self.assertNotIn("truncation_summary", ob, "truncation_summary must be absent when not truncated")
 
-    def test_truncation_summary_fields_present(self):
+    def test_no_truncation_summary_broad_bulk_only(self):
+        """Broad-bulk-only truncation (no lead rows omitted) must not produce a summary.
+
+        The 3-file x 8-symbol fixture at the default 40k cap keeps all lead rows
+        (only application_impact bulk is evicted), so the summary would be all-zero
+        and is suppressed.
+        """
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
         result = enforce_review_context_budget(packet)
         ob = result.get("output_budget") or {}
-        if not ob.get("truncated"):
-            self.skipTest("packet did not truncate")
+        # Packet must be truncated (bulk evicted) but have no omitted lead rows.
+        self.assertTrue(ob.get("truncated"), "fixture should be truncated at default cap")
+        rl = result.get("review_leads") or {}
+        self.assertEqual(
+            len(rl.get("changed_symbols") or []), 24,
+            "all 24 changed_symbols should be retained (3 files * 8 symbols)",
+        )
+        self.assertNotIn(
+            "truncation_summary", ob,
+            "broad-bulk-only truncation must not produce truncation_summary",
+        )
+
+    def test_truncation_summary_fields_present(self):
+        # Use the extreme-pressure packet at 8k to guarantee lead rows are omitted
+        # (broad-bulk-only truncation at the default cap no longer produces a summary).
+        packet = _make_over_budget_packet(file_count=5, symbols_per_file=10,
+                                          hyp_cluster_paths=["src/module_0.py", "src/module_1.py"])
+        result = enforce_review_context_budget(packet, max_chars=8_000)
+        ob = result.get("output_budget") or {}
+        self.assertTrue(ob.get("truncated"), "extreme fixture must truncate at 8k")
         ts = ob.get("truncation_summary")
-        self.assertIsInstance(ts, dict, "truncation_summary must be a dict")
+        self.assertIsInstance(ts, dict, "truncation_summary must be a dict when lead rows are omitted")
         # Required count fields
         for field in (
             "omitted_changed_symbol_count",
@@ -471,14 +499,26 @@ class TestTruncationSummaryShape(unittest.TestCase):
             self.assertIn(field, ts, f"missing field {field}")
             self.assertIsInstance(ts[field], int, f"{field} must be int")
             self.assertGreaterEqual(ts[field], 0, f"{field} must be non-negative")
+        # At least one lead field must be nonzero (confirms gate is passed).
+        self.assertTrue(
+            any(ts.get(f, 0) > 0 for f in (
+                "omitted_changed_symbol_count",
+                "omitted_direct_caller_count",
+                "omitted_direct_callee_count",
+                "omitted_transitive_caller_count",
+            )),
+            "at least one omitted-lead count must be nonzero for summary to be present",
+        )
         # omitted_high_risk_clusters bounded to <= 5
         clusters = ts.get("omitted_high_risk_clusters") or []
         self.assertIsInstance(clusters, list)
         self.assertLessEqual(len(clusters), 5, "omitted_high_risk_clusters must have <= 5 entries")
 
     def test_truncation_summary_cluster_row_shape(self):
-        packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
-        result = enforce_review_context_budget(packet)
+        # Use the extreme-pressure packet at 8k (same reason as test above).
+        packet = _make_over_budget_packet(file_count=5, symbols_per_file=10,
+                                          hyp_cluster_paths=["src/module_0.py", "src/module_1.py"])
+        result = enforce_review_context_budget(packet, max_chars=8_000)
         ob = result.get("output_budget") or {}
         if not ob.get("truncated"):
             self.skipTest("packet did not truncate")
@@ -609,6 +649,142 @@ class TestEndToEndClusterCoverage(unittest.TestCase):
                     row["lead_id"], lead_ids_in_leads,
                     "top_changed_symbols mirror contains lead_id not in review_leads.changed_symbols",
                 )
+
+
+# ---------------------------------------------------------------------------
+# Spec 6: Top-level changed_symbols mirrors review_leads after post-repair eviction
+# ---------------------------------------------------------------------------
+
+def _make_over_budget_packet_with_top_cs(
+    file_count: int = 5,
+    symbols_per_file: int = 10,
+    hyp_cluster_paths: list[str] | None = None,
+) -> dict:
+    """Variant of _make_over_budget_packet that includes a top-level changed_symbols key.
+
+    The equality contract (review_leads.changed_symbols == changed_symbols) only applies
+    when a top-level changed_symbols key is present (the MCP review_context tool emits
+    both; the test fixture in test_mcp_tools.py does too). This helper matches that shape.
+    """
+    packet = _make_over_budget_packet(
+        file_count=file_count,
+        symbols_per_file=symbols_per_file,
+        hyp_cluster_paths=hyp_cluster_paths,
+    )
+    # Mirror the review_leads.changed_symbols into the top-level key so the
+    # de-alias desync path can be exercised.
+    rl = packet.get("review_leads") or {}
+    packet["changed_symbols"] = list(rl.get("changed_symbols") or [])
+    return packet
+
+
+class TestTopLevelChangedSymbolsMirror(unittest.TestCase):
+    """Regression for the desync path: post-repair eviction must not break equality.
+
+    Before the fix, _repair_cluster_coverage de-aliased result["changed_symbols"]
+    from review_leads["changed_symbols"], and the subsequent _evict_review_rows_to_fit
+    could pop from the top-level list (classified non-lead) while leaving
+    review_leads["changed_symbols"] untouched, violating the equality contract.
+    """
+
+    def test_top_level_mirrors_review_leads_after_post_repair_eviction(self):
+        """Force the desync path by using a cap where repair runs and eviction follows."""
+        # 5-file x 10-symbol fixture; hypothesis references only files 0+1.
+        # At 9k the repair pass runs (hard-cap re-ranks rows cluster-blind) and
+        # subsequent eviction can touch the top-level list before the re-mirror.
+        packet = _make_over_budget_packet_with_top_cs(
+            file_count=5,
+            symbols_per_file=10,
+            hyp_cluster_paths=["src/module_0.py", "src/module_1.py"],
+        )
+        result = enforce_review_context_budget(packet, max_chars=9_000)
+        self.assertLessEqual(len(canonical_json(result)), 9_000)
+
+        review_leads = result.get("review_leads") or {}
+        rl_cs = review_leads.get("changed_symbols") or []
+        # Only assert when the top-level key is present (it must be — we seeded it above).
+        self.assertIn("changed_symbols", result, "top-level changed_symbols key must be present")
+        top_cs = result["changed_symbols"]
+
+        # Non-vacuous: the packet must actually be truncated so post-repair eviction runs.
+        ob = result.get("output_budget") or {}
+        self.assertTrue(ob.get("truncated"), "fixture must be truncated at 9k cap")
+
+        # Equality contract: the two lists must be identical after finalize.
+        self.assertEqual(
+            rl_cs,
+            top_cs,
+            f"review_leads.changed_symbols ({len(rl_cs)} rows) != "
+            f"top-level changed_symbols ({len(top_cs)} rows) after post-repair eviction",
+        )
+
+    def test_top_level_mirrors_review_leads_at_extreme_pressure(self):
+        """Same equality contract under extreme budget pressure (8k)."""
+        packet = _make_over_budget_packet_with_top_cs(
+            file_count=5,
+            symbols_per_file=10,
+            hyp_cluster_paths=["src/module_0.py", "src/module_1.py"],
+        )
+        result = enforce_review_context_budget(packet, max_chars=8_000)
+        self.assertLessEqual(len(canonical_json(result)), 8_000)
+
+        review_leads = result.get("review_leads") or {}
+        rl_cs = review_leads.get("changed_symbols") or []
+        self.assertIn("changed_symbols", result, "top-level changed_symbols key must be present")
+        top_cs = result["changed_symbols"]
+
+        ob = result.get("output_budget") or {}
+        self.assertTrue(ob.get("truncated"), "fixture must be truncated at 8k cap")
+
+        self.assertEqual(
+            rl_cs,
+            top_cs,
+            f"review_leads.changed_symbols ({len(rl_cs)} rows) != "
+            f"top-level changed_symbols ({len(top_cs)} rows) at extreme pressure",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Spec 7: Snapshot-derived edge counts used for re-interleave ranking
+# ---------------------------------------------------------------------------
+
+class TestSnapshotEdgeCountsForRanking(unittest.TestCase):
+    """Rank-input consistency: re-interleave in repair and finalize must use snapshot counts.
+
+    When edge rows are evicted during budget passes, the compacted result has fewer
+    edge rows than the original snapshot. Re-interleaving from compacted rows would
+    use a different edge count than repair/P2, causing non-deterministic ordering
+    depending on which rows survived eviction. The fix threads snapshot edge counts
+    into both re-interleave calls.
+    """
+
+    def test_cluster_order_uses_snapshot_not_compacted_edges(self):
+        """After extreme eviction the returned changed_symbols are ranked by snapshot counts.
+
+        With 5 files x 10 symbols and hypothesis on files 0+1, files 2/3/4 are
+        ranked by snapshot edge counts (4 callers + 4 callees = 8 per file, equal
+        among non-referenced clusters, so path is the final tie-breaker). The first
+        retained non-referenced cluster after repair must be module_2.py (lowest path).
+        """
+        packet = _make_over_budget_packet(
+            file_count=5,
+            symbols_per_file=10,
+            hyp_cluster_paths=["src/module_0.py", "src/module_1.py"],
+        )
+        result = enforce_review_context_budget(packet, max_chars=9_000)
+        self.assertLessEqual(len(canonical_json(result)), 9_000)
+
+        review_leads = result.get("review_leads") or {}
+        cs = [r for r in (review_leads.get("changed_symbols") or []) if isinstance(r, dict)]
+        retained_paths = {r.get("path") for r in cs}
+
+        # At 9k the top-3 clusters survive; referenced (0+1) plus the lowest-path
+        # non-referenced one (module_2.py when edge counts are equal).
+        if len(retained_paths) == 3:
+            self.assertIn(
+                "src/module_2.py", retained_paths,
+                "module_2.py (lowest-path non-referenced cluster) must be the 3rd retained cluster",
+            )
 
 
 if __name__ == "__main__":

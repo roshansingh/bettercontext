@@ -3219,7 +3219,27 @@ def _cluster_rank_key(
     return (0 if referenced else 1, -edge_count, path)
 
 
-def _interleave_changed_symbols_by_cluster(result: JsonObject) -> None:
+def _snapshot_edge_counts(snapshot_review_leads: JsonObject) -> dict[str, int]:
+    """Count direct caller/callee edges per path from a pre-budget snapshot.
+
+    Used to keep re-interleave ranking consistent with the repair and P2 passes,
+    which also rank from the snapshot. Current compacted rows may have had edge rows
+    evicted, so ranking from them can give different orderings across the finalize loop.
+    """
+    counts: dict[str, int] = {}
+    for field in ("direct_callers", "direct_callees"):
+        for row in _list_value(snapshot_review_leads.get(field)):
+            if isinstance(row, dict):
+                p = row.get("path") or ""
+                counts[p] = counts.get(p, 0) + 1
+    return counts
+
+
+def _interleave_changed_symbols_by_cluster(
+    result: JsonObject,
+    *,
+    snapshot_edge_counts: dict[str, int] | None = None,
+) -> None:
     """Reorder changed-symbol lead rows so rows interleave across clusters.
 
     Cluster key: the changed-file ``path`` field on each row. One row from each
@@ -3237,6 +3257,11 @@ def _interleave_changed_symbols_by_cluster(result: JsonObject) -> None:
     Cluster rank: hypothesis-referenced clusters first, then (descending direct-edge
     count, ascending path). Deterministic.
 
+    ``snapshot_edge_counts``: when provided, use these pre-budget edge counts for
+    ranking instead of the current (possibly compacted) edge rows in ``result``.
+    This keeps re-interleave ranking consistent with the repair/P2 passes that also
+    rank from the snapshot.
+
     Mutates result in place.
     """
     # Collect supporting_lead_ids from current hypotheses
@@ -3247,20 +3272,24 @@ def _interleave_changed_symbols_by_cluster(result: JsonObject) -> None:
                 if isinstance(lid, str):
                     hyp_supporting.add(lid)
 
-    # Count direct edges per path to rank clusters with no hypothesis reference.
-    # Prefer review_leads edge rows; fall back to the top-level detail lists.
-    review_leads = result.get("review_leads")
-    edge_source: JsonObject = review_leads if isinstance(review_leads, dict) else result
-    edge_counts: dict[str, int] = {}
-    for field in ("direct_callers", "direct_callees"):
-        rows = edge_source.get(field)
-        if not isinstance(rows, list):
-            rows = result.get(field) if isinstance(result.get(field), list) else []
-        for row in rows:
-            if isinstance(row, dict):
-                p = row.get("path") or ""
-                edge_counts[p] = edge_counts.get(p, 0) + 1
+    if snapshot_edge_counts is not None:
+        edge_counts = snapshot_edge_counts
+    else:
+        # Count direct edges per path to rank clusters with no hypothesis reference.
+        # Prefer review_leads edge rows; fall back to the top-level detail lists.
+        review_leads = result.get("review_leads")
+        edge_source: JsonObject = review_leads if isinstance(review_leads, dict) else result
+        edge_counts = {}
+        for field in ("direct_callers", "direct_callees"):
+            rows = edge_source.get(field)
+            if not isinstance(rows, list):
+                rows = result.get(field) if isinstance(result.get(field), list) else []
+            for row in rows:
+                if isinstance(row, dict):
+                    p = row.get("path") or ""
+                    edge_counts[p] = edge_counts.get(p, 0) + 1
 
+    review_leads = result.get("review_leads")
     if isinstance(review_leads, dict) and isinstance(review_leads.get("changed_symbols"), list):
         review_leads["changed_symbols"] = _interleaved_cluster_order(
             review_leads["changed_symbols"], hyp_supporting=hyp_supporting, edge_counts=edge_counts
@@ -3388,13 +3417,7 @@ def _build_truncation_summary(
     dropped_clusters: list[tuple[tuple[int, int, str], str, list[dict]]] = []
     for path, orig_rows in original_by_cluster.items():
         if all((r.get("lead_id") or "") not in retained_lead_ids for r in orig_rows):
-            # Determine risk_family: first hypothesis risk_type that referenced any lead here
             orig_ids = {r.get("lead_id") or "" for r in orig_rows}
-            risk_family: str | None = None
-            for rt, lids in sorted(hyp_supporting_by_risk.items()):
-                if orig_ids & lids:
-                    risk_family = rt
-                    break
             hyp_ids = {lid for s in hyp_supporting_by_risk.values() for lid in s}
             rank = _cluster_rank_key(path, list(orig_ids), hyp_ids, edge_counts.get(path, 0))
             dropped_clusters.append((rank, path, orig_rows))
@@ -3538,7 +3561,9 @@ def _repair_cluster_coverage(
         if isinstance(result.get("changed_symbols"), list):
             result["changed_symbols"] = list(retained)
         # Re-cluster the order so any later tail eviction drops extras before anchors.
-        _interleave_changed_symbols_by_cluster(result)
+        # Use snapshot-derived edge counts (same source repair/P2 already rank from)
+        # so ranking is consistent regardless of which edge rows survived compaction.
+        _interleave_changed_symbols_by_cluster(result, snapshot_edge_counts=edge_counts)
     return changed
 
 
@@ -3623,8 +3648,10 @@ def _finalize_review_hypothesis_budget(
     """
     # P1: Interleave changed_symbols by cluster so eviction respects cluster coverage.
     # Gated on budget pressure so packets that already fit keep their producer order.
+    # Use snapshot-derived edge counts to keep ranking consistent with repair/P2 passes.
+    _snap_edge_counts = _snapshot_edge_counts(original_review_leads)
     if _current_chars(result) > max_chars:
-        _interleave_changed_symbols_by_cluster(result)
+        _interleave_changed_symbols_by_cluster(result, snapshot_edge_counts=_snap_edge_counts)
 
     # N2: Evict broad context to fund up to _REVIEW_HYPOTHESIS_HEADROOM_TARGET hypotheses.
     broad_evicted = _restore_hypotheses_up_to_target(
@@ -3681,6 +3708,17 @@ def _finalize_review_hypothesis_budget(
     # The funding eviction above may have dropped further lead rows; reconcile again so
     # hypotheses never cite lead_ids that no longer exist in the packet.
     _reconcile_hypothesis_lead_ids(result)
+    # Re-mirror top-level changed_symbols from review_leads.changed_symbols.
+    # _repair_cluster_coverage and the gated re-interleave both de-alias the two lists,
+    # and _evict_review_rows_to_fit classifies top-level "changed_symbols" as non-lead so
+    # it may be popped independently of review_leads.changed_symbols (which is protected).
+    # Re-mirroring here restores the equality contract; review_leads is the authoritative
+    # side so the re-mirror can only shrink or equal the pre-eviction state — never grow it.
+    _rl = result.get("review_leads")
+    if isinstance(_rl, dict) and isinstance(_rl.get("changed_symbols"), list):
+        _rl_cs = _rl["changed_symbols"]
+        if isinstance(result.get("changed_symbols"), list):
+            result["changed_symbols"] = list(_rl_cs)
 
 
 # Changed-symbol anchor lists are never evicted to fund the truncation summary: the
@@ -3780,6 +3818,16 @@ def _attach_truncation_summary_within_budget(
         return
     for _ in range(5):
         ts = _build_truncation_summary(result, original_review_leads, original_hypotheses)
+        # Gate: broad-bulk-only truncation (no lead rows omitted, no dropped clusters)
+        # produces an all-zero summary that adds noise without value — skip it.
+        _omit_fields = (
+            "omitted_changed_symbol_count",
+            "omitted_direct_caller_count",
+            "omitted_direct_callee_count",
+            "omitted_transitive_caller_count",
+        )
+        if not any(ts.get(f) for f in _omit_fields) and not ts.get("omitted_high_risk_clusters"):
+            return
         cluster_rows = list(ts.get("omitted_high_risk_clusters") or [])
         ts["omitted_high_risk_clusters"] = []
         budget["truncation_summary"] = ts
