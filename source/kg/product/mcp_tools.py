@@ -2802,6 +2802,9 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         changed_symbols=changed_symbols,
         limit=detail_limit,
     )
+    risk_signals = _review_context_risk_signals(
+        kg, changed_symbols=changed_symbols, changed_files=changed_files, limit=12
+    )
     endpoint_rows = runtime_surfaces["endpoints"]
     endpoint_consumer_rows = runtime_surfaces["endpoint_consumers"]
     event_channel_rows = runtime_surfaces["event_channels"]
@@ -2976,6 +2979,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         runtime_surfaces=runtime_surfaces,
         review_leads=review_lead_packet["review_leads"],
         review_lead_status=review_lead_packet["review_lead_status"],
+        risk_signals=risk_signals,
     )
     review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     result = {
@@ -3305,6 +3309,84 @@ def _review_context_diff_anchor_source_coordinates(diff_anchors: list[JsonObject
             if len(coordinates) >= COMPACT_REVIEW_SOURCE_COORDINATE_LIMIT:
                 return coordinates
     return coordinates
+
+
+_RISK_SIGNAL_PREDICATE = "code_risk_signal"
+
+
+def _review_context_risk_signals(
+    kg: KgSnapshot,
+    *,
+    changed_symbols: list[JsonObject],
+    changed_files: list[str],
+    limit: int = 12,
+) -> list[JsonObject]:
+    """Retrieve code_risk_signal support facts for changed symbols and files.
+
+    Returns up to *limit* signal rows, each augmented with a ``_evidence`` list
+    containing the evidence rows that carry ``bytes_ref`` coordinates (so the
+    hypothesis builder can extract paths without a separate KG lookup).
+
+    Matching logic:
+      1. subject_id matches the entity_id of any changed-symbol row.
+      2. evidence bytes_ref.path matches a normalized changed file path.
+    """
+    # Index changed context.
+    changed_entity_ids: set[str] = set()
+    for sym in changed_symbols:
+        eid = sym.get("entity_id")
+        if isinstance(eid, str) and eid:
+            changed_entity_ids.add(eid)
+
+    normalized_changed_files: set[str] = set()
+    for f in changed_files:
+        normalized = _planning_context_normalize_path(f)
+        if normalized:
+            normalized_changed_files.add(normalized)
+
+    results: list[JsonObject] = []
+    seen_fact_ids: set[str] = set()
+
+    for fact in kg.support_facts:
+        if fact.get("predicate") != _RISK_SIGNAL_PREDICATE:
+            continue
+        fact_id = fact.get("fact_id")
+        if isinstance(fact_id, str) and fact_id in seen_fact_ids:
+            continue
+
+        subject_id = fact.get("subject_id")
+        matched = isinstance(subject_id, str) and subject_id in changed_entity_ids
+
+        # Attach evidence rows for coordinate extraction.
+        evidence_rows: list[JsonObject] = []
+        if isinstance(fact_id, str):
+            for ev in kg.evidence_by_target.get(fact_id, []):
+                evidence_rows.append(ev)
+
+        if not matched:
+            # Try evidence path matching.
+            for ev in evidence_rows:
+                br = ev.get("bytes_ref")
+                if isinstance(br, dict):
+                    p = br.get("path")
+                    if isinstance(p, str) and p in normalized_changed_files:
+                        matched = True
+                        break
+
+        if not matched:
+            continue
+
+        if isinstance(fact_id, str):
+            seen_fact_ids.add(fact_id)
+
+        enriched: JsonObject = dict(fact)
+        enriched["_evidence"] = evidence_rows
+        results.append(enriched)
+
+        if len(results) >= limit:
+            break
+
+    return results
 
 
 def _planning_context_from_query(kg: KgSnapshot, *, query: str, limit: int) -> JsonObject:

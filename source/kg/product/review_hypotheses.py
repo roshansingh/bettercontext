@@ -12,6 +12,7 @@ _FRONTEND_HOOK_EXTENSIONS = frozenset({".ts", ".tsx", ".js", ".jsx"})
 _CONFIDENCE_RANK = {"strong": 2, "medium": 1, "weak": 0}
 _FRAMEWORK_IMPACT_KEYS = ("changed_models", "model_fields", "model_relations", "serializers", "views", "tasks")
 _RUNTIME_SURFACE_KEYS = ("endpoints", "endpoint_consumers", "event_channels", "deploy_mappings")
+_ASYNC_LIFECYCLE_FAMILIES: frozenset[str] = frozenset({"async_callback_in_iteration", "unawaited_async_call"})
 
 # O2: Specific-class families. Post-1e74bf2 probe evidence (Grafana 106778, limit=25) showed
 # specific families generating on real repos but losing visible slots to generics because
@@ -21,8 +22,10 @@ _RUNTIME_SURFACE_KEYS = ("endpoints", "endpoint_consumers", "event_channels", "d
 # so hook_gate_render_mismatch outranks direct_call_contract_drift in top_review_hypotheses.
 _SPECIFIC_CLASS_FAMILIES: frozenset[str] = frozenset(
     {
+        "async_side_effect_lifecycle_drift",
         "component_list_render_identity_drift",
         "hook_gate_render_mismatch",
+        "swallowed_exception_state_drift",
         "test_locks_in_regression",
         "low_coverage_stylesheet_gap",
     }
@@ -41,6 +44,7 @@ def review_hypotheses_for_context(
     runtime_surfaces: dict[str, list[JsonObject]],
     review_leads: JsonObject,
     review_lead_status: JsonObject,
+    risk_signals: list[JsonObject] | None = None,
 ) -> list[JsonObject]:
     low_coverage = review_lead_status.get("coverage_status") == "low_coverage"
     if low_coverage:
@@ -108,6 +112,25 @@ def review_hypotheses_for_context(
     )
     if h:
         hypotheses.append(h)
+    effective_risk_signals = risk_signals or []
+    h = _async_side_effect_lifecycle_drift(
+        changed_symbols=changed_symbols,
+        direct_callers=direct_callers,
+        direct_callees=direct_callees,
+        risk_signals=effective_risk_signals,
+        review_leads=review_leads,
+    )
+    if h:
+        hypotheses.append(h)
+    h = _swallowed_exception_state_drift(
+        changed_symbols=changed_symbols,
+        direct_callers=direct_callers,
+        direct_callees=direct_callees,
+        risk_signals=effective_risk_signals,
+        review_leads=review_leads,
+    )
+    if h:
+        hypotheses.append(h)
     hypotheses.sort(
         key=lambda row: (
             -len(row.get("supporting_lead_ids") or []),
@@ -150,6 +173,7 @@ def _make_hypothesis(
     evidence_refs: list[JsonObject],
     source_checks: list[str],
     supporting_lead_ids: list[str],
+    concrete_invariant: str | None = None,
 ) -> JsonObject:
     row: JsonObject = {
         "risk_type": risk_type,
@@ -159,6 +183,8 @@ def _make_hypothesis(
         "source_checks": source_checks,
         "supporting_lead_ids": supporting_lead_ids,
     }
+    if concrete_invariant is not None:
+        row["concrete_invariant"] = concrete_invariant
     row["hypothesis_id"] = hypothesis_stable_id(risk_type, supporting_lead_ids, evidence_refs)
     return row
 
@@ -769,4 +795,248 @@ def _test_locks_in_regression(
         evidence_refs=evidence_refs,
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
+    )
+
+
+def _changed_symbol_entity_ids(changed_symbols: list[JsonObject]) -> set[str]:
+    """Return the set of entity_ids (subject_id) for changed-symbol rows.
+
+    Symbol rows from _symbol_result carry 'entity_id' directly.  Synthetic
+    test rows may omit it.  We also index by (repo, path, qualname) so that
+    support-fact subjects without an entity_id can still be matched.
+    """
+    ids: set[str] = set()
+    for sym in changed_symbols:
+        eid = sym.get("entity_id")
+        if isinstance(eid, str) and eid:
+            ids.add(eid)
+    return ids
+
+
+def _changed_symbol_paths(changed_symbols: list[JsonObject]) -> set[str]:
+    paths: set[str] = set()
+    for sym in changed_symbols:
+        p = sym.get("path")
+        if isinstance(p, str) and p:
+            paths.add(p)
+    return paths
+
+
+def _signal_matches_changed_context(
+    signal: JsonObject,
+    changed_entity_ids: set[str],
+    changed_paths: set[str],
+) -> bool:
+    """Return True if this risk_signal is attached to a changed symbol or file.
+
+    Matching logic (in priority order):
+      1. signal.subject_id in changed_entity_ids
+      2. evidence bytes_ref.path in changed_paths
+    """
+    subject_id = signal.get("subject_id")
+    if isinstance(subject_id, str) and subject_id in changed_entity_ids:
+        return True
+    # Fall back to evidence path matching.
+    for ev in signal.get("_evidence", []):
+        if not isinstance(ev, dict):
+            continue
+        br = ev.get("bytes_ref")
+        if isinstance(br, dict):
+            p = br.get("path")
+            if isinstance(p, str) and p in changed_paths:
+                return True
+    return False
+
+
+def _evidence_refs_from_risk_signals(signals: list[JsonObject]) -> list[JsonObject]:
+    """Build evidence_refs from risk signal evidence bytes_refs."""
+    refs: list[JsonObject] = []
+    for sig in signals:
+        for ev in sig.get("_evidence", []):
+            if not isinstance(ev, dict):
+                continue
+            br = ev.get("bytes_ref")
+            if not isinstance(br, dict):
+                continue
+            ref: JsonObject = {}
+            for key in ("repo", "path", "line_start", "line_end"):
+                val = br.get(key)
+                if val is not None:
+                    ref[key] = val
+            q = sig.get("qualifier")
+            if isinstance(q, dict):
+                callee = q.get("callee")
+                if callee:
+                    ref["callee"] = callee
+                qualname = q.get("qualname")
+                if qualname:
+                    ref["qualname"] = qualname
+            if ref:
+                refs.append(ref)
+    return refs[:5]
+
+
+def _lead_ids_for_signal_subjects(
+    signals: list[JsonObject],
+    changed_symbols: list[JsonObject],
+    direct_callers: list[JsonObject],
+    direct_callees: list[JsonObject],
+    review_leads: JsonObject,
+) -> list[str]:
+    """Return lead_ids from changed_symbols whose path/entity matches a signal subject."""
+    sig_entity_ids: set[str] = set()
+    sig_paths: set[str] = set()
+    for sig in signals:
+        eid = sig.get("subject_id")
+        if isinstance(eid, str) and eid:
+            sig_entity_ids.add(eid)
+        for ev in sig.get("_evidence", []):
+            if not isinstance(ev, dict):
+                continue
+            br = ev.get("bytes_ref")
+            if isinstance(br, dict):
+                p = br.get("path")
+                if isinstance(p, str) and p:
+                    sig_paths.add(p)
+
+    lead_ids: list[str] = []
+    for row in review_leads.get("changed_symbols") or []:
+        if not isinstance(row, dict):
+            continue
+        lid = row.get("lead_id")
+        if not isinstance(lid, str) or not lid:
+            continue
+        eid = row.get("entity_id")
+        if isinstance(eid, str) and eid in sig_entity_ids:
+            lead_ids.append(lid)
+            continue
+        p = row.get("path")
+        if isinstance(p, str) and p in sig_paths:
+            lead_ids.append(lid)
+    return lead_ids
+
+
+def _why_from_signals(signals: list[JsonObject], family: str) -> str:
+    """Build a why string from actual signal qualifier data (no fabrication)."""
+    callees: list[str] = []
+    qualnames: list[str] = []
+    for sig in signals[:3]:
+        q = sig.get("qualifier")
+        if not isinstance(q, dict):
+            continue
+        c = q.get("callee")
+        if isinstance(c, str) and c and c not in callees:
+            callees.append(c)
+        qn = q.get("qualname")
+        if isinstance(qn, str) and qn and qn not in qualnames:
+            qualnames.append(qn)
+    count = len(signals)
+    count_str = f"{count} signal{'s' if count != 1 else ''}"
+    if family == "async_lifecycle":
+        if callees:
+            callee_str = ", ".join(callees[:2])
+            return (
+                f"{count_str} ({callee_str}) in changed symbols have async side-effect calls "
+                f"whose completion or persistence may not be coupled to the changed mutation path."
+            )
+        return (
+            f"{count_str} in changed symbols have async side-effect calls "
+            f"whose completion or persistence may not be coupled to the changed mutation path."
+        )
+    # swallowed_exception
+    if qualnames:
+        qualname_str = ", ".join(qualnames[:2])
+        return (
+            f"{count_str} in changed symbols ({qualname_str}) swallow broad exceptions; "
+            f"errors converted to silent state must be intentional and not mask a caller-visible state transition."
+        )
+    return (
+        f"{count_str} in changed symbols swallow broad exceptions; "
+        f"errors converted to silent state must be intentional and not mask a caller-visible state transition."
+    )
+
+
+def _async_side_effect_lifecycle_drift(
+    *,
+    changed_symbols: list[JsonObject],
+    direct_callers: list[JsonObject],
+    direct_callees: list[JsonObject],
+    risk_signals: list[JsonObject],
+    review_leads: JsonObject,
+) -> JsonObject | None:
+    """Trigger: >=1 code_risk_signal with async-lifecycle family on changed symbols/files."""
+    changed_entity_ids = _changed_symbol_entity_ids(changed_symbols)
+    changed_paths = _changed_symbol_paths(changed_symbols)
+    matching = [
+        sig for sig in risk_signals
+        if sig.get("qualifier", {}).get("risk_family") in _ASYNC_LIFECYCLE_FAMILIES
+        and _signal_matches_changed_context(sig, changed_entity_ids, changed_paths)
+    ]
+    if not matching:
+        return None
+    evidence_refs = _evidence_refs_from_risk_signals(matching)
+    lead_ids = _lead_ids_for_signal_subjects(
+        matching, changed_symbols, direct_callers, direct_callees, review_leads
+    )
+    has_direct_edge = bool(direct_callers or direct_callees)
+    confidence = "medium" if (lead_ids and has_direct_edge) else "weak"
+    source_checks = [
+        "Trace each flagged call site; verify the async call is awaited or its result is reconciled with any paired persistent-state change.",
+        "Check whether the mutation path that contains the async call has a compensating rollback or retry if the async work fails.",
+    ]
+    return _make_hypothesis(
+        risk_type="async_side_effect_lifecycle_drift",
+        confidence=confidence,
+        why=_why_from_signals(matching, "async_lifecycle"),
+        evidence_refs=evidence_refs,
+        source_checks=source_checks,
+        supporting_lead_ids=lead_ids[:10],
+        concrete_invariant=(
+            "Side-effect calls and their completion or persistence must stay coupled: "
+            "an async call in a mutation path must be awaited, returned, or reconciled "
+            "before the mutation is considered complete."
+        ),
+    )
+
+
+def _swallowed_exception_state_drift(
+    *,
+    changed_symbols: list[JsonObject],
+    direct_callers: list[JsonObject],
+    direct_callees: list[JsonObject],
+    risk_signals: list[JsonObject],
+    review_leads: JsonObject,
+) -> JsonObject | None:
+    """Trigger: >=1 code_risk_signal with swallowed_exception family on changed symbols/files."""
+    changed_entity_ids = _changed_symbol_entity_ids(changed_symbols)
+    changed_paths = _changed_symbol_paths(changed_symbols)
+    matching = [
+        sig for sig in risk_signals
+        if sig.get("qualifier", {}).get("risk_family") == "swallowed_exception"
+        and _signal_matches_changed_context(sig, changed_entity_ids, changed_paths)
+    ]
+    if not matching:
+        return None
+    evidence_refs = _evidence_refs_from_risk_signals(matching)
+    lead_ids = _lead_ids_for_signal_subjects(
+        matching, changed_symbols, direct_callers, direct_callees, review_leads
+    )
+    has_direct_edge = bool(direct_callers or direct_callees)
+    confidence = "medium" if (lead_ids and has_direct_edge) else "weak"
+    source_checks = [
+        "Trace each flagged broad-exception handler; verify it cannot mask a state transition the caller depends on.",
+        "Check whether the handler's silent outcome (pass/continue/constant return) is documented as intentional in the changed code.",
+    ]
+    return _make_hypothesis(
+        risk_type="swallowed_exception_state_drift",
+        confidence=confidence,
+        why=_why_from_signals(matching, "swallowed_exception"),
+        evidence_refs=evidence_refs,
+        source_checks=source_checks,
+        supporting_lead_ids=lead_ids[:10],
+        concrete_invariant=(
+            "Errors converted to silent state must be intentional: "
+            "a broad exception handler that discards an error must not mask a state transition "
+            "the caller observes or relies on."
+        ),
     )
