@@ -78,7 +78,9 @@ def _symbol_kind_from_parsed(parsed_file: dict[str, Any], qualname: str) -> str 
     """
     for sym in parsed_file.get("symbols", []):
         if isinstance(sym, dict) and sym.get("name") == qualname:
-            return str(sym.get("kind", "function"))
+            # Same default as compiler_api_extractor._symbol_from_row (:201, "value")
+            # so the synthesized identity always matches the main extractor's.
+            return str(sym.get("kind", "value"))
     return None
 
 
