@@ -372,7 +372,12 @@ def _is_test_file(path: str) -> bool:
             return True
     stem = parts[-1]
     base = stem.rsplit(".", 1)[0] if "." in stem else stem
-    return base.startswith("test_") or base.endswith("_test") or base.startswith("spec_") or base.endswith("_spec")
+    if base.startswith("test_") or base.endswith("_test") or base.startswith("spec_") or base.endswith("_spec"):
+        return True
+    # Co-located test file patterns: src/foo.test.ts or src/Bar.spec.tsx
+    if ".test." in stem or ".spec." in stem:
+        return True
+    return False
 
 
 def _is_config_file(path: str) -> bool:

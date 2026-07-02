@@ -695,6 +695,86 @@ class TestTestLocksInRegression(unittest.TestCase):
         risk_types = [h["risk_type"] for h in hypotheses]
         self.assertNotIn("test_locks_in_regression", risk_types)
 
+    def test_positive_colocated_test_file_pattern_test_infix(self):
+        # Co-located test file: src/foo.test.ts
+        hypotheses = self._call(
+            changed_files=["src/parser.ts", "src/parser.test.ts"],
+            changed_symbols=[
+                _sym("parse", "src/parser.ts", lead_id="lead-co1"),
+                _sym("testParse", "src/parser.test.ts", lead_id="lead-co2"),
+            ],
+            direct_callees=[_edge("testParse", "parse", "lead-te-co1")],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-co1", "path": "src/parser.ts"},
+                    {"lead_id": "lead-co2", "path": "src/parser.test.ts"},
+                ],
+                "direct_callees": [{"lead_id": "lead-te-co1"}],
+            },
+        )
+        risk_types = [h["risk_type"] for h in hypotheses]
+        self.assertIn("test_locks_in_regression", risk_types)
+
+    def test_positive_colocated_test_file_pattern_spec_infix(self):
+        # Co-located spec file: src/Bar.spec.tsx
+        hypotheses = self._call(
+            changed_files=["src/Button.tsx", "src/Button.spec.tsx"],
+            changed_symbols=[
+                _sym("Button", "src/Button.tsx", kind="class", lead_id="lead-co3"),
+                _sym("testButton", "src/Button.spec.tsx", lead_id="lead-co4"),
+            ],
+            direct_callees=[_edge("testButton", "Button", "lead-te-co2")],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-co3", "path": "src/Button.tsx"},
+                    {"lead_id": "lead-co4", "path": "src/Button.spec.tsx"},
+                ],
+                "direct_callees": [{"lead_id": "lead-te-co2"}],
+            },
+        )
+        risk_types = [h["risk_type"] for h in hypotheses]
+        self.assertIn("test_locks_in_regression", risk_types)
+
+    def test_negative_infix_without_surrounding_dots_not_test_file(self):
+        # src/attestation.ts contains 'test' but not surrounded by dots → not a test file
+        hypotheses = self._call(
+            changed_files=["src/attestation.ts", "src/main.ts"],
+            changed_symbols=[
+                _sym("validate", "src/attestation.ts", lead_id="lead-neg1"),
+                _sym("main", "src/main.ts", lead_id="lead-neg2"),
+            ],
+            direct_callees=[_edge("main", "validate", "lead-te-neg1")],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-neg1", "path": "src/attestation.ts"},
+                    {"lead_id": "lead-neg2", "path": "src/main.ts"},
+                ],
+                "direct_callees": [{"lead_id": "lead-te-neg1"}],
+            },
+        )
+        risk_types = [h["risk_type"] for h in hypotheses]
+        self.assertNotIn("test_locks_in_regression", risk_types)
+
+    def test_negative_spectrum_not_mistaken_for_spec_file(self):
+        # src/spectrum.ts contains 'spec' but not surrounded by dots → not a test file
+        hypotheses = self._call(
+            changed_files=["src/spectrum.ts", "src/utils.ts"],
+            changed_symbols=[
+                _sym("getColor", "src/spectrum.ts", lead_id="lead-neg3"),
+                _sym("helper", "src/utils.ts", lead_id="lead-neg4"),
+            ],
+            direct_callees=[_edge("helper", "getColor", "lead-te-neg2")],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-neg3", "path": "src/spectrum.ts"},
+                    {"lead_id": "lead-neg4", "path": "src/utils.ts"},
+                ],
+                "direct_callees": [{"lead_id": "lead-te-neg2"}],
+            },
+        )
+        risk_types = [h["risk_type"] for h in hypotheses]
+        self.assertNotIn("test_locks_in_regression", risk_types)
+
 
 if __name__ == "__main__":
     unittest.main()
