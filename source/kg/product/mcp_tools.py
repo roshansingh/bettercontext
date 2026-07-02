@@ -55,6 +55,7 @@ _PLANNING_CONTEXT_ANCHOR_FIELDS = (
     "domain",
 )
 REVIEW_CONTEXT_DETAIL_LIMIT = 25
+REVIEW_CONTEXT_UNKNOWN_SURFACE_CAP = 8
 REVIEW_CONTEXT_SURFACES = (
     "ui_screens",
     "scheduled_jobs",
@@ -2157,25 +2158,6 @@ def _optional_string_list(arguments: JsonObject, field: str) -> list[str]:
             raise ValueError(f"MCP tool argument {field!r} must be a list of non-empty strings")
         normalized.append(item.strip())
     return normalized
-
-
-def _optional_review_surfaces(arguments: JsonObject, field: str) -> list[str]:
-    surfaces: list[str] = []
-    unsupported: list[str] = []
-    for value in _optional_string_list(arguments, field):
-        normalized_value = value.strip().lower().replace("-", "_").replace(" ", "_")
-        if normalized_value in REVIEW_CONTEXT_BUILTIN_SECTION_ALIASES:
-            continue
-        canonical = REVIEW_CONTEXT_SURFACE_ALIASES.get(normalized_value)
-        if canonical is None:
-            unsupported.append(value)
-            continue
-        if canonical not in surfaces:
-            surfaces.append(canonical)
-    if unsupported:
-        allowed = ", ".join(REVIEW_CONTEXT_SURFACES)
-        raise ValueError(f"MCP tool argument {field!r} has unsupported surface(s): {', '.join(unsupported)}; allowed: {allowed}")
-    return surfaces
 
 
 def _optional_review_surfaces_tolerant(
@@ -4394,9 +4376,16 @@ def _review_context_surface_status(
         )
         for surface in surfaces
     ]
-    for token in unknown_surfaces or []:
+    capped = (unknown_surfaces or [])[:REVIEW_CONTEXT_UNKNOWN_SURFACE_CAP]
+    omitted_unknown = max(0, len(unknown_surfaces or []) - REVIEW_CONTEXT_UNKNOWN_SURFACE_CAP)
+    for token in capped:
         rows.append(_review_context_unknown_surface_status_row(token, changed_symbols=changed_symbols or []))
+    if omitted_unknown and rows:
+        rows[-1] = dict(rows[-1], omitted_unknown_surface_count=omitted_unknown)
     return rows
+
+
+_REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN = 200
 
 
 def _review_context_unknown_surface_status_row(
@@ -4404,6 +4393,7 @@ def _review_context_unknown_surface_status_row(
     *,
     changed_symbols: list[JsonObject],
 ) -> JsonObject:
+    token = token[:_REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN]
     words = [w for w in token.replace("-", "_").split("_") if w]
     terms: list[str] = []
     seen: set[str] = set()

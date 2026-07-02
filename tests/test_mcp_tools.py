@@ -3787,6 +3787,47 @@ class McpToolsTest(unittest.TestCase):
         # at most 5 symbol names appended (no duplicates in terms)
         self.assertEqual(len(terms), len(set(terms)))
 
+    def test_review_context_unknown_surface_cap_applied(self) -> None:
+        # 12 unknown surfaces → at most 8 rows + omission count on last row
+        surfaces = [f"unknown_surface_{i}" for i in range(12)]
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "requested_surfaces": surfaces,
+                    "limit": 10,
+                },
+            )
+
+        unknown_rows = [r for r in result["surface_status"] if r.get("status") == "unsupported_or_unlinked"]
+        self.assertEqual(len(unknown_rows), 8)
+        last = unknown_rows[-1]
+        self.assertIn("omitted_unknown_surface_count", last)
+        self.assertEqual(last["omitted_unknown_surface_count"], 4)
+
+    def test_review_context_unknown_surface_token_truncated(self) -> None:
+        long_token = "x" * 300
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "requested_surfaces": [long_token],
+                    "limit": 10,
+                },
+            )
+
+        unknown_rows = [r for r in result["surface_status"] if r.get("status") == "unsupported_or_unlinked"]
+        self.assertEqual(len(unknown_rows), 1)
+        self.assertLessEqual(len(unknown_rows[0]["surface"]), 200)
+        for term in unknown_rows[0]["source_inspection_terms"]:
+            self.assertLessEqual(len(term), 200)
+
     def test_review_context_surfaces_path_matched_endpoint_consumers(self) -> None:
         with _fixture_snapshot(endpoint_consumer=True) as kg:
             result = call_tool(
