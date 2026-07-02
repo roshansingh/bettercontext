@@ -3076,10 +3076,28 @@ def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]
         label, rows = target
         rows.pop()
         evicted.add(label)
+        # Tandem clipping: when a top-level detail list is evicted, pop the matching
+        # row from review_leads so the re-mirror at the end of finalize is guaranteed
+        # to be shrink-or-equal (never growth after the last cap check).
+        _TOPLEVEL_TO_REVIEW_LEADS: dict[str, str] = {
+            "changed_symbols": "changed_symbols",
+            "direct_callers": "direct_callers",
+            "direct_callees": "direct_callees",
+            "transitive_callers": "transitive_callers",
+        }
+        if label in _TOPLEVEL_TO_REVIEW_LEADS:
+            rl = result.get("review_leads")
+            if isinstance(rl, dict):
+                rl_field = _TOPLEVEL_TO_REVIEW_LEADS[label]
+                rl_rows = rl.get(rl_field)
+                if isinstance(rl_rows, list) and rl_rows:
+                    rl_rows.pop()
+                    evicted.add(f"review_leads.{rl_field}")
+            _sync_review_lead_status_from_packet(result)
         # N1 coherent drop: if we just evicted a review_leads row, sync the mirror
         # immediately so the top_* entry is also removed — never leave mirror showing
         # a lead_id that no longer exists in review_leads.
-        if _is_review_leads_label(label):
+        elif _is_review_leads_label(label):
             _sync_review_lead_status_from_packet(result)
     return evicted
 
@@ -3709,11 +3727,12 @@ def _finalize_review_hypothesis_budget(
     # hypotheses never cite lead_ids that no longer exist in the packet.
     _reconcile_hypothesis_lead_ids(result)
     # Re-mirror top-level changed_symbols from review_leads.changed_symbols.
-    # _repair_cluster_coverage and the gated re-interleave both de-alias the two lists,
-    # and _evict_review_rows_to_fit classifies top-level "changed_symbols" as non-lead so
-    # it may be popped independently of review_leads.changed_symbols (which is protected).
-    # Re-mirroring here restores the equality contract; review_leads is the authoritative
-    # side so the re-mirror can only shrink or equal the pre-eviction state — never grow it.
+    # _repair_cluster_coverage and the gated re-interleave both de-alias the two lists.
+    # Tandem clipping in _evict_review_rows_to_fit keeps review_leads.changed_symbols in
+    # sync with top-level evictions, so this re-mirror is guaranteed shrink-or-equal BY
+    # CONSTRUCTION — never a growth that would breach the cap.  It exists as cheap
+    # invariant enforcement (reorder/repair can shift the list objects) and to handle the
+    # _repair_cluster_coverage de-alias path.
     _rl = result.get("review_leads")
     if isinstance(_rl, dict) and isinstance(_rl.get("changed_symbols"), list):
         _rl_cs = _rl["changed_symbols"]

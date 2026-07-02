@@ -1107,5 +1107,170 @@ class TestClipAnswerPacketTopNonDictRows(unittest.TestCase):
         self.assertEqual(answer_packet["top_changed_symbols"], [plain, no_lead])
 
 
+class TestTandemClippingCapInvariant(unittest.TestCase):
+    """Regression: fat changed_symbols with NO application_impact must not breach the 40k cap.
+
+    Reviewer repro shape: 6 clusters x 3 rows, no other evictable bulk.
+    Before the tandem-clipping fix, _evict_review_rows_to_fit popped from top-level
+    changed_symbols (non-lead victim) while review_leads.changed_symbols stayed
+    untouched (lead = protected). The end-of-finalize re-mirror then restored ALL rows,
+    producing final > cap despite the loop ending under cap.
+    """
+
+    @staticmethod
+    def _make_fat_changed_symbols_packet(file_count: int = 6, symbols_per_file: int = 3) -> dict:
+        """6 clusters × 3 rows, no application_impact, top-level changed_symbols present."""
+        changed_symbols = []
+        for fi in range(file_count):
+            fpath = f"src/module_{fi}.py"
+            for si in range(symbols_per_file):
+                lid = f"lead:changed_symbol:file{fi}_sym{si}"
+                changed_symbols.append({
+                    "lead_id": lid,
+                    "lead_kind": "changed_symbol",
+                    "qualname": f"module_{fi}.func_{si}",
+                    "name": f"func_{si}",
+                    "path": fpath,
+                    "repo": "repo-a",
+                    "line_start": si * 20 + 1,
+                    "line_end": si * 20 + 15,
+                    # Bulk the row to inflate size without adding new list-of-dicts victims
+                    "detail": "x" * 400,
+                })
+
+        review_leads = {
+            "changed_symbols": list(changed_symbols),
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+        }
+        available_counts = {
+            "changed_symbol_count": len(changed_symbols),
+            "direct_caller_count": 0,
+            "direct_callee_count": 0,
+            "transitive_caller_count": 0,
+            "source_coordinate_count": 0,
+        }
+        lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": len(changed_symbols),
+            "changed_symbol_count": len(changed_symbols),
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": file_count,
+            "available": available_counts,
+            "returned": dict(available_counts),
+        }
+        review_answer_packet = {
+            "top_changed_symbols": list(changed_symbols[:3]),
+            "top_direct_callers": [],
+            "top_direct_callees": [],
+            "top_transitive_callers": [],
+            "top_review_hypotheses": [],
+            "review_lead_status": lead_status,
+        }
+        hypothesis = {
+            "hypothesis_id": "hypothesis:direct_call_contract_drift:deadbeef00000001",
+            "risk_type": "direct_call_contract_drift",
+            "confidence": "medium",
+            "why": "Risk.",
+            "supporting_lead_ids": [changed_symbols[0]["lead_id"]],
+            "evidence_refs": [{"repo": "repo-a", "path": "src/module_0.py", "line_start": 1, "line_end": 5}],
+            "source_checks": [],
+        }
+        return {
+            "tool": "review_context",
+            "status": "ok",
+            "query": {"changed_files": [f"src/module_{i}.py" for i in range(file_count)]},
+            "summary": {"symbol_anchor_count": len(changed_symbols), "file_anchor_count": file_count},
+            "snapshot_summary": {},
+            "snapshot_scope": {},
+            "review_leads": review_leads,
+            "review_lead_status": lead_status,
+            "review_hypotheses": [hypothesis],
+            "review_answer_packet": review_answer_packet,
+            # NO application_impact — prevents prior tests from absorbing evictions
+            "changed_symbols": list(changed_symbols),
+            "output_budget": {
+                "truncated": False,
+                "measured_chars": 0,
+                "max_chars": 40_000,
+                "truncated_sections": [],
+            },
+        }
+
+    def _assert_invariants(self, result: dict, cap: int, entry_size: int, label: str) -> None:
+        final_size = len(canonical_json(result))
+        # Cap invariant: final <= cap
+        self.assertLessEqual(
+            final_size,
+            cap,
+            f"[{label}] cap breach: cap={cap} entry={entry_size} final={final_size}",
+        )
+        # Tandem equality: top-level changed_symbols == review_leads.changed_symbols
+        review_leads = result.get("review_leads") or {}
+        rl_cs = review_leads.get("changed_symbols") or []
+        top_cs = result.get("changed_symbols")
+        if top_cs is not None:
+            self.assertEqual(
+                rl_cs,
+                top_cs,
+                f"[{label}] desync: review_leads.changed_symbols ({len(rl_cs)}) "
+                f"!= top-level changed_symbols ({len(top_cs)})",
+            )
+        # Non-vacuous: something must have been evicted (entry was over cap)
+        self.assertGreater(
+            entry_size,
+            cap,
+            f"[{label}] fixture was not over cap at entry ({entry_size} <= {cap}); "
+            "cap invariant assertion may be vacuous",
+        )
+
+    def test_cap_invariant_direct_finalize_at_8444(self):
+        """Direct _finalize call at cap=8444 with reviewer's repro shape."""
+        from copy import deepcopy
+        packet = self._make_fat_changed_symbols_packet()
+        original_hyps = deepcopy(packet["review_hypotheses"])
+        original_review_leads = deepcopy(packet["review_leads"])
+        cap = 8_444
+        entry_size = len(canonical_json(packet))
+        _finalize_review_hypothesis_budget(
+            packet, original_hyps, original_review_leads=original_review_leads, max_chars=cap
+        )
+        self._assert_invariants(packet, cap, entry_size, "direct_finalize_8444")
+
+    def test_cap_invariant_direct_finalize_at_7544(self):
+        """Direct _finalize call at cap=7544 with reviewer's repro shape."""
+        from copy import deepcopy
+        packet = self._make_fat_changed_symbols_packet()
+        original_hyps = deepcopy(packet["review_hypotheses"])
+        original_review_leads = deepcopy(packet["review_leads"])
+        cap = 7_544
+        entry_size = len(canonical_json(packet))
+        _finalize_review_hypothesis_budget(
+            packet, original_hyps, original_review_leads=original_review_leads, max_chars=cap
+        )
+        self._assert_invariants(packet, cap, entry_size, "direct_finalize_7544")
+
+    def test_cap_invariant_enforce_budget_at_8444(self):
+        """enforce_review_context_budget path at cap=8444 with reviewer's repro shape."""
+        packet = self._make_fat_changed_symbols_packet()
+        cap = 8_444
+        entry_size = len(canonical_json(packet))
+        result = enforce_review_context_budget(packet, max_chars=cap)
+        self._assert_invariants(result, cap, entry_size, "enforce_budget_8444")
+
+    def test_cap_invariant_enforce_budget_at_7544(self):
+        """enforce_review_context_budget path at cap=7544 with reviewer's repro shape."""
+        packet = self._make_fat_changed_symbols_packet()
+        cap = 7_544
+        entry_size = len(canonical_json(packet))
+        result = enforce_review_context_budget(packet, max_chars=cap)
+        self._assert_invariants(result, cap, entry_size, "enforce_budget_7544")
+
+
 if __name__ == "__main__":
     unittest.main()
