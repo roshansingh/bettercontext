@@ -108,6 +108,10 @@ _BUDGET_BACKFILL_LIST_PATHS: tuple[tuple[str, ...], ...] = (
     ("related_facts", "symbol_impact", "reverse_impact", "source_inspection_areas"),
 )
 _REVIEW_BUDGET_BACKFILL_LIST_PATHS: tuple[tuple[str, ...], ...] = (
+    # Hypotheses are highest-priority backfill: they are the reviewer's primary signal and
+    # compacted rows are small, so they should be restored before broad context rows.
+    ("review_hypotheses",),
+    ("review_answer_packet", "top_review_hypotheses"),
     ("review_leads", "changed_symbols"),
     ("review_leads", "direct_callers"),
     ("review_leads", "direct_callees"),
@@ -128,8 +132,6 @@ _REVIEW_BUDGET_BACKFILL_LIST_PATHS: tuple[tuple[str, ...], ...] = (
     ("review_answer_packet", "top_direct_callers"),
     ("review_answer_packet", "top_direct_callees"),
     ("review_answer_packet", "top_transitive_callers"),
-    ("review_hypotheses",),
-    ("review_answer_packet", "top_review_hypotheses"),
 )
 _PLANNING_BUDGET_ADVICE = (
     "Use runtime_architecture.answer_packet.investigation_brief as the source-inspection head start, then use narrower "
@@ -476,10 +478,24 @@ def enforce_review_context_budget(
     the agent inspects source rather than doing saved-file archaeology. Row limits tighten
     across passes until the packet fits; if non-row content alone still exceeds the cap, the
     packet is returned with output_budget.exceeded_after_minimization set.
+
+    Priority order (highest keep-priority first):
+      1. review_lead_status
+      2. review_hypotheses (top 1-3; top 1 is the floor when any were generated)
+      3. review_leads rows with lead_ids
+      4. source coordinates for hypotheses/leads
+      5. compact diff anchors
+      6. inspection_areas
+      7. broad application/runtime/framework context
     """
     measured = len(canonical_json(result))
     if measured <= max_chars:
         return result
+    # Record original hypotheses before any compaction so the floor and status helpers can
+    # reference the pre-budget list throughout all paths.
+    original_hypotheses = [
+        row for row in _list_value(result.get("review_hypotheses")) if isinstance(row, dict)
+    ]
     for row_limit in _REVIEW_DETAIL_ROW_LIMITS:
         compact, truncated_sections = _compact_review_detail(result, limit=row_limit)
         _attach_detail_budget_metadata(
@@ -490,27 +506,33 @@ def enforce_review_context_budget(
             truncated_sections=truncated_sections,
         )
         if len(canonical_json(compact)) <= max_chars:
-            return _backfill_review_context(
+            backfilled = _backfill_review_context(
                 compact,
                 result,
                 measured_chars=measured,
                 max_chars=max_chars,
                 truncated_sections=truncated_sections,
             )
+            _attach_review_hypothesis_status(backfilled, original_hypotheses)
+            return backfilled
     # Even the tightest pass overshot (rare: dominated by non-row content); signal it like
     # the planning path by shrinking the largest low-signal row lists before degrading to a
     # lead-only packet.
     compact = _review_signal_hard_cap(compact, max_chars=max_chars)
+    compact = _protect_review_hypotheses_floor(compact, original_hypotheses)
     if len(canonical_json(compact)) <= max_chars:
+        _attach_review_hypothesis_status(compact, original_hypotheses)
         return compact
     compact = _review_lead_only_budget_packet(
         compact,
         measured_chars=measured,
         max_chars=max_chars,
         truncated_sections=truncated_sections,
+        original_hypotheses=original_hypotheses,
     )
     if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
         compact["output_budget"]["exceeded_after_minimization"] = True
+    _attach_review_hypothesis_status(compact, original_hypotheses)
     return compact
 
 
@@ -734,6 +756,7 @@ def _review_lead_only_budget_packet(
     measured_chars: int,
     max_chars: int,
     truncated_sections: set[str],
+    original_hypotheses: list[JsonObject] | None = None,
 ) -> JsonObject:
     compact, lead_truncated = _compact_review_detail(result, limit=1)
     truncated_sections = set(truncated_sections) | lead_truncated
@@ -773,9 +796,12 @@ def _review_lead_only_budget_packet(
         "unsupported_review_scopes": compact.get("unsupported_review_scopes", []),
         "next_actions": compact.get("next_actions", []),
     }
+    # Use original_hypotheses as fallback when the compact pass evicted all hypotheses
+    # (can happen when the last detail pass reduced them to an empty list).
+    hyp_source = compact.get("review_hypotheses") or (original_hypotheses or [])
     compacted_hypotheses = [
         _compact_review_hypothesis(row)
-        for row in (compact.get("review_hypotheses") or [])
+        for row in hyp_source
         if isinstance(row, dict)
     ]
     if compacted_hypotheses:
@@ -792,6 +818,7 @@ def _review_lead_only_budget_packet(
         lead_only["output_budget"]["lead_only"] = True
     if _current_chars(lead_only) > max_chars:
         lead_only = _review_signal_hard_cap(lead_only, max_chars=max_chars)
+        lead_only = _protect_review_hypotheses_floor(lead_only, original_hypotheses or [])
         if isinstance(lead_only.get("output_budget"), dict):
             lead_only["output_budget"]["lead_only"] = True
     return lead_only
@@ -2748,6 +2775,54 @@ def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
     if isinstance(supporting_lead_ids, list):
         compact["supporting_lead_ids"] = supporting_lead_ids[:5]
     return compact
+
+
+def _protect_review_hypotheses_floor(result: JsonObject, original_hypotheses: list[JsonObject]) -> JsonObject:
+    """Ensure at least 1 compacted hypothesis survives when any were originally generated.
+
+    Called after hard-cap or signal-cap passes that may have evicted all hypotheses while
+    keeping broad context rows. If the packet has no hypotheses but the original had some,
+    inserts the top compacted hypothesis and, if needed, drops the smallest non-protected
+    list row to keep the packet under budget.
+    """
+    if not original_hypotheses:
+        return result
+    current = result.get("review_hypotheses")
+    if isinstance(current, list) and current:
+        return result
+    # Restore top 1 compacted hypothesis.
+    top_compact = _compact_review_hypothesis(original_hypotheses[0])
+    result = deepcopy(result)
+    result["review_hypotheses"] = [top_compact]
+    budget = result.get("output_budget")
+    if isinstance(budget, dict):
+        truncated = set(budget.get("truncated_sections") or [])
+        if len(original_hypotheses) > 1:
+            truncated.add("review_hypotheses")
+        else:
+            truncated.discard("review_hypotheses")
+        budget["truncated_sections"] = sorted(truncated)
+    return result
+
+
+def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: list[JsonObject]) -> None:
+    """Add review_hypothesis_status when returned count < available count.
+
+    Writes the status dict in-place on result. No-op when zero hypotheses were generated
+    (available_count = 0) or when all generated hypotheses are returned.
+    """
+    available = len(original_hypotheses)
+    if available == 0:
+        return
+    returned = len([h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)])
+    if returned >= available:
+        return
+    result["review_hypothesis_status"] = {
+        "available_count": available,
+        "returned_count": returned,
+    }
+    if returned == 0:
+        result["review_hypothesis_status"]["reason"] = "omitted_due_to_budget"
 
 
 def _compact_diff_anchor(value: object) -> JsonObject:

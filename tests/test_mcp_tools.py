@@ -1972,6 +1972,272 @@ class McpToolsTest(unittest.TestCase):
         self.assertIs(enforce_review_context_budget(result), result)
         self.assertNotIn("output_budget", result)
 
+    def test_review_context_budget_preserves_top_hypothesis_under_heavy_compaction(self) -> None:
+        # Build hypotheses with distinct hypothesis_ids ranked by position.
+        hypotheses = [
+            {
+                "hypothesis_id": f"hyp_{i}",
+                "risk_type": "data_mutation_risk",
+                "confidence": 0.9 - i * 0.1,
+                "why": f"Hypothesis {i} explanation with enough text to be substantial",
+                "evidence_refs": [{"repo": "repo", "path": f"pkg/hyp_{i}.py", "line_start": i, "line_end": i}],
+                "source_checks": [{"repo": "repo", "path": f"pkg/hyp_{i}.py"}],
+                "supporting_lead_ids": [f"lead_{i}"],
+                "payload": "h" * 500,
+            }
+            for i in range(5)
+        ]
+        # Many broad rows to dominate the budget.
+        broad_caller_rows = [
+            {
+                "predicate": "CALLS",
+                "depth": 1,
+                "subject": f"pkg.module_{i}.caller",
+                "object": "pkg.target.changed",
+                "evidence": [{"bytes_ref": {"repo": "repo", "path": f"pkg/module_{i}.py", "line_start": i, "line_end": i}}],
+                "payload": "z" * 1_200,
+            }
+            for i in range(80)
+        ]
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 0,
+            "changed_symbol_count": 0,
+            "direct_impact_count": 80,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+        }
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"direct_caller_count": 80},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "top_direct_callers": broad_caller_rows,
+                "top_review_hypotheses": hypotheses,
+                "application": {"runtime_facts": broad_caller_rows},
+                "framework": {"changed_models": broad_caller_rows},
+            },
+            "review_hypotheses": hypotheses,
+            "review_leads": {
+                "changed_files": ["pkg/module.py"],
+                "changed_symbols": [],
+                "direct_callers": broad_caller_rows,
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": broad_caller_rows,
+            "direct_callees": [],
+            "application_impact": {"runtime_facts": broad_caller_rows},
+            "framework_impact": {"changed_models": broad_caller_rows},
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+        budgeted = enforce_review_context_budget(result, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+
+        final_size = len(canonical_json(budgeted))
+        self.assertLessEqual(final_size, REVIEW_CONTEXT_MAX_CHARS)
+        # At least the top-ranked (first) hypothesis must survive.
+        self.assertIsInstance(budgeted.get("review_hypotheses"), list)
+        self.assertGreater(len(budgeted["review_hypotheses"]), 0)
+        top_hyp = budgeted["review_hypotheses"][0]
+        self.assertEqual(top_hyp["hypothesis_id"], "hyp_0")
+        # Surviving hypotheses keep required compacted fields.
+        self.assertIn("risk_type", top_hyp)
+        self.assertIn("confidence", top_hyp)
+        self.assertIn("why", top_hyp)
+        self.assertIn("evidence_refs", top_hyp)
+        self.assertIn("source_checks", top_hyp)
+        self.assertIn("supporting_lead_ids", top_hyp)
+        # payload stripped by compaction.
+        self.assertNotIn("payload", top_hyp)
+
+    def test_review_context_budget_lead_only_preserves_top_hypothesis(self) -> None:
+        hypotheses = [
+            {
+                "hypothesis_id": f"hyp_{i}",
+                "risk_type": "auth_bypass_risk",
+                "confidence": 0.8,
+                "why": f"Hypothesis {i} reason",
+                "evidence_refs": [{"repo": "repo", "path": f"pkg/h_{i}.py", "line_start": i, "line_end": i}],
+                "source_checks": [{"repo": "repo", "path": f"pkg/h_{i}.py"}],
+                "supporting_lead_ids": [f"lead_{i}"],
+            }
+            for i in range(3)
+        ]
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 0,
+            "changed_symbol_count": 0,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+        }
+        # Force lead-only by stuffing a huge non-row string that survives compaction.
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "top_review_hypotheses": hypotheses,
+                "application": {"oversized_non_row_context": "z" * 50_000},
+            },
+            "review_hypotheses": hypotheses,
+            "review_leads": {
+                "changed_files": ["pkg/module.py"],
+                "changed_symbols": [],
+                "direct_callers": [],
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+
+        self.assertLessEqual(len(canonical_json(budgeted)), 10_000)
+        self.assertTrue(budgeted["output_budget"].get("lead_only"))
+        # Top hypothesis must survive even in lead-only path.
+        self.assertIsInstance(budgeted.get("review_hypotheses"), list)
+        self.assertGreater(len(budgeted["review_hypotheses"]), 0)
+        self.assertEqual(budgeted["review_hypotheses"][0]["hypothesis_id"], "hyp_0")
+
+    def test_review_context_budget_emits_hypothesis_status_when_truncated(self) -> None:
+        hypotheses = [
+            {
+                "hypothesis_id": f"hyp_{i}",
+                "risk_type": "data_mutation_risk",
+                "confidence": 0.7,
+                "why": f"Hypothesis {i} reason",
+                "evidence_refs": [],
+                "source_checks": [],
+                "supporting_lead_ids": [],
+            }
+            for i in range(5)
+        ]
+        broad_caller_rows = [
+            {
+                "predicate": "CALLS",
+                "depth": 1,
+                "subject": f"pkg.module_{i}.caller",
+                "object": "pkg.target.changed",
+                "evidence": [{"bytes_ref": {"repo": "repo", "path": f"pkg/module_{i}.py", "line_start": i, "line_end": i}}],
+                "payload": "z" * 1_200,
+            }
+            for i in range(80)
+        ]
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 0,
+            "changed_symbol_count": 0,
+            "direct_impact_count": 80,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+        }
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"direct_caller_count": 80},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "top_direct_callers": broad_caller_rows,
+                "top_review_hypotheses": hypotheses,
+            },
+            "review_hypotheses": hypotheses,
+            "review_leads": {
+                "changed_files": ["pkg/module.py"],
+                "changed_symbols": [],
+                "direct_callers": broad_caller_rows,
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": broad_caller_rows,
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+        budgeted = enforce_review_context_budget(result, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+
+        self.assertLessEqual(len(canonical_json(budgeted)), REVIEW_CONTEXT_MAX_CHARS)
+        returned_hyps = budgeted.get("review_hypotheses", [])
+        # If fewer than 5 hypotheses returned, review_hypothesis_status must appear.
+        if len(returned_hyps) < 5:
+            self.assertIn("review_hypothesis_status", budgeted)
+            status = budgeted["review_hypothesis_status"]
+            self.assertEqual(status["available_count"], 5)
+            self.assertEqual(status["returned_count"], len(returned_hyps))
+
+    def test_review_context_budget_no_hypothesis_status_when_zero_hypotheses(self) -> None:
+        # Packet with no hypotheses: no fake hypothesis injected, no review_hypothesis_status.
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 0,
+            "changed_symbol_count": 0,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+        }
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "application": {"oversized_non_row_context": "z" * 50_000},
+            },
+            "review_leads": {
+                "changed_files": ["pkg/module.py"],
+                "changed_symbols": [],
+                "direct_callers": [],
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+
+        self.assertLessEqual(len(canonical_json(budgeted)), 10_000)
+        self.assertNotIn("review_hypotheses", budgeted)
+        self.assertNotIn("review_hypothesis_status", budgeted)
+
     def test_reverse_impact_callable_partition_rule(self) -> None:
         from source.kg.query.reverse_impact import _is_callable_symbol
 
