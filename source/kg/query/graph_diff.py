@@ -261,7 +261,9 @@ def call_edge_delta_for_paths(
     one of *paths*.
 
     Path matching rule: the entity's properties["path"] must equal one of the
-    given paths after normalizing both sides with ``path.replace("\\\\", "/").lstrip("./").strip()``.
+    given paths after normalizing both sides — backslashes become "/", whitespace
+    is stripped, and any leading "./" prefixes are removed as literal prefixes
+    ("../" is NOT stripped; "./x" and "x" match, "../x" and "x" do not).
     Entities without a path property are excluded.
 
     Output rows (sorted by (change_kind, predicate, subject_id, object_id)):
@@ -273,10 +275,13 @@ def call_edge_delta_for_paths(
     if not paths:
         return []
 
-    normalized_paths: set[str] = {p.replace("\\", "/").lstrip("./").strip() for p in paths}
-
     def _norm(p: str) -> str:
-        return p.replace("\\", "/").lstrip("./").strip()
+        p = p.replace("\\", "/").strip()
+        while p.startswith("./"):
+            p = p[2:]
+        return p
+
+    normalized_paths: set[str] = {_norm(p) for p in paths}
 
     def _entity_path(entity_id: str, snap: KgSnapshot) -> str | None:
         entity = snap.entities_by_id.get(entity_id)

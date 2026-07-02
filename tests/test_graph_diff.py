@@ -20,14 +20,19 @@ from source.kg.query.graph_diff import (
 TENANT = "default"
 
 
-def _make_snapshot(tmpdir: Path, name: str, entities: list[Entity], facts: list[Fact]) -> KgSnapshot:
+def _make_snapshot(
+    tmpdir: Path,
+    name: str,
+    entities: list[Entity],
+    facts: list[Fact],
+    evidence: list[Evidence] | None = None,
+) -> KgSnapshot:
     root = tmpdir / name
-    evidence: list[Evidence] = []
     coverage: list[Coverage] = []
     JsonlKgStore(root).write(
         entities=entities,
         facts=facts,
-        evidence=evidence,
+        evidence=evidence or [],
         coverage=coverage,
         manifest={"version": 1, "tenant_id": TENANT},
     )
@@ -395,6 +400,43 @@ class TestRemovedSymbolsWithSurvivingReferrers(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
+    def test_coordinates_fall_back_to_evidence_bytes_ref(self) -> None:
+        """Entities without properties.path get coordinates from evidence bytes_ref."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            # No properties.path on either symbol — forces the evidence fallback.
+            fn_alpha = _symbol("svc", "svc.core", "alpha")
+            fn_beta = _symbol("svc", "svc.core", "beta")
+            call = _calls_fact(fn_alpha, fn_beta)
+            mod = _module("svc", "svc.core")
+            ev_beta = Evidence(
+                target_type="entity",
+                target_id=fn_beta.entity_id,
+                derivation_class="deterministic_static",
+                source_system="test-fixture",
+                source_ref={"kind": "unit-test"},
+                bytes_ref={"repo": "svc", "commit_sha": "0" * 40, "path": "svc/core.py", "line_start": 4, "line_end": 5},
+            )
+            ev_alpha = Evidence(
+                target_type="entity",
+                target_id=fn_alpha.entity_id,
+                derivation_class="deterministic_static",
+                source_system="test-fixture",
+                source_ref={"kind": "unit-test"},
+                bytes_ref={"repo": "svc", "commit_sha": "0" * 40, "path": "svc/core.py", "line_start": 1, "line_end": 2},
+            )
+
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta], [call], evidence=[ev_alpha, ev_beta])
+            head = _make_snapshot(root, "head", [mod, fn_alpha], [])
+            delta = diff_snapshots(base, head)
+            rows = removed_symbols_with_surviving_referrers(delta, base, head)
+
+        self.assertEqual(len(rows), 1)
+        removed_coords = rows[0]["removed_symbol"]["coordinates"]
+        referrer_coords = rows[0]["surviving_referrers"][0]["coordinates"]
+        self.assertEqual(removed_coords, {"path": "svc/core.py", "line": 4, "end_line": 5})
+        self.assertEqual(referrer_coords, {"path": "svc/core.py", "line": 1, "end_line": 2})
+
 
 class TestCallEdgeDeltaForPaths(unittest.TestCase):
     """
@@ -462,6 +504,27 @@ class TestCallEdgeDeltaForPaths(unittest.TestCase):
             rows = call_edge_delta_for_paths(delta, base, head, [])
 
         self.assertEqual(rows, [])
+
+    def test_dot_slash_prefix_normalized_but_parent_dir_not(self) -> None:
+        """"./core.py" matches entity path "core.py"; "../core.py" does NOT
+        (a character-class lstrip("./") would wrongly strip ".." and match)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "core", "alpha", "core.py")
+            fn_beta = _symbol_with_path("svc", "core", "beta", "core.py")
+            call_ab = _calls_fact(fn_alpha, fn_beta)
+            mod = _module("svc", "core")
+
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta], [call_ab])
+            head = _make_snapshot(root, "head", [mod, fn_alpha, fn_beta], [])
+            delta = diff_snapshots(base, head)
+
+            dot_slash_rows = call_edge_delta_for_paths(delta, base, head, ["./core.py"])
+            parent_dir_rows = call_edge_delta_for_paths(delta, base, head, ["../core.py"])
+
+        self.assertEqual(len(dot_slash_rows), 1)
+        self.assertEqual(dot_slash_rows[0]["change_kind"], "removed")
+        self.assertEqual(parent_dir_rows, [])
 
     def test_object_path_match_includes_edge(self) -> None:
         """Removed CALLS fact where the OBJECT entity matches the given path."""
