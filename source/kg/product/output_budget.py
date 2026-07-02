@@ -2826,7 +2826,7 @@ def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
             compact[key] = row[key]
     evidence_refs = row.get("evidence_refs")
     if isinstance(evidence_refs, list):
-        compact["evidence_refs"] = evidence_refs[:3]
+        compact["evidence_refs"] = evidence_refs[:4]
     source_checks = row.get("source_checks")
     if isinstance(source_checks, list):
         compact["source_checks"] = source_checks[:2]
@@ -3161,6 +3161,241 @@ def _reconcile_hypothesis_lead_ids(result: JsonObject) -> None:
                     hyp["supporting_lead_ids"] = [lid for lid in lead_ids if lid in surviving]
 
 
+def _group_changed_symbols_by_cluster(
+    review_leads: JsonObject,
+) -> dict[str, list[int]]:
+    """Group changed_symbol row indices in review_leads by their 'path' field.
+
+    Returns {path: [index, ...]} so callers can reorder rows by cluster.
+    """
+    clusters: dict[str, list[int]] = {}
+    rows = review_leads.get("changed_symbols")
+    if not isinstance(rows, list):
+        return clusters
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        path = row.get("path") or ""
+        if path not in clusters:
+            clusters[path] = []
+        clusters[path].append(i)
+    return clusters
+
+
+def _cluster_rank_key(
+    path: str,
+    cluster_lead_ids: list[str],
+    hyp_supporting_ids: set[str],
+    edge_count: int,
+) -> tuple[int, int, str]:
+    """Deterministic rank for a changed-file cluster.
+
+    Referenced-by-hypothesis clusters rank first (0), then by descending edge
+    count, then by path for tie-breaking. Lower tuple = higher rank = kept first.
+    """
+    referenced = any(lid in hyp_supporting_ids for lid in cluster_lead_ids)
+    return (0 if referenced else 1, -edge_count, path)
+
+
+def _interleave_changed_symbols_by_cluster(result: JsonObject) -> None:
+    """Reorder review_leads.changed_symbols so rows interleave across clusters.
+
+    One row from each cluster is placed before any second row from any cluster,
+    etc. (round-robin by rank). This means the existing tail-eviction logic in
+    _evict_review_rows_to_fit naturally preserves cluster coverage: it always
+    pops from the tail, which drops the lowest-priority extra rows first, leaving
+    at least one anchor per cluster until extreme pressure forces whole-cluster
+    drops.
+
+    Cluster rank: hypothesis-referenced clusters first, then (descending edge
+    count, ascending path). Deterministic.
+
+    Mutates result in place.
+    """
+    review_leads = result.get("review_leads")
+    if not isinstance(review_leads, dict):
+        return
+    rows = review_leads.get("changed_symbols")
+    if not isinstance(rows, list) or len(rows) <= 1:
+        return
+
+    # Collect supporting_lead_ids from current hypotheses
+    hyp_supporting: set[str] = set()
+    for hyp in (_list_value(result.get("review_hypotheses")) or []):
+        if isinstance(hyp, dict):
+            for lid in (_list_value(hyp.get("supporting_lead_ids")) or []):
+                if isinstance(lid, str):
+                    hyp_supporting.add(lid)
+
+    # Count direct edges per path to rank clusters with no hypothesis reference
+    edge_counts: dict[str, int] = {}
+    for field in ("direct_callers", "direct_callees"):
+        for row in _list_value(review_leads.get(field)):
+            if isinstance(row, dict):
+                p = row.get("path") or ""
+                edge_counts[p] = edge_counts.get(p, 0) + 1
+
+    # Build cluster → indices mapping preserving original row order within cluster
+    cluster_indices: dict[str, list[int]] = {}
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        path = row.get("path") or ""
+        if path not in cluster_indices:
+            cluster_indices[path] = []
+        cluster_indices[path].append(i)
+
+    if len(cluster_indices) <= 1:
+        return
+
+    # Only interleave when at least one cluster has > 1 row; if every cluster has exactly
+    # 1 row, the list is already trivially interleaved — reordering would only scramble
+    # the existing order without providing any coverage benefit.
+    if all(len(indices) == 1 for indices in cluster_indices.values()):
+        return
+
+    # Rank clusters deterministically
+    def _rank(path: str) -> tuple[int, int, str]:
+        lead_ids = [rows[i].get("lead_id") or "" for i in cluster_indices[path] if isinstance(rows[i], dict)]
+        return _cluster_rank_key(path, lead_ids, hyp_supporting, edge_counts.get(path, 0))
+
+    ranked_paths = sorted(cluster_indices.keys(), key=_rank)
+
+    # Round-robin interleave: pick 1 from each cluster in rank order, cycle
+    interleaved_indices: list[int] = []
+    iterators = [iter(cluster_indices[p]) for p in ranked_paths]
+    active = list(range(len(ranked_paths)))
+    while active:
+        next_active = []
+        for slot in active:
+            idx = next(iterators[slot], None)
+            if idx is not None:
+                interleaved_indices.append(idx)
+                next_active.append(slot)
+        active = next_active
+
+    review_leads["changed_symbols"] = [rows[i] for i in interleaved_indices]
+
+
+def _build_truncation_summary(
+    result: JsonObject,
+    original_review_leads: JsonObject,
+) -> JsonObject:
+    """Build P2 truncation_summary from pre-budget lead counts vs current packet.
+
+    Returns the summary dict. Bounded: <= 5 cluster rows.
+    """
+    review_leads = result.get("review_leads")
+    if not isinstance(review_leads, dict):
+        review_leads = {}
+
+    def _len_field(leads: JsonObject, field: str) -> int:
+        v = leads.get(field)
+        return len(v) if isinstance(v, list) else 0
+
+    omitted_changed_symbol_count = max(
+        0, _len_field(original_review_leads, "changed_symbols") - _len_field(review_leads, "changed_symbols")
+    )
+    omitted_direct_caller_count = max(
+        0, _len_field(original_review_leads, "direct_callers") - _len_field(review_leads, "direct_callers")
+    )
+    omitted_direct_callee_count = max(
+        0, _len_field(original_review_leads, "direct_callees") - _len_field(review_leads, "direct_callees")
+    )
+    omitted_transitive_caller_count = max(
+        0, _len_field(original_review_leads, "transitive_callers") - _len_field(review_leads, "transitive_callers")
+    )
+
+    # Find clusters whose changed_symbol rows were entirely omitted
+    original_cs = [r for r in _list_value(original_review_leads.get("changed_symbols")) if isinstance(r, dict)]
+    retained_cs = [r for r in _list_value(review_leads.get("changed_symbols")) if isinstance(r, dict)]
+    retained_lead_ids: set[str] = {r.get("lead_id") or "" for r in retained_cs}
+
+    # Group original rows by cluster (file path)
+    original_by_cluster: dict[str, list[dict]] = {}
+    for row in original_cs:
+        p = row.get("path") or ""
+        if p not in original_by_cluster:
+            original_by_cluster[p] = []
+        original_by_cluster[p].append(row)
+
+    # Collect hypothesis supporting ids to determine risk_family
+    hyp_supporting_by_risk: dict[str, set[str]] = {}
+    for hyp in _list_value(result.get("review_hypotheses")) or []:
+        if not isinstance(hyp, dict):
+            continue
+        rt = str(hyp.get("risk_type") or "")
+        for lid in _list_value(hyp.get("supporting_lead_ids")):
+            if isinstance(lid, str):
+                if rt not in hyp_supporting_by_risk:
+                    hyp_supporting_by_risk[rt] = set()
+                hyp_supporting_by_risk[rt].add(lid)
+
+    # Also check original hypotheses inside review_hypotheses — they may have been compacted
+    # Edge count per path
+    edge_counts: dict[str, int] = {}
+    for field in ("direct_callers", "direct_callees"):
+        for row in _list_value(original_review_leads.get(field)):
+            if isinstance(row, dict):
+                p = row.get("path") or ""
+                edge_counts[p] = edge_counts.get(p, 0) + 1
+
+    # Clusters dropped entirely
+    dropped_clusters: list[tuple[tuple[int, int, str], str, list[dict]]] = []
+    for path, orig_rows in original_by_cluster.items():
+        if all((r.get("lead_id") or "") not in retained_lead_ids for r in orig_rows):
+            # Determine risk_family: first hypothesis risk_type that referenced any lead here
+            orig_ids = {r.get("lead_id") or "" for r in orig_rows}
+            risk_family: str | None = None
+            for rt, lids in sorted(hyp_supporting_by_risk.items()):
+                if orig_ids & lids:
+                    risk_family = rt
+                    break
+            hyp_ids = {lid for s in hyp_supporting_by_risk.values() for lid in s}
+            rank = _cluster_rank_key(path, list(orig_ids), hyp_ids, edge_counts.get(path, 0))
+            dropped_clusters.append((rank, path, orig_rows))
+
+    # Sort by rank (highest-priority dropped clusters first in summary)
+    dropped_clusters.sort(key=lambda t: t[0])
+
+    omitted_high_risk_clusters: list[JsonObject] = []
+    for _, path, orig_rows in dropped_clusters[:5]:
+        orig_ids_list = [r.get("lead_id") or "" for r in orig_rows if r.get("lead_id")]
+        orig_ids_set = set(orig_ids_list)
+        risk_family = None
+        for rt, lids in sorted(hyp_supporting_by_risk.items()):
+            if orig_ids_set & lids:
+                risk_family = rt
+                break
+        n_edges = edge_counts.get(path, 0)
+        if risk_family:
+            reason = f"referenced by hypothesis {risk_family}"
+        elif n_edges:
+            reason = f"{n_edges} direct edges"
+        else:
+            reason = "changed file with no retained symbols"
+        rep_syms = [
+            r.get("qualname") or r.get("name") or ""
+            for r in orig_rows[:3]
+            if isinstance(r, dict) and (r.get("qualname") or r.get("name"))
+        ]
+        omitted_high_risk_clusters.append({
+            "risk_family": risk_family,
+            "changed_files": [path],
+            "representative_symbols": rep_syms[:3],
+            "representative_lead_ids": orig_ids_list[:3],
+            "reason_ranked_high": reason,
+        })
+
+    return {
+        "omitted_changed_symbol_count": omitted_changed_symbol_count,
+        "omitted_direct_caller_count": omitted_direct_caller_count,
+        "omitted_direct_callee_count": omitted_direct_callee_count,
+        "omitted_transitive_caller_count": omitted_transitive_caller_count,
+        "omitted_high_risk_clusters": omitted_high_risk_clusters,
+    }
+
+
 _REVIEW_HYPOTHESIS_HEADROOM_TARGET = 3
 
 
@@ -3219,11 +3454,22 @@ def _finalize_review_hypothesis_budget(
     chars must be paid for by evicting broad rows — never by exceeding the cap and never by
     dropping the protected hypotheses. Mutates ``result`` in place.
 
+    P1: Before any eviction, reorder changed_symbols in review_leads so rows interleave
+    across clusters (changed file paths). This ensures the existing tail-eviction logic
+    retains >= 1 anchor per cluster before retaining a 2nd anchor from any single cluster.
+
     N2: Before syncing the mirror, attempt to restore up to min(3, available) compacted
     hypotheses by evicting broad application/runtime/framework context first. This ensures
     Grafana-shaped packets (modest headroom, fat broad sections) return top-3 hypotheses
     instead of just the floor-of-1.
+
+    P2: After all eviction, attach truncation_summary to output_budget when truncated.
     """
+    # P1: Interleave changed_symbols by cluster so eviction respects cluster coverage.
+    _interleave_changed_symbols_by_cluster(result)
+    # Snapshot pre-eviction review_leads for P2 omitted-count computation.
+    _pre_eviction_review_leads = deepcopy(result.get("review_leads") or {})
+
     # N2: Evict broad context to fund up to _REVIEW_HYPOTHESIS_HEADROOM_TARGET hypotheses.
     broad_evicted = _restore_hypotheses_up_to_target(
         result,
@@ -3257,6 +3503,22 @@ def _finalize_review_hypothesis_budget(
     # After all eviction is complete, drop stale lead IDs from hypotheses. hypothesis_id
     # is intentionally not recomputed — it was stamped at producer time from the pre-budget set.
     _reconcile_hypothesis_lead_ids(result)
+    # P2: Attach truncation_summary when the packet was truncated.
+    budget = result.get("output_budget")
+    if isinstance(budget, dict) and budget.get("truncated"):
+        ts = _build_truncation_summary(result, _pre_eviction_review_leads)
+        ts_chars = len(canonical_json(ts))
+        # Only attach if it fits within the cap (it replaces bulk, so almost always true).
+        if _current_chars(result) + ts_chars <= max_chars:
+            budget["truncation_summary"] = ts
+        else:
+            # Compacted form: omit cluster rows, keep counts only
+            ts_compact: JsonObject = {
+                k: v for k, v in ts.items() if k != "omitted_high_risk_clusters"
+            }
+            ts_compact["omitted_high_risk_clusters"] = []
+            if _current_chars(result) + len(canonical_json(ts_compact)) <= max_chars:
+                budget["truncation_summary"] = ts_compact
 
 
 _REVIEW_HYPOTHESIS_MIRROR_CAP = 3
