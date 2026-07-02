@@ -2178,6 +2178,26 @@ def _optional_review_surfaces(arguments: JsonObject, field: str) -> list[str]:
     return surfaces
 
 
+def _optional_review_surfaces_tolerant(
+    arguments: JsonObject, field: str
+) -> tuple[list[str], list[str]]:
+    """review_context call site: known surfaces + unknown tokens (verbatim, no error)."""
+    surfaces: list[str] = []
+    unknown: list[str] = []
+    for value in _optional_string_list(arguments, field):
+        normalized_value = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized_value in REVIEW_CONTEXT_BUILTIN_SECTION_ALIASES:
+            continue
+        canonical = REVIEW_CONTEXT_SURFACE_ALIASES.get(normalized_value)
+        if canonical is None:
+            if value not in unknown:
+                unknown.append(value)
+            continue
+        if canonical not in surfaces:
+            surfaces.append(canonical)
+    return surfaces, unknown
+
+
 def _optional_review_section_aliases(arguments: JsonObject, field: str) -> set[str]:
     sections: set[str] = set()
     for value in _optional_string_list(arguments, field):
@@ -2693,7 +2713,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     changed_ranges = _optional_changed_ranges(arguments, "changed_ranges")
     limit = _limit(arguments)
     detail_limit = min(limit, REVIEW_CONTEXT_DETAIL_LIMIT)
-    requested_surfaces = _optional_review_surfaces(arguments, "requested_surfaces")
+    requested_surfaces, unknown_surfaces = _optional_review_surfaces_tolerant(arguments, "requested_surfaces")
     requested_review_sections = _optional_review_section_aliases(arguments, "requested_surfaces")
     include_deploy_blockers = _optional_bool(arguments, "include_deploy_blockers", default=False)
     include_unlinked_leads = _optional_bool(arguments, "include_unlinked_leads", default=False)
@@ -2843,6 +2863,8 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         application_impact=application_impact,
         runtime_surfaces=runtime_surfaces,
         requested_surfaces=requested_surfaces,
+        unknown_surfaces=unknown_surfaces,
+        changed_symbols=changed_symbols,
     )
     answerability = _review_context_answerability(
         status=status,
@@ -4360,9 +4382,11 @@ def _review_context_surface_status(
     application_impact: JsonObject,
     runtime_surfaces: dict[str, list[JsonObject]],
     requested_surfaces: list[str],
+    unknown_surfaces: list[str] | None = None,
+    changed_symbols: list[JsonObject] | None = None,
 ) -> list[JsonObject]:
     surfaces = requested_surfaces or list(REVIEW_CONTEXT_SURFACES)
-    return [
+    rows: list[JsonObject] = [
         _review_context_surface_status_row(
             surface,
             application_impact=application_impact,
@@ -4370,6 +4394,33 @@ def _review_context_surface_status(
         )
         for surface in surfaces
     ]
+    for token in unknown_surfaces or []:
+        rows.append(_review_context_unknown_surface_status_row(token, changed_symbols=changed_symbols or []))
+    return rows
+
+
+def _review_context_unknown_surface_status_row(
+    token: str,
+    *,
+    changed_symbols: list[JsonObject],
+) -> JsonObject:
+    words = [w for w in token.replace("-", "_").split("_") if w]
+    terms: list[str] = []
+    seen: set[str] = set()
+    for t in [token] + words:
+        if t and t not in seen:
+            terms.append(t)
+            seen.add(t)
+    for row in changed_symbols[:5]:
+        name = str(row.get("qualified_name") or row.get("qualname") or "")
+        if name and name not in seen:
+            terms.append(name)
+            seen.add(name)
+    return {
+        "surface": token,
+        "status": "unsupported_or_unlinked",
+        "source_inspection_terms": terms,
+    }
 
 
 def _review_context_surface_status_row(

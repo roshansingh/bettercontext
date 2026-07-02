@@ -2045,9 +2045,10 @@ class McpToolsTest(unittest.TestCase):
 
         final_size = len(canonical_json(budgeted))
         self.assertLessEqual(final_size, REVIEW_CONTEXT_MAX_CHARS)
-        # At least the top-ranked (first) hypothesis must survive.
+        # At least the top-ranked (first) hypothesis must survive; hypotheses backfill
+        # ahead of broad rows, so the top-3 target holds at the normal cap.
         self.assertIsInstance(budgeted.get("review_hypotheses"), list)
-        self.assertGreater(len(budgeted["review_hypotheses"]), 0)
+        self.assertGreaterEqual(len(budgeted["review_hypotheses"]), 3)
         top_hyp = budgeted["review_hypotheses"][0]
         self.assertEqual(top_hyp["hypothesis_id"], "hyp_0")
         # Surviving hypotheses keep required compacted fields.
@@ -2127,10 +2128,10 @@ class McpToolsTest(unittest.TestCase):
                 "hypothesis_id": f"hyp_{i}",
                 "risk_type": "data_mutation_risk",
                 "confidence": 0.7,
-                "why": f"Hypothesis {i} reason",
-                "evidence_refs": [],
-                "source_checks": [],
-                "supporting_lead_ids": [],
+                "why": f"Hypothesis {i} reason " + "w" * 120,
+                "evidence_refs": [{"repo": "repo", "path": f"pkg/h_{i}.py", "line_start": i, "line_end": i}],
+                "source_checks": [{"repo": "repo", "path": f"pkg/h_{i}.py"}],
+                "supporting_lead_ids": [f"lead_{i}"],
             }
             for i in range(5)
         ]
@@ -2183,16 +2184,21 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        # 8,000 chars is tight enough that only some of the 5 hypotheses fit, so this
+        # test always exercises the truncation-status path (never vacuous).
+        budgeted = enforce_review_context_budget(result, max_chars=8_000)
 
-        self.assertLessEqual(len(canonical_json(budgeted)), REVIEW_CONTEXT_MAX_CHARS)
+        self.assertLessEqual(len(canonical_json(budgeted)), 8_000)
         returned_hyps = budgeted.get("review_hypotheses", [])
-        # If fewer than 5 hypotheses returned, review_hypothesis_status must appear.
-        if len(returned_hyps) < 5:
-            self.assertIn("review_hypothesis_status", budgeted)
-            status = budgeted["review_hypothesis_status"]
-            self.assertEqual(status["available_count"], 5)
-            self.assertEqual(status["returned_count"], len(returned_hyps))
+        # Truncation must actually happen at this cap, and the floor must hold.
+        self.assertGreater(len(returned_hyps), 0)
+        self.assertLess(len(returned_hyps), 5)
+        self.assertEqual(returned_hyps[0]["hypothesis_id"], "hyp_0")
+        self.assertIn("review_hypothesis_status", budgeted)
+        status = budgeted["review_hypothesis_status"]
+        self.assertEqual(status["available_count"], 5)
+        self.assertEqual(status["returned_count"], len(returned_hyps))
+        self.assertIn("review_hypotheses", budgeted["output_budget"]["truncated_sections"])
 
     def test_review_context_budget_no_hypothesis_status_when_zero_hypotheses(self) -> None:
         # Packet with no hypotheses: no fake hypothesis injected, no review_hypothesis_status.
@@ -3702,6 +3708,85 @@ class McpToolsTest(unittest.TestCase):
         self.assertIn("repo_dependencies", result["impact"])
         self.assertIn("runtime_surfaces", result)
 
+    def test_review_context_unknown_surfaces_degrade_to_status_rows(self) -> None:
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "requested_surfaces": ["rule_actions", "abilities", "authz", "tests"],
+                    "limit": 10,
+                },
+            )
+
+        self.assertEqual(result["status"], "found")
+        statuses = {row["surface"]: row for row in result["surface_status"]}
+        self.assertIn("rule_actions", statuses)
+        self.assertIn("abilities", statuses)
+        self.assertIn("authz", statuses)
+        self.assertIn("tests", statuses)
+        for token in ("rule_actions", "abilities", "authz", "tests"):
+            row = statuses[token]
+            self.assertEqual(row["status"], "unsupported_or_unlinked")
+            self.assertIn("source_inspection_terms", row)
+            terms = row["source_inspection_terms"]
+            self.assertIn(token, terms)
+        # split words present for multi-word token
+        self.assertIn("rule", statuses["rule_actions"]["source_inspection_terms"])
+        self.assertIn("actions", statuses["rule_actions"]["source_inspection_terms"])
+
+    def test_review_context_mixed_known_and_unknown_surfaces(self) -> None:
+        with _fixture_snapshot(app_surface=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "requested_surfaces": ["scheduled_jobs", "authz"],
+                    "limit": 10,
+                },
+            )
+
+        self.assertEqual(result["status"], "found")
+        statuses = {row["surface"]: row for row in result["surface_status"]}
+        # known surface behaves normally
+        self.assertIn("scheduled_jobs", statuses)
+        self.assertIn(statuses["scheduled_jobs"]["status"], {"inventory_context", "unlinked_lead", "missing"})
+        self.assertNotEqual(statuses["scheduled_jobs"]["status"], "unsupported_or_unlinked")
+        # unknown surface gets degraded row
+        self.assertIn("authz", statuses)
+        self.assertEqual(statuses["authz"]["status"], "unsupported_or_unlinked")
+        self.assertIn("authz", statuses["authz"]["source_inspection_terms"])
+
+    def test_review_context_unknown_surface_inspection_terms_include_changed_symbol_names(self) -> None:
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 1, "end_line": 200}],
+                    "requested_surfaces": ["ability_checks"],
+                    "limit": 10,
+                },
+            )
+
+        statuses = {row["surface"]: row for row in result["surface_status"]}
+        self.assertIn("ability_checks", statuses)
+        row = statuses["ability_checks"]
+        self.assertEqual(row["status"], "unsupported_or_unlinked")
+        terms = row["source_inspection_terms"]
+        # token and its split words
+        self.assertIn("ability_checks", terms)
+        self.assertIn("ability", terms)
+        self.assertIn("checks", terms)
+        # at most 5 symbol names appended (no duplicates in terms)
+        self.assertEqual(len(terms), len(set(terms)))
+
     def test_review_context_surfaces_path_matched_endpoint_consumers(self) -> None:
         with _fixture_snapshot(endpoint_consumer=True) as kg:
             result = call_tool(
@@ -4639,16 +4724,7 @@ class McpToolsTest(unittest.TestCase):
                     "review_context",
                     {"repo": "payments", "changed_files": ["payments/checkout.py"], "changed_ranges": None},
                 )
-            with self.assertRaisesRegex(ValueError, "requested_surfaces.*unsupported"):
-                call_tool(
-                    kg,
-                    "review_context",
-                    {
-                        "repo": "payments",
-                        "changed_files": ["payments/checkout.py"],
-                        "requested_surfaces": ["campaign_specific_guess"],
-                    },
-                )
+            # Unknown surfaces no longer raise; they degrade to unsupported_or_unlinked status rows.
             with self.assertRaisesRegex(ValueError, "requested_surfaces.*list"):
                 call_tool(
                     kg,
