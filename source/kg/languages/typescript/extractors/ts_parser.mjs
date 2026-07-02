@@ -3260,8 +3260,9 @@ function collectKafkaEvents(sourceFile) {
 //   chained, and not assigned to a variable.  Cross-file calls emit nothing
 //   (documented limitation).
 //
-// Both signals carry { signal, qualname, callee, line } and are capped at 3
-// per enclosing symbol (lowest line first) across both families combined.
+// Both signals carry { signal, qualname, callee, line } and are capped at 20
+// per file (lowest line first). Per-subject retrieval bound of 3 is enforced
+// at query time in _review_context_risk_signals.
 //
 // Limitation: collectAsyncFunctionNames only captures top-level async function
 // declarations and top-level async arrow/function-expression variable bindings;
@@ -3441,20 +3442,11 @@ function isInsidePromiseAll(callNode) {
 }
 
 function applySignalCap(rawSignals) {
-  // Group by qualname only — cap is 3 signals combined across all families per
-  // enclosing symbol, lowest line first.
-  const bySymbol = new Map();
-  for (const sig of rawSignals) {
-    const key = sig.qualname;
-    if (!bySymbol.has(key)) bySymbol.set(key, []);
-    bySymbol.get(key).push(sig);
-  }
-  const capped = [];
-  for (const sigs of bySymbol.values()) {
-    sigs.sort((a, b) => a.line - b.line);
-    capped.push(...sigs.slice(0, 3));
-  }
-  return capped;
+  // File-level cap: emit at most 20 signals per file (all families combined).
+  // Per-subject retrieval bound (3 signals per enclosing symbol, relevance-first)
+  // is enforced at query time in _review_context_risk_signals.
+  rawSignals.sort((a, b) => a.line - b.line);
+  return rawSignals.slice(0, 20);
 }
 
 function collectAsyncLifecycleSignals(sourceFile, symbols) {

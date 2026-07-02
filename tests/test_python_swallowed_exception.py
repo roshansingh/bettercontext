@@ -8,7 +8,7 @@ TDD: these tests are written before the implementation. They verify:
 - narrow exception type (except ValueError:) does NOT fire (negative)
 - handler that logs (calls logging.*) does NOT fire (negative)
 - handler that calls cleanup (any call) does NOT fire (negative)
-- per-symbol cap at 3 (lowest lines selected)
+- per-file cap at 20 (lowest lines selected; per-symbol bound of 3 at retrieval)
 - bytes_ref is present and complete on every emitted signal
 - qualifier contains risk_family, exception_type, detail
 - determinism: two builds produce identical fact_ids
@@ -365,27 +365,27 @@ class QualifierAndBytesRefTest(unittest.TestCase):
 
 
 class CapTest(unittest.TestCase):
-    def test_per_symbol_cap_at_three(self) -> None:
+    def test_file_cap_allows_all_four_from_one_symbol(self) -> None:
+        # _CAP_EXCEEDED has 4 handlers in one symbol; file cap is 20 → all 4 emitted.
         sf, _, _ = _build({"worker.py": _CAP_EXCEEDED})
         signals = [
             s for s in _swallowed_signals(sf)
             if s["qualifier"].get("qualname") == "multi_try"
         ]
-        self.assertEqual(len(signals), 3, f"expected exactly 3 (cap), got {len(signals)}: {signals}")
+        self.assertEqual(len(signals), 4, f"expected all 4 (file cap=20), got {len(signals)}: {signals}")
 
-    def test_cap_selects_lowest_lines(self) -> None:
+    def test_all_four_lines_present_under_file_cap(self) -> None:
         sf, _, _ = _build({"worker.py": _CAP_EXCEEDED})
         signals = [
             s for s in _swallowed_signals(sf)
             if s["qualifier"].get("qualname") == "multi_try"
         ]
-        self.assertEqual(len(signals), 3)
         lines = sorted(s["qualifier"]["line"] for s in signals)
         # _CAP_EXCEEDED: 4 except Exception: pass handlers at lines 4, 8, 12, 16.
-        # Cap keeps lowest 3 → [4, 8, 12]; line 16 (4th handler) is absent.
-        self.assertEqual(lines, [4, 8, 12], f"expected lowest 3 handler lines [4,8,12], got {lines}")
-        # Inversion: line 16 must be absent (proves 4th handler was dropped, not a different 3)
-        self.assertNotIn(16, lines, "line 16 (4th except handler) must be dropped by cap")
+        # File cap is 20 → all 4 lines must appear.
+        self.assertEqual(lines, [4, 8, 12, 16], f"expected all 4 handler lines [4,8,12,16], got {lines}")
+        # Inversion: previously line 16 was dropped by the old per-symbol cap of 3.
+        self.assertIn(16, lines, "line 16 (4th handler) must now be present under file cap")
 
 
 class DeterminismTest(unittest.TestCase):

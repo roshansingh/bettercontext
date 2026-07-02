@@ -3655,9 +3655,22 @@ def _repair_cluster_coverage(
                 if _rank(worst) > _rank(path):
                     donor = worst
         if donor is None:
-            # The best-ranked uncovered cluster cannot be funded; lower-ranked ones
-            # cannot either — they stay dropped whole and P2 records them.
-            break
+            # No swap donor; try funding via tier-2 eviction (broad context →
+            # answer-packet contract dedup → changed_surface/surface_status/
+            # changed_file_symbols).  Each cluster is attempted highest-rank first;
+            # stop when even tier-2 eviction cannot make room (lower-ranked clusters
+            # are cheaper but also lower-priority, so if this one fails, break).
+            compact_anchor = _compact_symbol(original_by_cluster[path][0])
+            anchor_cost = len(canonical_json(compact_anchor))
+            _evict_broad_context_to_fit(
+                result, max_chars=max(1, max_chars - anchor_cost - _HARD_CAP_AREA_RESERVE // 4)
+            )
+            if _current_chars(result) + anchor_cost > max_chars:
+                break
+            retained.append(compact_anchor)
+            retained_counts[path] = retained_counts.get(path, 0) + 1
+            changed = True
+            continue
         for index in range(len(retained) - 1, -1, -1):
             row = retained[index]
             if isinstance(row, dict) and (row.get("path") or "") == donor:

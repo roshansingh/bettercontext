@@ -381,16 +381,17 @@ class UnawaitedAsyncCallTest(unittest.TestCase):
 
 @unittest.skipIf(not NODE_AVAILABLE, "node not available")
 class SignalCapTest(unittest.TestCase):
-    def test_per_symbol_cap_at_three(self) -> None:
+    def test_file_cap_allows_all_four_from_one_symbol(self) -> None:
+        # _CAP_EXCEEDED has 4 forEach(async) in one symbol; file cap is 20 → all 4 emitted.
         sf, _, _ = _build({"batch.ts": _CAP_EXCEEDED})
         signals = [
             s for s in _risk_signals(sf)
             if s["qualifier"]["risk_family"] == "async_callback_in_iteration"
             and s["qualifier"]["qualname"] == "batchProcess"
         ]
-        self.assertEqual(len(signals), 3, f"expected exactly 3 (cap), got {len(signals)}: {signals}")
+        self.assertEqual(len(signals), 4, f"expected all 4 (file cap=20), got {len(signals)}: {signals}")
 
-    def test_cap_selects_lowest_lines(self) -> None:
+    def test_all_four_lines_present_under_file_cap(self) -> None:
         sf, _, _ = _build({"batch.ts": _CAP_EXCEEDED})
         signals = [
             s for s in _risk_signals(sf)
@@ -398,28 +399,42 @@ class SignalCapTest(unittest.TestCase):
             and s["qualifier"]["qualname"] == "batchProcess"
         ]
         lines = sorted(s["qualifier"]["line"] for s in signals)
-        # _CAP_EXCEEDED: 4 forEach(async) calls on lines 2, 3, 4, 5 (1-indexed).
-        # Cap keeps lowest 3 → [2, 3, 4]; line 5 (the 4th handler) is absent.
-        self.assertEqual(lines, [2, 3, 4], f"expected lowest 3 lines [2,3,4], got {lines}")
-        # Inversion: line 5 must be absent (proves the 4th handler was dropped, not a different 3)
-        self.assertNotIn(5, lines, "line 5 (4th forEach) must be dropped by cap")
+        # _CAP_EXCEEDED: 4 forEach(async) calls; all 4 lines must appear under file cap of 20.
+        self.assertEqual(len(lines), 4, f"expected 4 lines, got {lines}")
+        # Inversion: previously line 5 was dropped by the old per-symbol cap of 3.
+        self.assertIn(5, lines, "line 5 (4th forEach) must now be present under file cap")
 
-    def test_cap_is_combined_across_families(self) -> None:
-        # 2 async_callback_in_iteration + 2 unawaited_async_call in one symbol;
-        # total must be exactly 3, not 4 (which the old per-family cap would allow).
+    def test_all_four_signals_present_across_families(self) -> None:
+        # 2 async_callback_in_iteration + 2 unawaited_async_call = 4 total; file cap=20 → all 4 present.
         sf, _, _ = _build({"mixed.ts": _CAP_MIXED})
         signals = [
             s for s in _risk_signals(sf)
             if s["qualifier"]["qualname"] == "mixedWork"
         ]
         self.assertEqual(
-            len(signals), 3,
-            f"expected 3 combined (cross-family cap), got {len(signals)}: {signals}",
+            len(signals), 4,
+            f"expected 4 combined (file cap=20 allows all), got {len(signals)}: {signals}",
         )
-        # Inversion check: the old key `signal:qualname` would produce 4 (2+2).
-        # If this assertion passes with 3 it proves the cap is not per-family.
         families_present = {s["qualifier"]["risk_family"] for s in signals}
         self.assertGreater(len(families_present), 0, "no signals at all")
+
+    def test_file_level_cap_at_twenty(self) -> None:
+        # 21 forEach(async) calls in one file — file cap is 20, so exactly 20 emitted.
+        lines_code = "\n".join(
+            f"  ids.forEach(async (id) => {{ await fetch('/{i}/' + id); }});"
+            for i in range(21)
+        )
+        source = f"export async function bigRouter(ids: string[]): Promise<void> {{\n{lines_code}\n}}\n"
+        sf, _, _ = _build({"router.ts": source})
+        signals = [
+            s for s in _risk_signals(sf)
+            if s["qualifier"]["risk_family"] == "async_callback_in_iteration"
+        ]
+        self.assertEqual(len(signals), 20, f"expected 20 (file cap), got {len(signals)}")
+        lines_present = sorted(s["qualifier"]["line"] for s in signals)
+        self.assertEqual(len(lines_present), 20)
+        # Inversion: 21st forEach is on line 22; it must be absent.
+        self.assertNotIn(22, lines_present, "21st signal (line 22) must be dropped by file cap")
 
 
 @unittest.skipIf(not NODE_AVAILABLE, "node not available")
@@ -570,3 +585,29 @@ class ClassMethodSymbolKindTest(unittest.TestCase):
                     f"Enclosing class 'Saver' must have symbol_kind='class', got {actual_kind!r}",
                 )
             # If no signals for 'Saver' the adapter conservatively skipped it — also valid
+
+
+class RetrievalCapTest(unittest.TestCase):
+    """Unit tests for per-subject retrieval bound in _cap_risk_signals_per_subject."""
+
+    def test_changed_range_overlap_wins_retrieval_cap(self) -> None:
+        """4 signals for one subject; only the 4th (line 40) overlaps changed range → 4th survives."""
+        from source.kg.product.mcp_tools import _cap_risk_signals_per_subject
+        subject_id = "entity:test:subject1"
+        signals = [
+            {
+                "subject_id": subject_id,
+                "fact_id": f"fact:{i}",
+                "_evidence": [{"bytes_ref": {"path": "router.ts", "line_start": line, "line_end": line + 2}}],
+            }
+            for i, line in enumerate([10, 20, 30, 40])
+        ]
+        range_filters = {"router.ts": [(38, 42)]}
+        result = _cap_risk_signals_per_subject(signals, range_filters=range_filters, limit_per_subject=3)
+        self.assertEqual(len(result), 3, f"expected 3 (per-subject cap), got {len(result)}")
+        fact_ids = {s["fact_id"] for s in result}
+        # Priority: line40 (overlap) → (0, 40); line10 → (1, 10); line20 → (1, 20); line30 → (1, 30)
+        # Top 3: fact:3 (line40), fact:0 (line10), fact:1 (line20)
+        self.assertIn("fact:3", fact_ids, "changed-range overlapping signal (line40) must survive")
+        # Inversion: fact:2 (line30) is the one dropped
+        self.assertNotIn("fact:2", fact_ids, "lowest non-overlapping 3rd signal (line30) must be dropped")

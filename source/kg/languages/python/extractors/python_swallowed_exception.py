@@ -8,7 +8,7 @@ pure assignments with no calls) and whose exception type is broad
 If the handler body contains ANY call, raise, or import the signal is suppressed
 (conservatism binding).
 
-Per-symbol cap of 3 signals (lowest line first) is enforced before emitting.
+Per-file cap of 20 signals (lowest line first) is enforced before emitting.
 Coverage refusal rows are emitted for unparseable files.
 
 Reuse note:
@@ -40,7 +40,7 @@ _SOURCE_SYSTEM = "python_swallowed_exception_v0"
 _PREDICATE = "code_risk_signal"
 _RISK_FAMILY = "swallowed_exception"
 _BROAD_EXCEPTION_NAMES: frozenset[str] = frozenset({"Exception", "BaseException"})
-_PER_SYMBOL_CAP = 3
+_PER_FILE_CAP = 20
 
 
 # ---------------------------------------------------------------------------
@@ -388,41 +388,36 @@ def _extract_swallowed_exceptions(
 
         raw_signals = _collect_signals_from_file(repo, file_path, parsed.tree, tenant_id)
 
-        # Apply per-symbol cap (3, lowest line first) — group by enclosing entity_id
-        by_symbol: dict[str, list[_Signal]] = {}
-        for sig in raw_signals:
-            key = sig.enclosing_entity.entity_id
-            by_symbol.setdefault(key, []).append(sig)
-
-        for sym_signals in by_symbol.values():
-            sym_signals.sort(key=lambda s: s.line)
-            for sig in sym_signals[:_PER_SYMBOL_CAP]:
-                subject = sig.enclosing_entity
-                qualifier: dict[str, Any] = {
-                    "risk_family": _RISK_FAMILY,
-                    "exception_type": sig.exception_type,
-                    "detail": f"broad_except_vacuous_handler:{sig.exception_type}",
-                    "qualname": sig.enclosing_qualname,
-                    "line": sig.line,
-                }
-                fact = Fact(
-                    predicate=_PREDICATE,
-                    subject_id=subject.entity_id,
-                    object_id=subject.entity_id,
-                    qualifier=qualifier,
-                )
-                evidence = Evidence(
-                    target_type="fact",
-                    target_id=fact.fact_id,
-                    derivation_class="deterministic_static",
-                    source_system=_SOURCE_SYSTEM,
-                    source_ref={"extractor": _SOURCE_SYSTEM, "predicate": _PREDICATE},
-                    bytes_ref=_bytes_ref(repo, file_path, sig.line, sig.end_line),
-                    confidence=1.0,
-                )
-                result.entities.append(subject)
-                result.support_facts.append(fact)
-                result.evidence.append(evidence)
+        # Apply per-file cap (20, lowest line first); per-subject retrieval bound
+        # of 3 is enforced at query time in _review_context_risk_signals.
+        raw_signals.sort(key=lambda s: s.line)
+        for sig in raw_signals[:_PER_FILE_CAP]:
+            subject = sig.enclosing_entity
+            qualifier: dict[str, Any] = {
+                "risk_family": _RISK_FAMILY,
+                "exception_type": sig.exception_type,
+                "detail": f"broad_except_vacuous_handler:{sig.exception_type}",
+                "qualname": sig.enclosing_qualname,
+                "line": sig.line,
+            }
+            fact = Fact(
+                predicate=_PREDICATE,
+                subject_id=subject.entity_id,
+                object_id=subject.entity_id,
+                qualifier=qualifier,
+            )
+            evidence = Evidence(
+                target_type="fact",
+                target_id=fact.fact_id,
+                derivation_class="deterministic_static",
+                source_system=_SOURCE_SYSTEM,
+                source_ref={"extractor": _SOURCE_SYSTEM, "predicate": _PREDICATE},
+                bytes_ref=_bytes_ref(repo, file_path, sig.line, sig.end_line),
+                confidence=1.0,
+            )
+            result.entities.append(subject)
+            result.support_facts.append(fact)
+            result.evidence.append(evidence)
 
     return result
 

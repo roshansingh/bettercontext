@@ -3321,6 +3321,52 @@ def _review_context_diff_anchor_source_coordinates(diff_anchors: list[JsonObject
 _RISK_SIGNAL_PREDICATE = "code_risk_signal"
 
 
+def _cap_risk_signals_per_subject(
+    signals: list[JsonObject],
+    *,
+    range_filters: dict[str, list[tuple[int, int]]],
+    limit_per_subject: int,
+) -> list[JsonObject]:
+    """Keep at most limit_per_subject signals per enclosing subject_id.
+
+    Relevance order within each subject:
+      1. Evidence overlaps a changed range (overlap first).
+      2. Lowest evidence line (ascending).
+    """
+    def _signal_sort_key(sig: JsonObject) -> tuple[int, int]:
+        overlaps_range = 0
+        min_line = 999_999
+        for ev in (sig.get("_evidence") or []):
+            br = ev.get("bytes_ref") if isinstance(ev, dict) else None
+            if not isinstance(br, dict):
+                continue
+            ev_line_start = br.get("line_start")
+            ev_line_end = br.get("line_end")
+            if isinstance(ev_line_start, int) and isinstance(ev_line_end, int):
+                min_line = min(min_line, ev_line_start)
+                p = br.get("path")
+                if isinstance(p, str):
+                    p_norm = _planning_context_normalize_path(p)
+                    path_ranges = range_filters.get(p_norm, [])
+                    if path_ranges and any(
+                        ev_line_start <= rng_end and rng_start <= ev_line_end
+                        for rng_start, rng_end in path_ranges
+                    ):
+                        overlaps_range = 1
+        return (1 - overlaps_range, min_line)
+
+    by_subject: dict[str, list[JsonObject]] = {}
+    for sig in signals:
+        subj = sig.get("subject_id") or ""
+        by_subject.setdefault(subj, []).append(sig)
+
+    result: list[JsonObject] = []
+    for subj_sigs in by_subject.values():
+        subj_sigs.sort(key=_signal_sort_key)
+        result.extend(subj_sigs[:limit_per_subject])
+    return result
+
+
 def _review_context_risk_signals(
     kg: KgSnapshot,
     *,
@@ -3428,9 +3474,9 @@ def _review_context_risk_signals(
         enriched["_evidence"] = evidence_rows
         results.append(enriched)
 
-        if len(results) >= limit:
-            break
-
+    # Per-subject retrieval cap: keep at most 3 signals per enclosing subject,
+    # selected by relevance: changed-range overlap first, then lowest evidence line.
+    results = _cap_risk_signals_per_subject(results, range_filters=range_filters, limit_per_subject=3)
     return results
 
 

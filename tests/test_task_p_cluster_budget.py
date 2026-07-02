@@ -745,6 +745,107 @@ class TestTopLevelChangedSymbolsMirror(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Regression: tier-2 funded anchor repair (R1b)
+# ---------------------------------------------------------------------------
+
+class ClusterAnchorTier2FundingTest(unittest.TestCase):
+    """Regression: anchor repair must consume tier-2 victims when no swap donors exist.
+
+    Geometry: 8 clusters (one symbol each = no multi-row donors) plus bulky
+    claim_contract/scope_contract/changed_surface/surface_status sections that push
+    the packet over budget. After enforcement every cluster must have >= 1 anchor,
+    proving the tier-2 funding path in _repair_cluster_coverage.
+    """
+
+    def _make_packet(self) -> dict:
+        files = [f"src/router_{i}.ts" for i in range(8)]
+        changed_symbols = [
+            _make_changed_symbol(f"lead:cs:{i}", files[i], f"handler_{i}")
+            for i in range(8)
+        ]
+        bulky_item = {"key": "x" * 300, "value": "y" * 300, "meta": {"a": 1, "b": 2}}
+        changed_surface = {
+            "symbols": [dict(bulky_item, path=f) for f in files],
+            "files": [{"path": f, "size": 9999} for f in files],
+        }
+        surface_status = [dict(bulky_item, path=f) for f in files for _ in range(4)]
+        changed_file_symbols = [dict(bulky_item, path=f) for f in files for _ in range(4)]
+        claim_contract = {"fields": ["x" * 50] * 20}
+        scope_contract = {"repos": ["r" * 50] * 20}
+        answer_packet = {
+            "status": "ok",
+            "claim_contract": claim_contract,
+            "scope_contract": scope_contract,
+            "top_changed_symbols": [
+                _make_changed_symbol(f"lead:cs:{i}", files[i], f"handler_{i}")
+                for i in range(8)
+            ],
+        }
+        review_leads = {
+            "changed_symbols": list(changed_symbols),
+            "changed_files": list(files),
+        }
+        review_lead_status = {
+            "changed_symbol_count": 8,
+            "changed_anchor_count": 8,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+            "coverage_status": "ok",
+            "available": {
+                "changed_symbol_count": 8,
+                "direct_caller_count": 0,
+                "direct_callee_count": 0,
+                "transitive_caller_count": 0,
+                "source_coordinate_count": 0,
+            },
+        }
+        packet = {
+            "tool": "review_context",
+            "status": "ok",
+            "repo": "repo-a",
+            "summary": {"changed_symbol_count": 8},
+            "review_leads": review_leads,
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": answer_packet,
+            "changed_symbols": list(changed_symbols),
+            "changed_surface": changed_surface,
+            "surface_status": surface_status,
+            "changed_file_symbols": changed_file_symbols,
+            "claim_contract": claim_contract,
+            "scope_contract": scope_contract,
+            "output_budget": {"engine_version": "test"},
+        }
+        return add_review_lead_ids(packet)
+
+    def test_tier2_funding_restores_all_cluster_anchors(self) -> None:
+        from source.kg.product.output_budget import REVIEW_CONTEXT_MAX_CHARS
+        packet = self._make_packet()
+        self.assertGreater(
+            len(canonical_json(packet)), REVIEW_CONTEXT_MAX_CHARS,
+            "fixture must be over budget",
+        )
+        result = enforce_review_context_budget(packet)
+        self.assertLessEqual(
+            len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS,
+            "result must fit within budget",
+        )
+        rl = result.get("review_leads", {})
+        retained = rl.get("changed_symbols", [])
+        paths_with_anchor = {r["path"] for r in retained if isinstance(r, dict) and r.get("path")}
+        expected_paths = {f"src/router_{i}.ts" for i in range(8)}
+        self.assertEqual(
+            paths_with_anchor,
+            expected_paths,
+            f"missing anchors for: {expected_paths - paths_with_anchor}",
+        )
+        rls = result.get("review_lead_status", {})
+        returned = rls.get("returned", {})
+        self.assertGreaterEqual(returned.get("changed_symbol_count", 0), 1)
+
+
+# ---------------------------------------------------------------------------
 # Spec 7: Snapshot-derived edge counts used for re-interleave ranking
 # ---------------------------------------------------------------------------
 
