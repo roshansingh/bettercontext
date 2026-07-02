@@ -5309,10 +5309,8 @@ class McpToolsTest(unittest.TestCase):
     def test_review_context_stylesheet_low_coverage_emits_gap_hypothesis(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            from source.kg.core.store import JsonlKgStore
             JsonlKgStore(root).write(entities=[], facts=[], evidence=[], coverage=[], manifest={"version": 1})
-            from source.kg.query.snapshot import KgSnapshot as _KgSnapshot
-            kg = _KgSnapshot(root)
+            kg = KgSnapshot(root)
             result = call_tool(
                 kg,
                 "review_context",
@@ -5323,6 +5321,7 @@ class McpToolsTest(unittest.TestCase):
                 },
             )
         self.assertEqual(result["review_lead_status"]["coverage_status"], "low_coverage")
+        self.assertEqual(len(result["review_hypotheses"]), 1)
         self.assertEqual(result["review_hypotheses"][0]["risk_type"], "low_coverage_stylesheet_gap")
         self.assertIn("stylesheet", result["review_hypotheses"][0]["why"].lower())
 
