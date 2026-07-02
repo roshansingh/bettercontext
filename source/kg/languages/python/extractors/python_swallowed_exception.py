@@ -247,56 +247,94 @@ def _collect_signals_from_file(
     tree: ast.AST,
     tenant_id: str,
 ) -> list[_Signal]:
-    """Walk all except handlers in the file and return vacuous broad-exception ones."""
+    """Walk all except handlers in the file and return vacuous broad-exception ones.
+
+    Uses an explicit traversal that tracks the current function-def stack instead
+    of ast.walk(), so that handlers inside nested functions (or classes defined
+    inside a function) are NOT attributed to the outer collected symbol.
+
+    Conservatism binding: emit a signal ONLY when the handler's innermost enclosing
+    FunctionDef/AsyncFunctionDef IS one of the collected symbols.  Handlers inside
+    nested functions are skipped entirely (mirrors the TS detector's
+    skip-when-unmatched rule).
+
+    Limitation: class-in-function bodies are treated as opaque — any try/except
+    inside them is skipped, matching the conservative skip-when-nested rule.
+    """
     module_name = _module_name(repo, file_path)
     symbols = _collect_function_symbols(repo, file_path, module_name, tree, tenant_id)
+    # Build a fast lookup: (line, end_line) → _SymbolRef for O(1) membership test
+    collected_line_ranges: dict[tuple[int, int], _SymbolRef] = {
+        (s.line, s.end_line): s for s in symbols
+    }
 
     signals: list[_Signal] = []
-    # Walk the whole file for try/except nodes
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Try):
-            continue
-        for handler in node.handlers:
-            if not isinstance(handler, ast.ExceptHandler):
-                continue
-            is_broad, exc_type_label = _is_broad_handler(handler)
-            if not is_broad:
-                continue
-            if not _handler_body_is_vacuous(handler.body):
-                continue
-            # Find enclosing function/method
-            enclosing = _enclosing_symbol(handler, tree, symbols)
-            if enclosing is None:
-                continue
-            h_line = getattr(handler, "lineno", enclosing.line)
-            h_end = getattr(handler, "end_lineno", h_line)
-            signals.append(_Signal(
-                enclosing_entity=enclosing.entity,
-                enclosing_qualname=enclosing.qualname,
-                exception_type=exc_type_label,
-                line=h_line,
-                end_line=h_end,
-            ))
+
+    def _visit_body(body: list[ast.stmt], fn_stack: list[_SymbolRef | None]) -> None:
+        """Recursively visit statement list.
+
+        fn_stack: innermost-first list of enclosing FunctionDef/_SymbolRef entries.
+        None entries mark nested (non-collected) function layers.
+        """
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                if fn_stack:
+                    # Class defined inside a function — opaque, skip entirely
+                    # (conservative: no collected symbol corresponds to any code here)
+                    pass
+                else:
+                    # Top-level class: visit its methods as collected symbols
+                    _visit_body(node.body, fn_stack)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                sym_key = (getattr(node, "lineno", -1), getattr(node, "end_lineno", -1))
+                sym_ref = collected_line_ranges.get(sym_key)
+                # Push the symbol (or None if not collected / nested)
+                new_stack = [sym_ref] + fn_stack
+                _visit_body(node.body, new_stack)
+            elif isinstance(node, ast.Try):
+                for handler in node.handlers:
+                    if not isinstance(handler, ast.ExceptHandler):
+                        continue
+                    # Only attribute when innermost enclosing function IS collected
+                    if not fn_stack or fn_stack[0] is None:
+                        continue
+                    enclosing = fn_stack[0]
+                    is_broad, exc_type_label = _is_broad_handler(handler)
+                    if not is_broad:
+                        continue
+                    if not _handler_body_is_vacuous(handler.body):
+                        continue
+                    h_line = getattr(handler, "lineno", enclosing.line)
+                    h_end = getattr(handler, "end_lineno", h_line)
+                    signals.append(_Signal(
+                        enclosing_entity=enclosing.entity,
+                        enclosing_qualname=enclosing.qualname,
+                        exception_type=exc_type_label,
+                        line=h_line,
+                        end_line=h_end,
+                    ))
+                # Also walk the try body and else/final clauses for nested try blocks
+                _visit_body(node.body, fn_stack)
+                for handler in node.handlers:
+                    if isinstance(handler, ast.ExceptHandler):
+                        _visit_body(handler.body, fn_stack)
+                if node.orelse:
+                    _visit_body(node.orelse, fn_stack)
+                if node.finalbody:
+                    _visit_body(node.finalbody, fn_stack)
+            else:
+                # Visit sub-statements of any other compound node (for/while/if/with)
+                sub_stmts: list[ast.stmt] = []
+                for attr in ("body", "orelse", "finalbody"):
+                    val = getattr(node, attr, None)
+                    if isinstance(val, list):
+                        sub_stmts.extend(s for s in val if isinstance(s, ast.stmt))
+                if sub_stmts:
+                    _visit_body(sub_stmts, fn_stack)
+
+    if isinstance(tree, ast.Module):
+        _visit_body(tree.body, [])
     return signals
-
-
-def _enclosing_symbol(
-    handler: ast.ExceptHandler,
-    tree: ast.AST,
-    symbols: list[_SymbolRef],
-) -> _SymbolRef | None:
-    """Return the innermost function/method that contains the handler's line."""
-    handler_line = getattr(handler, "lineno", None)
-    if handler_line is None:
-        return None
-    # Find all symbols that contain handler_line, pick the one with largest line (innermost)
-    candidates = [
-        s for s in symbols
-        if s.line <= handler_line <= s.end_line
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda s: s.line)
 
 
 # ---------------------------------------------------------------------------

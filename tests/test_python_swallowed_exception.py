@@ -520,6 +520,81 @@ def outer():
             pass
 """
 
+# Bug-fix fixtures: nested-function misattribution (5dd9f1b / ast.walk regression)
+
+# Handler inside nested function → NO signal (previously attributed to outer)
+_NESTED_FN_HANDLER_ONLY = """\
+def outer():
+    def inner():
+        try:
+            go()
+        except Exception:
+            pass
+"""
+
+# Handler directly in outer alongside a nested function → still fires on outer
+_OUTER_AND_NESTED_FN = """\
+def outer():
+    try:
+        op()
+    except Exception:
+        pass
+    def inner():
+        try:
+            go()
+        except Exception:
+            pass
+"""
+
+# Handler inside a class-in-function → NO signal
+_CLASS_IN_FUNCTION_HANDLER = """\
+def outer():
+    class Inner:
+        def method(self):
+            try:
+                go()
+            except Exception:
+                pass
+"""
+
+
+class NestedFunctionMisattributionTest(unittest.TestCase):
+    """Regression: ast.walk caused handlers in nested fns to be attributed to outer.
+
+    After fix (explicit traversal with fn_stack): emit ONLY when handler's
+    innermost enclosing FunctionDef IS a collected symbol.
+    """
+
+    def test_nested_fn_handler_emits_no_signal(self) -> None:
+        """Handler inside inner() must NOT emit any signal (outer is not the enclosing fn)."""
+        sf, _, _ = _build({"worker.py": _NESTED_FN_HANDLER_ONLY})
+        signals = _swallowed_signals(sf)
+        self.assertEqual(
+            signals, [],
+            f"handler inside nested fn must not emit signal (would misattribute to outer): {signals}",
+        )
+
+    def test_outer_handler_fires_despite_nested_fn(self) -> None:
+        """Handler directly in outer() must still fire; handler in inner() must not."""
+        sf, _, _ = _build({"worker.py": _OUTER_AND_NESTED_FN})
+        signals = _swallowed_signals(sf)
+        outer_signals = [s for s in signals if s["qualifier"].get("qualname") == "outer"]
+        inner_signals = [s for s in signals if s["qualifier"].get("qualname") == "outer.inner"]
+        self.assertGreater(len(outer_signals), 0, "outer handler must still emit a signal")
+        self.assertEqual(inner_signals, [], f"inner handler must not emit signal: {inner_signals}")
+        # Inversion: only outer, not inner
+        all_qualnames = {s["qualifier"].get("qualname") for s in signals}
+        self.assertNotIn("outer.inner", all_qualnames, "outer.inner must never appear as signal subject")
+
+    def test_class_in_function_handler_emits_no_signal(self) -> None:
+        """Handler inside a class defined inside a function → no signal (opaque scope)."""
+        sf, _, _ = _build({"worker.py": _CLASS_IN_FUNCTION_HANDLER})
+        signals = _swallowed_signals(sf)
+        self.assertEqual(
+            signals, [],
+            f"handler inside class-in-function must not emit signal: {signals}",
+        )
+
 
 class NestedFunctionNotEmittedTest(unittest.TestCase):
     """Nested function symbols must not be emitted by the detector (mirrors main extractor).
