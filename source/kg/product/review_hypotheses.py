@@ -124,6 +124,7 @@ def review_hypotheses_for_context(
     effective_risk_signals = risk_signals or []
     h = _async_side_effect_lifecycle_drift(
         changed_symbols=changed_symbols,
+        changed_files=changed_files,
         direct_callers=direct_callers,
         direct_callees=direct_callees,
         risk_signals=effective_risk_signals,
@@ -133,6 +134,7 @@ def review_hypotheses_for_context(
         hypotheses.append(h)
     h = _swallowed_exception_state_drift(
         changed_symbols=changed_symbols,
+        changed_files=changed_files,
         direct_callers=direct_callers,
         direct_callees=direct_callees,
         risk_signals=effective_risk_signals,
@@ -830,6 +832,20 @@ def _changed_symbol_paths(changed_symbols: list[JsonObject]) -> set[str]:
     return paths
 
 
+def _changed_context_paths(changed_symbols: list[JsonObject], changed_files: list[str]) -> set[str]:
+    """Changed-symbol paths, falling back to changed files when no symbols resolved.
+
+    Signals reaching the families are already repo- and range-scoped by
+    _review_context_risk_signals, so the file fallback cannot widen scope; it
+    only lets in-range signals fire when symbol anchoring came up empty
+    (supporting_lead_ids stays empty there, so confidence stays weak).
+    """
+    paths = _changed_symbol_paths(changed_symbols)
+    if paths:
+        return paths
+    return {_normalize_path(f) for f in changed_files if isinstance(f, str) and f}
+
+
 def _signal_matches_changed_context(
     signal: JsonObject,
     changed_entity_ids: set[str],
@@ -965,14 +981,15 @@ def _why_from_signals(signals: list[JsonObject], family: str) -> str:
 def _async_side_effect_lifecycle_drift(
     *,
     changed_symbols: list[JsonObject],
+    changed_files: list[str],
     direct_callers: list[JsonObject],
     direct_callees: list[JsonObject],
     risk_signals: list[JsonObject],
     review_leads: JsonObject,
 ) -> JsonObject | None:
-    """Trigger: >=1 code_risk_signal with async-lifecycle family on changed symbols (by entity_id or path)."""
+    """Trigger: >=1 code_risk_signal with async-lifecycle family on changed symbols/files (entity_id or path)."""
     changed_entity_ids = _changed_symbol_entity_ids(changed_symbols)
-    changed_paths = _changed_symbol_paths(changed_symbols)
+    changed_paths = _changed_context_paths(changed_symbols, changed_files)
     matching = [
         sig for sig in risk_signals
         if sig.get("qualifier", {}).get("risk_family") in _ASYNC_LIFECYCLE_FAMILIES
@@ -1006,14 +1023,15 @@ def _async_side_effect_lifecycle_drift(
 def _swallowed_exception_state_drift(
     *,
     changed_symbols: list[JsonObject],
+    changed_files: list[str],
     direct_callers: list[JsonObject],
     direct_callees: list[JsonObject],
     risk_signals: list[JsonObject],
     review_leads: JsonObject,
 ) -> JsonObject | None:
-    """Trigger: >=1 code_risk_signal with swallowed_exception family on changed symbols (by entity_id or path)."""
+    """Trigger: >=1 code_risk_signal with swallowed_exception family on changed symbols/files (entity_id or path)."""
     changed_entity_ids = _changed_symbol_entity_ids(changed_symbols)
-    changed_paths = _changed_symbol_paths(changed_symbols)
+    changed_paths = _changed_context_paths(changed_symbols, changed_files)
     matching = [
         sig for sig in risk_signals
         if sig.get("qualifier", {}).get("risk_family") == "swallowed_exception"

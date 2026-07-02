@@ -146,6 +146,23 @@ class TestAsyncSideEffectLifecycleDrift(unittest.TestCase):
         risk_types = [h["risk_type"] for h in hypotheses]
         self.assertIn("async_side_effect_lifecycle_drift", risk_types)
 
+    def test_positive_changed_files_fallback_when_no_symbols(self):
+        # Signals reaching the families are already repo/range-scoped upstream;
+        # when symbol anchoring came up empty, changed_files is the fallback
+        # context so in-range signals can still fire (confidence stays weak —
+        # no supporting leads).
+        sig = _risk_signal("unawaited_async_call", "eid-unknown", path="./src/mutate.ts", callee="saveRow")
+        hypotheses = self._call(
+            changed_symbols=[],
+            changed_files=["src/mutate.ts"],
+            risk_signals=[sig],
+            review_leads={"changed_symbols": []},
+        )
+        h = next((h for h in hypotheses if h["risk_type"] == "async_side_effect_lifecycle_drift"), None)
+        self.assertIsNotNone(h, "file-fallback signal must fire the family when changed_symbols is empty")
+        self.assertEqual(h["confidence"], "weak")
+        self.assertEqual(h.get("supporting_lead_ids", []), [])
+
     def test_positive_confidence_medium_when_lead_and_direct_edge(self):
         sym = _sym("processItem", "src/proc.ts", entity_id="eid-3", lead_id="lead-3")
         sig = _risk_signal("async_callback_in_iteration", "eid-3", path="src/proc.ts")
