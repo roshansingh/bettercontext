@@ -3399,7 +3399,10 @@ function isInsidePromiseAll(callNode) {
   // Walk parent chain; cross array literals, arrow functions, and array-method
   // call expressions (map/flatMap) until we either find Promise.* or hit a hard
   // boundary (any other call expression, block, or function boundary).
-  let node = callNode.parent;
+  // Start from the effective parent (skip any wrapping ParenthesizedExpression nodes)
+  // so that ids.map(id => (processItem(id))) is treated like ids.map(id => processItem(id)).
+  const { child: _child, parent: startParent } = effectiveParentSkippingParens(callNode);
+  let node = startParent;
   while (node) {
     if (ts.isCallExpression(node)) {
       const expr = node.expression;
@@ -3467,28 +3470,29 @@ function collectAsyncLifecycleSignals(sourceFile, symbols) {
     }
 
     // Signal 2: unawaited call to same-file async fn
-    if (
-      ts.isCallExpression(node) &&
-      !isForEachCall(node) &&  // forEach handled above
-      !isAwaitedContext(node) &&
-      !isReturnedContext(node) &&
-      !isThenCatchChained(node) &&
-      !isAssignedContext(node) &&
-      !isInsidePromiseAll(node) &&
-      !(node.parent != null && ts.isVoidExpression(node.parent))  // void fn() is intentional discard
-    ) {
-      const name = callName(node.expression, sourceFile);
-      // Only the leaf name for same-file check (no dots = top-level call)
-      const leafName = name && !name.includes(".") ? name : null;
-      if (leafName && asyncNames.has(leafName)) {
-        const line = lineOf(sourceFile, node.getStart(sourceFile));
-        const qualname = enclosingSymbolName(node, symbols) ?? "<module>";
-        rawSignals.push({
-          signal: "unawaited_async_call",
-          qualname,
-          callee: leafName,
-          line,
-        });
+    if (ts.isCallExpression(node) && !isForEachCall(node)) {  // forEach handled above
+      const { parent: effectiveParent } = effectiveParentSkippingParens(node);
+      if (
+        !isAwaitedContext(node) &&
+        !isReturnedContext(node) &&
+        !isThenCatchChained(node) &&
+        !isAssignedContext(node) &&
+        !isInsidePromiseAll(node) &&
+        !(effectiveParent != null && ts.isVoidExpression(effectiveParent))  // void (fn()) is intentional discard
+      ) {
+        const name = callName(node.expression, sourceFile);
+        // Only the leaf name for same-file check (no dots = top-level call)
+        const leafName = name && !name.includes(".") ? name : null;
+        if (leafName && asyncNames.has(leafName)) {
+          const line = lineOf(sourceFile, node.getStart(sourceFile));
+          const qualname = enclosingSymbolName(node, symbols) ?? "<module>";
+          rawSignals.push({
+            signal: "unawaited_async_call",
+            qualname,
+            callee: leafName,
+            line,
+          });
+        }
       }
     }
 

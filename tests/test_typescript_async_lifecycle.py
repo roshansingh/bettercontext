@@ -80,6 +80,18 @@ export async function processAll(ids: string[]): Promise<void> {
 }
 """
 
+# Negative: Promise.all with parenthesized arrow body — must NOT fire
+# ids.map(id => (processItem(id))) — the paren wraps the call inside the arrow
+_PROMISE_ALL_PAREN_ARROW = """\
+async function processItem(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export async function processAll(ids: string[]): Promise<void> {
+  await Promise.all(ids.map((id) => (processItem(id))));
+}
+"""
+
 # Negative: call to imported (cross-file) async fn — no signal
 _CROSS_FILE_CALL = """\
 import { saveRecord } from './storage';
@@ -122,6 +134,17 @@ async function save(id: string): Promise<void> {
 
 export function triggerSave(id: string): void {
   void save(id);
+}
+"""
+
+# Negative: void with parenthesized call — void (save(id)) — must NOT fire
+_VOID_DISCARD_PAREN = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export function triggerSave(id: string): void {
+  void (saveRecord(id));
 }
 """
 
@@ -330,6 +353,18 @@ class UnawaitedAsyncCallTest(unittest.TestCase):
         sf, _, _ = _build({"discard.ts": _VOID_DISCARD})
         signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
         self.assertEqual(signals, [], f"void discard must not emit unawaited_async_call: {signals}")
+
+    def test_void_discard_paren_emits_no_signal(self) -> None:
+        # void (saveRecord(id)) — paren-wrapped void discard — must not fire
+        sf, _, _ = _build({"discard.ts": _VOID_DISCARD_PAREN})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertEqual(signals, [], f"void (f()) must not emit unawaited_async_call: {signals}")
+
+    def test_promise_all_paren_arrow_emits_no_signal(self) -> None:
+        # await Promise.all(ids.map(id => (processItem(id)))) — paren in arrow body — must not fire
+        sf, _, _ = _build({"saver.ts": _PROMISE_ALL_PAREN_ARROW})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertEqual(signals, [], f"Promise.all with paren arrow must not emit unawaited_async_call: {signals}")
 
 
 @unittest.skipIf(not NODE_AVAILABLE, "node not available")
