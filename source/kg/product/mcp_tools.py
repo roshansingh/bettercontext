@@ -3838,7 +3838,12 @@ def _planning_context_value_matches(anchor: str, *candidates: object) -> bool:
 
 
 def _planning_context_normalize_path(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./")
+    # Strip only literal "./" prefixes; lstrip("./") is a char-class strip that
+    # would corrupt "../x" and "/abs/x".
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
 
 
 def _changed_ranges_by_path(changed_ranges: list[JsonObject]) -> dict[str, list[tuple[int, int]]]:

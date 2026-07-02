@@ -5,8 +5,11 @@ from source.kg.product.review_attribution import hypothesis_stable_id
 
 
 def _normalize_path(path: str) -> str:
-	"""Normalize path for comparison: backslash→forward slash, strip "./" prefix."""
-	return path.replace("\\", "/").lstrip("./")
+    """Normalize path for comparison: backslash to forward slash, strip literal "./" prefixes."""
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
 
 
 _TEST_PATH_SEGMENTS = frozenset({"test", "tests", "spec", "specs", "__tests__"})
