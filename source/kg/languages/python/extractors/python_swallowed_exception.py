@@ -119,7 +119,13 @@ def _collect_function_symbols(
     tree: ast.AST,
     tenant_id: str,
 ) -> list[_SymbolRef]:
-    """Collect top-level and class-nested functions/methods only."""
+    """Collect top-level and class-nested functions/methods only.
+
+    Mirrors PythonAstExtractor._collect_symbols (ast_extractor.py:578-593):
+    recurses into ClassDef bodies but NOT into FunctionDef bodies, so nested
+    functions (outer.inner) are never emitted.  entity_ids produced here must
+    align with those from the main extractor for subject-id matching to work.
+    """
     symbols: list[_SymbolRef] = []
 
     def visit(body: list[ast.stmt], prefix: str = "") -> None:
@@ -150,8 +156,8 @@ def _collect_function_symbols(
                     properties={"path": str(file_path.relative_to(repo.root)), "line": line},
                 )
                 symbols.append(_SymbolRef(entity, qualname, kind, line, end_line))
-                # recurse into function body to pick up nested functions
-                visit(node.body, qualname)
+                # Do NOT recurse into function bodies: the main extractor does
+                # not emit nested-function symbols, so we must not either.
 
     if isinstance(tree, ast.Module):
         visit(tree.body)

@@ -3392,11 +3392,14 @@ def _review_context_risk_signals(
                 if not _review_context_repo_matches(ev_repo, repo):
                     continue
                 p = br.get("path")
-                if not (isinstance(p, str) and p in normalized_changed_files):
+                if not isinstance(p, str):
+                    continue
+                p_norm = _planning_context_normalize_path(p)
+                if p_norm not in normalized_changed_files:
                     continue
                 # Range scope: when ranges are supplied for this path, the
                 # evidence line interval must overlap at least one range.
-                path_ranges = range_filters.get(p, [])
+                path_ranges = range_filters.get(p_norm, [])
                 if path_ranges:
                     line_start = br.get("line_start")
                     line_end = br.get("line_end")

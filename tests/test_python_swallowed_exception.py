@@ -509,3 +509,60 @@ class AsyncMethodKindTest(unittest.TestCase):
             async_fn_entities, [],
             f"no entity for Worker.run should have symbol_kind='async_function': {async_fn_entities}",
         )
+
+
+_NESTED_FUNCTION_SWALLOWED = """\
+def outer():
+    def inner():
+        try:
+            go()
+        except Exception:
+            pass
+"""
+
+
+class NestedFunctionNotEmittedTest(unittest.TestCase):
+    """Nested function symbols must not be emitted by the detector (mirrors main extractor).
+
+    ast_extractor.py:578-590 does not recurse into FunctionDef bodies, so
+    outer.inner is never emitted by the main extractor.  The detector must
+    mirror this: entity_ids produced by _collect_function_symbols must align
+    with those in entities.jsonl, and no signal subject may reference a
+    qualname that the main extractor never wrote.
+    """
+
+    def test_nested_function_not_in_main_extractor_entities(self) -> None:
+        """Main extractor must not emit a CodeSymbol for outer.inner."""
+        sf, _, _ = _build({"worker.py": _NESTED_FUNCTION_SWALLOWED})
+        # _build returns support_facts; we also need entities from the same run.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pkg = root / "pkg"
+            pkg.mkdir()
+            (pkg / "pyproject.toml").write_text(
+                "[project]\nname = \"test-pkg\"\nversion = \"0.1.0\"\n",
+                encoding="utf-8",
+            )
+            (pkg / "worker.py").write_text(_NESTED_FUNCTION_SWALLOWED, encoding="utf-8")
+            out = root / "kg"
+            build_kg(pkg, out)
+            entities_all = read_jsonl(out / "entities.jsonl")
+            support_facts = read_jsonl(out / "support_facts.jsonl") if (out / "support_facts.jsonl").exists() else []
+
+        nested_entities = [
+            e for e in entities_all
+            if e.get("identity", {}).get("qualname") == "outer.inner"
+        ]
+        self.assertEqual(
+            nested_entities, [],
+            f"main extractor must not emit outer.inner (ast_extractor.py:578-590); got: {nested_entities}",
+        )
+
+        # No signal subject should reference outer.inner.
+        by_id = {e["entity_id"]: e for e in entities_all}
+        for sig in _swallowed_signals(support_facts):
+            subject = by_id.get(sig.get("subject_id", ""), {})
+            self.assertNotEqual(
+                subject.get("identity", {}).get("qualname"), "outer.inner",
+                f"signal subject must not be outer.inner (detector diverged from main extractor): {sig}",
+            )

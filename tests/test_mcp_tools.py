@@ -4,6 +4,7 @@ import contextlib
 from copy import deepcopy
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -7419,19 +7420,20 @@ class TestOptionalReviewSurfacesTolerantDedupe(unittest.TestCase):
 
 
 def _minimal_risk_kg(
+    test_case: unittest.TestCase,
     *,
     repo: str,
     signal_repo: str,
     signal_path: str,
     signal_line_start: int,
     signal_line_end: int,
-    subject_entity_id: str | None = None,
 ) -> KgSnapshot:
     """Build a minimal KgSnapshot with one code_risk_signal support fact + evidence."""
     import tempfile
     from source.kg.core.models import Entity, Fact, Evidence, Coverage
 
     tmpdir = tempfile.mkdtemp()
+    test_case.addCleanup(shutil.rmtree, tmpdir, True)
     root = Path(tmpdir)
     subject = Entity(
         kind="CodeSymbol",
@@ -7444,14 +7446,6 @@ def _minimal_risk_kg(
         },
         properties={"path": signal_path, "line": signal_line_start},
     )
-    if subject_entity_id is not None:
-        # Override entity_id by writing raw JSONL directly (used for subject-match test).
-        import json
-        record = subject.to_record()
-        record = dict(record)
-        # We'll use the real entity_id from the Entity; caller passes it to tell us
-        # what ID to put in changed_symbols.
-        pass
     signal_fact = Fact(
         predicate="code_risk_signal",
         subject_id=subject.entity_id,
@@ -7493,6 +7487,7 @@ class ReviewContextRiskSignalScopeTest(unittest.TestCase):
     def test_same_path_different_repo_signal_excluded(self) -> None:
         """Signal from another repo with same path must be excluded (no subject match)."""
         kg = _minimal_risk_kg(
+            self,
             repo="repo-a",
             signal_repo="repo-b",
             signal_path="pkg/worker.py",
@@ -7512,6 +7507,7 @@ class ReviewContextRiskSignalScopeTest(unittest.TestCase):
     def test_same_file_out_of_range_signal_excluded_when_ranges_supplied(self) -> None:
         """Signal on lines 50-60 must be excluded when changed_ranges cover only lines 1-10."""
         kg = _minimal_risk_kg(
+            self,
             repo="repo-a",
             signal_repo="repo-a",
             signal_path="pkg/worker.py",
@@ -7540,6 +7536,7 @@ class ReviewContextRiskSignalScopeTest(unittest.TestCase):
     def test_subject_matched_signal_included_regardless_of_ranges(self) -> None:
         """Signal whose subject_id matches a changed symbol is included even if out of range."""
         kg = _minimal_risk_kg(
+            self,
             repo="repo-a",
             signal_repo="repo-a",
             signal_path="pkg/worker.py",
@@ -7562,6 +7559,7 @@ class ReviewContextRiskSignalScopeTest(unittest.TestCase):
     def test_in_range_signal_included(self) -> None:
         """Signal overlapping the supplied range is included."""
         kg = _minimal_risk_kg(
+            self,
             repo="repo-a",
             signal_repo="repo-a",
             signal_path="pkg/worker.py",
@@ -7576,6 +7574,25 @@ class ReviewContextRiskSignalScopeTest(unittest.TestCase):
             range_filters={"pkg/worker.py": [(1, 10)]},
         )
         self.assertEqual(len(results), 1, f"in-range signal must be included: {results}")
+
+    def test_dotslash_evidence_path_normalizes_to_match(self) -> None:
+        """bytes_ref.path with a leading './' must still match a normalized changed_files entry."""
+        kg = _minimal_risk_kg(
+            self,
+            repo="repo-a",
+            signal_repo="repo-a",
+            signal_path="./pkg/worker.py",
+            signal_line_start=5,
+            signal_line_end=8,
+        )
+        results = _review_context_risk_signals(
+            kg,
+            repo="repo-a",
+            changed_symbols=[],
+            changed_files=["pkg/worker.py"],
+            range_filters={"pkg/worker.py": [(1, 10)]},
+        )
+        self.assertEqual(len(results), 1, f"dotslash evidence path must be normalized and matched: {results}")
 
 
 if __name__ == "__main__":
