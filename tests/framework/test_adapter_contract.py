@@ -15,7 +15,7 @@ from source.kg.languages import language_adapters
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "adapters"
-EXCLUDED_FROM_SPLIT_FIXTURE_CONTRACT = {"static-config", "python-ast", "typescript-compiler-api", "typescript-async-lifecycle"}
+EXCLUDED_FROM_SPLIT_FIXTURE_CONTRACT = {"static-config", "python-ast", "typescript-compiler-api", "typescript-async-lifecycle", "python-swallowed-exception"}
 RESERVED_FIXTURE_NAMES = {"expected.json", "expected_coverage.json"}
 
 

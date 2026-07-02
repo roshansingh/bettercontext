@@ -15,6 +15,7 @@ from source.kg.languages.python.consumer_manifest import PythonConsumerManifestE
 from source.kg.languages.types import ConsumerManifestExtractor, PackageResolver
 from source.kg.languages.python.extractors.extractor_adapter import PYTHON_AST_ADAPTER
 from source.kg.languages.python.extractors.python_boto3_transport import PYTHON_BOTO3_TRANSPORT_ADAPTER
+from source.kg.languages.python.extractors.python_swallowed_exception import PYTHON_SWALLOWED_EXCEPTION_ADAPTER
 from source.kg.languages.python.files import LANGUAGE_FILES, PythonLanguageFiles
 from source.kg.languages.python.opportunities import HttpClientOpportunityDetector
 from source.kg.languages.python.package_resolver import PythonPackageResolver
@@ -65,7 +66,7 @@ class PythonLanguageSupport:
         return {}
 
     def adapters(self) -> tuple[Adapter, ...]:
-        return (PYTHON_AST_ADAPTER, PYTHON_BOTO3_TRANSPORT_ADAPTER)
+        return (PYTHON_AST_ADAPTER, PYTHON_BOTO3_TRANSPORT_ADAPTER, PYTHON_SWALLOWED_EXCEPTION_ADAPTER)
 
     def known_stacks(self) -> dict[str, dict[str, str]]:
         return {"python": dict(_known_stack_imports())}

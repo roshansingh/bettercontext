@@ -23,7 +23,7 @@ class PythonTypeScriptWrapperTest(unittest.TestCase):
 
         self.assertEqual(
             [adapter.capability.name for adapter in PYTHON_SUPPORT.adapters()],
-            ["python-ast", "python-boto3-transport"],
+            ["python-ast", "python-boto3-transport", "python-swallowed-exception"],
         )
         self.assertEqual(PYTHON_SUPPORT.source_roots(_repo_snapshot(), ctx), {"python": {"flask"}})
         self.assertEqual(PYTHON_SUPPORT.parse_repo(_repo_snapshot(), ctx), {})
