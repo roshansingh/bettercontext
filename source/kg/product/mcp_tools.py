@@ -2166,13 +2166,15 @@ def _optional_review_surfaces_tolerant(
     """review_context call site: known surfaces + unknown tokens (verbatim, no error)."""
     surfaces: list[str] = []
     unknown: list[str] = []
+    seen_unknown: set[str] = set()
     for value in _optional_string_list(arguments, field):
         normalized_value = value.strip().lower().replace("-", "_").replace(" ", "_")
         if normalized_value in REVIEW_CONTEXT_BUILTIN_SECTION_ALIASES:
             continue
         canonical = REVIEW_CONTEXT_SURFACE_ALIASES.get(normalized_value)
         if canonical is None:
-            if normalized_value not in {tok.strip().lower().replace("-", "_").replace(" ", "_") for tok in unknown}:
+            if normalized_value not in seen_unknown:
+                seen_unknown.add(normalized_value)
                 unknown.append(value)
             continue
         if canonical not in surfaces:
