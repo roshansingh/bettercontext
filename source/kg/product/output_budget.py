@@ -513,15 +513,15 @@ def enforce_review_context_budget(
                 max_chars=max_chars,
                 truncated_sections=truncated_sections,
             )
-            _attach_review_hypothesis_status(backfilled, original_hypotheses)
+            _finalize_review_hypothesis_budget(backfilled, original_hypotheses, max_chars=max_chars)
             return backfilled
     # Even the tightest pass overshot (rare: dominated by non-row content); signal it like
     # the planning path by shrinking the largest low-signal row lists before degrading to a
     # lead-only packet.
     compact = _review_signal_hard_cap(compact, max_chars=max_chars)
-    compact = _protect_review_hypotheses_floor(compact, original_hypotheses)
+    compact = _protect_review_hypotheses_floor(compact, original_hypotheses, max_chars=max_chars)
     if len(canonical_json(compact)) <= max_chars:
-        _attach_review_hypothesis_status(compact, original_hypotheses)
+        _finalize_review_hypothesis_budget(compact, original_hypotheses, max_chars=max_chars)
         return compact
     compact = _review_lead_only_budget_packet(
         compact,
@@ -530,9 +530,9 @@ def enforce_review_context_budget(
         truncated_sections=truncated_sections,
         original_hypotheses=original_hypotheses,
     )
+    _finalize_review_hypothesis_budget(compact, original_hypotheses, max_chars=max_chars)
     if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
         compact["output_budget"]["exceeded_after_minimization"] = True
-    _attach_review_hypothesis_status(compact, original_hypotheses)
     return compact
 
 
@@ -818,7 +818,7 @@ def _review_lead_only_budget_packet(
         lead_only["output_budget"]["lead_only"] = True
     if _current_chars(lead_only) > max_chars:
         lead_only = _review_signal_hard_cap(lead_only, max_chars=max_chars)
-        lead_only = _protect_review_hypotheses_floor(lead_only, original_hypotheses or [])
+        lead_only = _protect_review_hypotheses_floor(lead_only, original_hypotheses or [], max_chars=max_chars)
         if isinstance(lead_only.get("output_budget"), dict):
             lead_only["output_budget"]["lead_only"] = True
     return lead_only
@@ -2777,13 +2777,16 @@ def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
     return compact
 
 
-def _protect_review_hypotheses_floor(result: JsonObject, original_hypotheses: list[JsonObject]) -> JsonObject:
+def _protect_review_hypotheses_floor(
+    result: JsonObject, original_hypotheses: list[JsonObject], *, max_chars: int
+) -> JsonObject:
     """Ensure at least 1 compacted hypothesis survives when any were originally generated.
 
     Called after hard-cap or signal-cap passes that may have evicted all hypotheses while
     keeping broad context rows. If the packet has no hypotheses but the original had some,
-    inserts the top compacted hypothesis and, if needed, drops the smallest non-protected
-    list row to keep the packet under budget.
+    inserts the top compacted hypothesis and, when the insertion pushes the packet over
+    ``max_chars``, evicts rows from the largest other row list until it fits again — broad
+    context is dropped before the last hypothesis, per the review budget priority order.
     """
     if not original_hypotheses:
         return result
@@ -2794,6 +2797,7 @@ def _protect_review_hypotheses_floor(result: JsonObject, original_hypotheses: li
     top_compact = _compact_review_hypothesis(original_hypotheses[0])
     result = deepcopy(result)
     result["review_hypotheses"] = [top_compact]
+    truncated: set[str] = set()
     budget = result.get("output_budget")
     if isinstance(budget, dict):
         truncated = set(budget.get("truncated_sections") or [])
@@ -2801,8 +2805,34 @@ def _protect_review_hypotheses_floor(result: JsonObject, original_hypotheses: li
             truncated.add("review_hypotheses")
         else:
             truncated.discard("review_hypotheses")
+    # Compensating eviction: the restored hypothesis must never push the packet over the cap.
+    truncated |= _evict_review_rows_to_fit(result, max_chars=max_chars)
+    if isinstance(budget, dict):
         budget["truncated_sections"] = sorted(truncated)
     return result
+
+
+def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]:
+    """Evict rows from the largest non-hypothesis row list until the packet fits.
+
+    The top-level ``review_hypotheses`` list is protected: broad context rows are dropped
+    before the last hypothesis, per the review budget priority order. Mutates ``result``
+    in place and returns the labels of lists that lost rows.
+    """
+    evicted: set[str] = set()
+    guard = 0
+    while _current_chars(result) > max_chars and guard < 5_000:
+        guard += 1
+        protected = result.pop("review_hypotheses", None)
+        target = _largest_row_list(result)
+        if protected is not None:
+            result["review_hypotheses"] = protected
+        if target is None:
+            break
+        label, rows = target
+        rows.pop()
+        evicted.add(label)
+    return evicted
 
 
 def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: list[JsonObject]) -> None:
@@ -2823,6 +2853,27 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
     }
     if returned == 0:
         result["review_hypothesis_status"]["reason"] = "omitted_due_to_budget"
+
+
+def _finalize_review_hypothesis_budget(
+    result: JsonObject, original_hypotheses: list[JsonObject], *, max_chars: int
+) -> None:
+    """Attach review_hypothesis_status and keep the packet under the cap.
+
+    The status metadata is added after the budget passes measured the packet, so its extra
+    chars must be paid for by evicting broad rows — never by exceeding the cap and never by
+    dropping the protected hypotheses. Mutates ``result`` in place.
+    """
+    _attach_review_hypothesis_status(result, original_hypotheses)
+    # The truncated_sections bookkeeping itself costs chars, so iterate until stable.
+    for _ in range(5):
+        evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
+        if not evicted:
+            return
+        _sync_review_lead_status_from_packet(result)
+        budget = result.get("output_budget")
+        if isinstance(budget, dict):
+            budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
 
 
 def _compact_diff_anchor(value: object) -> JsonObject:
