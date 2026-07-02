@@ -130,12 +130,12 @@ def _collect_function_symbols(
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qualname = f"{prefix}.{node.name}" if prefix else node.name
                 kind: str
-                if isinstance(node, ast.AsyncFunctionDef):
-                    kind = "async_function"
-                elif prefix:
+                # Mirror PythonAstExtractor._collect_symbols precedence
+                # (ast_extractor.py:584-589): set async_function/function first,
+                # then override to "method" when inside a class (prefix set).
+                kind = "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function"
+                if prefix:
                     kind = "method"
-                else:
-                    kind = "function"
                 line = getattr(node, "lineno", 1)
                 end_line = getattr(node, "end_lineno", line)
                 entity = Entity(
@@ -207,9 +207,13 @@ def _handler_body_is_vacuous(body: list[ast.stmt]) -> bool:
             # return with non-constant expression → could be a call
             return False
         if isinstance(stmt, ast.Assign):
-            # Only allow assignments to simple names with constant right-hand sides
-            # or None. Any call on the right-hand side disqualifies.
-            if _expr_contains_call(stmt.value):
+            # Vacuous only if ALL targets are simple names AND the RHS is a
+            # constant (ast.Constant, which covers None, True, False, literals).
+            # Attribute targets (self.x), subscript targets (d[k]), or any
+            # non-constant RHS indicate state-changing assignments → not vacuous.
+            if not all(isinstance(t, ast.Name) for t in stmt.targets):
+                return False
+            if not isinstance(stmt.value, ast.Constant):
                 return False
             continue
         # Any raise, import, expr, augassign, annassign, for, while, with, if,

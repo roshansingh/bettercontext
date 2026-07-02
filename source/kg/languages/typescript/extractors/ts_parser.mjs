@@ -3352,13 +3352,23 @@ function isThenCatchChained(callNode) {
 }
 
 function isAssignedContext(callNode) {
-  // True if the call appears on the RHS of a variable declaration or assignment.
+  // True if the call appears on the RHS of a variable declaration or an
+  // assignment expression (simple `=` or compound `+=`, `-=`, etc.).
+  // ts.isBinaryExpression also covers comparisons (===, !==), logical (||, &&),
+  // and arithmetic (+, -, *) — restrict to assignment operators only so that
+  // `ready === saveRecord(id)` and `flag || saveRecord(id)` still emit signals.
+  // ASSIGNMENT_OPERATORS covers SyntaxKind.EqualsToken through the full
+  // compound-assignment range (FirstAssignment..LastAssignment).
   const parent = callNode.parent;
   if (!parent) return false;
   // `const x = callNode` or `let x = callNode`
   if (ts.isVariableDeclaration(parent) && parent.initializer === callNode) return true;
-  // `x = callNode`
-  if (ts.isBinaryExpression(parent) && parent.right === callNode) return true;
+  // `x = callNode`, `x += callNode`, etc. — assignment operators only
+  if (
+    ts.isBinaryExpression(parent) &&
+    parent.right === callNode &&
+    ASSIGNMENT_OPERATORS.has(parent.operatorToken.kind)
+  ) return true;
   return false;
 }
 

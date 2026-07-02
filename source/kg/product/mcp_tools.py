@@ -2803,7 +2803,12 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         limit=detail_limit,
     )
     risk_signals = _review_context_risk_signals(
-        kg, changed_symbols=changed_symbols, changed_files=changed_files, limit=12
+        kg,
+        repo=repo,
+        changed_symbols=changed_symbols,
+        changed_files=changed_files,
+        range_filters=range_filters,
+        limit=12,
     )
     endpoint_rows = runtime_surfaces["endpoints"]
     endpoint_consumer_rows = runtime_surfaces["endpoint_consumers"]
@@ -3317,8 +3322,10 @@ _RISK_SIGNAL_PREDICATE = "code_risk_signal"
 def _review_context_risk_signals(
     kg: KgSnapshot,
     *,
+    repo: str,
     changed_symbols: list[JsonObject],
     changed_files: list[str],
+    range_filters: dict[str, list[tuple[int, int]]],
     limit: int = 12,
 ) -> list[JsonObject]:
     """Retrieve code_risk_signal support facts for changed symbols and files.
@@ -3327,9 +3334,16 @@ def _review_context_risk_signals(
     containing the evidence rows that carry ``bytes_ref`` coordinates (so the
     hypothesis builder can extract paths without a separate KG lookup).
 
-    Matching logic:
-      1. subject_id matches the entity_id of any changed-symbol row.
-      2. evidence bytes_ref.path matches a normalized changed file path.
+    Scoping rules:
+      1. subject_id directly matches the entity_id of a changed-symbol row
+         (matched_by_subject) → included regardless of range filters.
+      2. evidence bytes_ref.repo must equal *repo* (case-insensitive suffix
+         match, same logic as _review_context_repo_matches).
+      3. evidence bytes_ref.path must match a normalized changed file path.
+      4. When range_filters contains ranges for that path, at least one
+         evidence line (line_start..line_end) must overlap a supplied range.
+         If range_filters is empty or has no entry for this path, the path
+         match alone is sufficient (no range filter applied).
     """
     # Index changed context.
     changed_entity_ids: set[str] = set()
@@ -3355,7 +3369,7 @@ def _review_context_risk_signals(
             continue
 
         subject_id = fact.get("subject_id")
-        matched = isinstance(subject_id, str) and subject_id in changed_entity_ids
+        matched_by_subject = isinstance(subject_id, str) and subject_id in changed_entity_ids
 
         # Attach evidence rows for coordinate extraction.
         evidence_rows: list[JsonObject] = []
@@ -3363,15 +3377,39 @@ def _review_context_risk_signals(
             for ev in kg.evidence_by_target.get(fact_id, []):
                 evidence_rows.append(ev)
 
+        matched = matched_by_subject
         if not matched:
-            # Try evidence path matching.
+            # Try evidence path matching, scoped to the effective repo and
+            # changed ranges when supplied.
             for ev in evidence_rows:
                 br = ev.get("bytes_ref")
-                if isinstance(br, dict):
-                    p = br.get("path")
-                    if isinstance(p, str) and p in normalized_changed_files:
-                        matched = True
-                        break
+                if not isinstance(br, dict):
+                    continue
+                # Repo scope: evidence must belong to the effective repo.
+                ev_repo = br.get("repo")
+                if not isinstance(ev_repo, str):
+                    continue
+                if not _review_context_repo_matches(ev_repo, repo):
+                    continue
+                p = br.get("path")
+                if not (isinstance(p, str) and p in normalized_changed_files):
+                    continue
+                # Range scope: when ranges are supplied for this path, the
+                # evidence line interval must overlap at least one range.
+                path_ranges = range_filters.get(p, [])
+                if path_ranges:
+                    line_start = br.get("line_start")
+                    line_end = br.get("line_end")
+                    if not (isinstance(line_start, int) and isinstance(line_end, int)):
+                        continue
+                    overlaps = any(
+                        line_start <= rng_end and rng_start <= line_end
+                        for rng_start, rng_end in path_ranges
+                    )
+                    if not overlaps:
+                        continue
+                matched = True
+                break
 
         if not matched:
             continue

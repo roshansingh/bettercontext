@@ -126,6 +126,56 @@ def process(item):
         log_error(result)
 """
 
+# Negative: attribute assignment (self.flag = True) — state-changing, must NOT fire
+_HANDLER_SELF_ATTR_ASSIGN = """\
+class Processor:
+    def process(self, item):
+        try:
+            handle(item)
+        except Exception:
+            self.flag = True
+"""
+
+# Negative: subscript assignment (state["failed"] = True) — state-changing, must NOT fire
+_HANDLER_SUBSCRIPT_ASSIGN = """\
+def process(item, state):
+    try:
+        handle(item)
+    except Exception:
+        state["failed"] = True
+"""
+
+# Negative: non-constant RHS (result = other_name) — references variable, must NOT fire
+_HANDLER_NAME_RHS_ASSIGN = """\
+DEFAULT = "fallback"
+
+def process(item):
+    try:
+        handle(item)
+    except Exception:
+        result = DEFAULT
+"""
+
+# Positive: simple name with constant RHS (ok = True) — still vacuous, must fire
+_HANDLER_SIMPLE_NAME_CONST = """\
+def process(item):
+    try:
+        handle(item)
+    except Exception:
+        ok = True
+"""
+
+# Positive: async method with swallowed exception — must fire with subject entity_id
+# matching the main extractor's "method" kind (class-nested, not async_function).
+_ASYNC_METHOD_SWALLOWED = """\
+class Worker:
+    async def run(self, task):
+        try:
+            await task.execute()
+        except Exception:
+            pass
+"""
+
 # Positive: except (Exception, BaseException): pass → all elements broad → fires as tuple_broad
 _TUPLE_BROAD_PASS = """\
 def store_item(item):
@@ -367,3 +417,95 @@ class DeterminismTest(unittest.TestCase):
             }
             self.assertGreater(len(sf1), 0, "no swallowed_exception signals in first build")
             self.assertEqual(sf1, sf2, "fact_ids differ between two builds")
+
+
+class VacuousAssignmentNegativeTest(unittest.TestCase):
+    """P2: state-changing assignments must not be treated as vacuous."""
+
+    def test_self_attr_assign_emits_no_signal(self) -> None:
+        sf, _, _ = _build({"worker.py": _HANDLER_SELF_ATTR_ASSIGN})
+        signals = _swallowed_signals(sf)
+        self.assertEqual(
+            signals, [],
+            f"self.flag = True is a state-changing assignment; must not emit signal: {signals}",
+        )
+
+    def test_subscript_assign_emits_no_signal(self) -> None:
+        sf, _, _ = _build({"worker.py": _HANDLER_SUBSCRIPT_ASSIGN})
+        signals = _swallowed_signals(sf)
+        self.assertEqual(
+            signals, [],
+            f'state["failed"] = True is a state-changing assignment; must not emit signal: {signals}',
+        )
+
+    def test_name_rhs_variable_assign_emits_no_signal(self) -> None:
+        sf, _, _ = _build({"worker.py": _HANDLER_NAME_RHS_ASSIGN})
+        signals = _swallowed_signals(sf)
+        self.assertEqual(
+            signals, [],
+            f"result = other_name (non-constant RHS) must not emit signal: {signals}",
+        )
+
+    def test_simple_name_constant_rhs_still_emits_signal(self) -> None:
+        """Inversion: Name target + Constant RHS is genuinely vacuous → must still fire."""
+        sf, _, _ = _build({"worker.py": _HANDLER_SIMPLE_NAME_CONST})
+        signals = _swallowed_signals(sf)
+        self.assertGreater(
+            len(signals), 0,
+            "ok = True in except body is vacuous; must still emit signal",
+        )
+
+
+class AsyncMethodKindTest(unittest.TestCase):
+    """P2: async method inside a class must produce symbol_kind='method', matching main extractor."""
+
+    def test_async_class_method_signal_subject_is_method_kind(self) -> None:
+        """Signal subject entity_id must use symbol_kind='method', not 'async_function'."""
+        import tempfile
+        from pathlib import Path
+        from source.kg.build.pipeline import build_kg
+        from source.kg.core.store import read_jsonl
+        from source.kg.core.models import Entity
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pkg = root / "pkg"
+            pkg.mkdir()
+            (pkg / "pyproject.toml").write_text(
+                "[project]\nname = \"test-pkg\"\nversion = \"0.1.0\"\n",
+                encoding="utf-8",
+            )
+            (pkg / "worker.py").write_text(_ASYNC_METHOD_SWALLOWED, encoding="utf-8")
+            out = root / "kg"
+            build_kg(pkg, out)
+
+            sf_path = out / "support_facts.jsonl"
+            support_facts = read_jsonl(sf_path) if sf_path.exists() else []
+            entities_all = read_jsonl(out / "entities.jsonl")
+
+        signals = _swallowed_signals(support_facts)
+        self.assertGreater(len(signals), 0, "async method swallowed exception must emit a signal")
+
+        # Build entity_id index from the main extractor's entities.
+        entities_by_id = {e["entity_id"]: e for e in entities_all}
+
+        # The signal's subject must be the 'method' entity, not an 'async_function' entity.
+        sig = signals[0]
+        subject_id = sig["subject_id"]
+        subject = entities_by_id.get(subject_id)
+        self.assertIsNotNone(subject, f"subject entity_id {subject_id!r} not in main extractor entities")
+        identity = subject.get("identity", {})
+        self.assertEqual(
+            identity.get("symbol_kind"), "method",
+            f"async class method must have symbol_kind='method' (main extractor precedence), got: {identity}",
+        )
+        # Inversion: no entity with qualname 'Worker.run' should have symbol_kind='async_function'.
+        async_fn_entities = [
+            e for e in entities_all
+            if e.get("identity", {}).get("qualname") == "Worker.run"
+            and e.get("identity", {}).get("symbol_kind") == "async_function"
+        ]
+        self.assertEqual(
+            async_fn_entities, [],
+            f"no entity for Worker.run should have symbol_kind='async_function': {async_fn_entities}",
+        )

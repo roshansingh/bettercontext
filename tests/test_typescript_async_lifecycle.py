@@ -125,6 +125,39 @@ export function triggerSave(id: string): void {
 }
 """
 
+# Negative (for isAssignedContext fix): call on RHS of strict-equality — must still fire
+_COMPARISON_CALL = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export function checkSave(id: string): boolean {
+  return ready === saveRecord(id);
+}
+"""
+
+# Negative (for isAssignedContext fix): call in logical OR — must still fire
+_LOGICAL_OR_CALL = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export function maybeSave(id: string): void {
+  const result = flag || saveRecord(id);
+}
+"""
+
+# Positive (control): plain assignment suppresses — must NOT fire
+_ASSIGNMENT_SUPPRESSED = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export function triggerSave(id: string): void {
+  const rec = saveRecord(id);
+}
+"""
+
 
 def _build(files: dict[str, str]) -> tuple[list[dict], list[dict], list[dict]]:
     """Write files to a tempdir, run build_kg, return (support_facts, evidence, coverage)."""
@@ -287,3 +320,35 @@ class DeterminismTest(unittest.TestCase):
             sf2 = {f["fact_id"] for f in (read_jsonl(sf2_path) if sf2_path.exists() else []) if f["predicate"] == "code_risk_signal"}
             self.assertGreater(len(sf1), 0, "no signals in first build")
             self.assertEqual(sf1, sf2, "fact_ids differ between two builds")
+
+
+@unittest.skipIf(not NODE_AVAILABLE, "node not available")
+class AssignmentContextDiscriminatorTest(unittest.TestCase):
+    """P2: isAssignedContext must only suppress true assignments, not comparisons/logicals."""
+
+    def test_strict_equality_rhs_still_emits_unawaited(self) -> None:
+        """ready === saveRecord(id) — comparison, not assignment → must emit unawaited_async_call."""
+        sf, _, _ = _build({"check.ts": _COMPARISON_CALL})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertGreater(
+            len(signals), 0,
+            "call on RHS of === is not an assignment; unawaited_async_call must fire",
+        )
+
+    def test_logical_or_rhs_still_emits_unawaited(self) -> None:
+        """flag || saveRecord(id) — logical, not assignment → must emit unawaited_async_call."""
+        sf, _, _ = _build({"or.ts": _LOGICAL_OR_CALL})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertGreater(
+            len(signals), 0,
+            "call on RHS of || is not an assignment; unawaited_async_call must fire",
+        )
+
+    def test_variable_declaration_still_suppressed(self) -> None:
+        """const rec = saveRecord(id) — true assignment → must NOT emit unawaited_async_call."""
+        sf, _, _ = _build({"assign.ts": _ASSIGNMENT_SUPPRESSED})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertEqual(
+            signals, [],
+            f"call in variable declaration must be suppressed; no unawaited_async_call: {signals}",
+        )
