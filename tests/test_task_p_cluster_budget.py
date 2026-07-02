@@ -211,19 +211,19 @@ class TestClusterCoverageMultiFile(unittest.TestCase):
         changed_symbols = review_leads.get("changed_symbols") or []
         self.assertIsInstance(changed_symbols, list)
 
+        # Non-vacuous: the packet must retain changed_symbols rows at the default cap.
+        self.assertTrue(changed_symbols, "no changed_symbols retained; cluster assertions did not execute")
+
         # Collect which file paths appear in the returned changed_symbols
         retained_paths = {row.get("path") for row in changed_symbols if isinstance(row, dict)}
 
-        # Every cluster (file) must have at least one representative IF budget allows it at all
+        # Every cluster (file) must have at least one representative
         original_paths = {f"src/module_{i}.py" for i in range(3)}
-
-        # If we have any changed_symbols at all, every original cluster must be represented
-        if changed_symbols:
-            for path in original_paths:
-                self.assertIn(
-                    path, retained_paths,
-                    f"cluster {path} has no changed-symbol anchor; retained: {retained_paths}",
-                )
+        for path in original_paths:
+            self.assertIn(
+                path, retained_paths,
+                f"cluster {path} has no changed-symbol anchor; retained: {retained_paths}",
+            )
 
     def test_returned_counts_match_review_leads_rows(self):
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
@@ -255,25 +255,37 @@ class TestClusterCoverageMultiFile(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestExtremePressureClusterDrop(unittest.TestCase):
-    """P1: under extreme budget pressure, drop whole lowest-ranked cluster."""
+    """P1: under extreme budget pressure, drop whole lowest-ranked cluster.
+
+    Uses a 5-file x 10-symbol fixture and tight caps so the lead rows themselves come
+    under pressure (the exp111 shape) — the assertions below are proven non-vacuous by
+    asserting that clusters really were dropped.
+    """
+
+    _ORIGINAL_PATHS = {f"src/module_{i}.py" for i in range(5)}
 
     def _make_extreme_packet(self) -> dict:
-        """3 files, 8 symbols each, hypothesis references only files 0+1."""
+        """5 files, 10 symbols each, hypothesis references only files 0+1."""
         return _make_over_budget_packet(
-            file_count=3,
-            symbols_per_file=8,
+            file_count=5,
+            symbols_per_file=10,
             hyp_cluster_paths=["src/module_0.py", "src/module_1.py"],
         )
 
+    def _retained_paths(self, result: dict) -> set:
+        review_leads = result.get("review_leads") or {}
+        changed_symbols = review_leads.get("changed_symbols") or []
+        return {row.get("path") for row in changed_symbols if isinstance(row, dict)}
+
     def test_cap_held_under_extreme_pressure(self):
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=30_000)
+        result = enforce_review_context_budget(packet, max_chars=8_000)
         size = len(canonical_json(result))
-        self.assertLessEqual(size, 30_000, f"cap exceeded: {size}")
+        self.assertLessEqual(size, 8_000, f"cap exceeded: {size}")
 
     def test_truncation_summary_present_when_truncated(self):
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=30_000)
+        result = enforce_review_context_budget(packet, max_chars=8_000)
         ob = result.get("output_budget")
         self.assertIsInstance(ob, dict, "output_budget missing")
         self.assertTrue(ob.get("truncated"), "expected truncated=True")
@@ -281,46 +293,112 @@ class TestExtremePressureClusterDrop(unittest.TestCase):
         self.assertIn("truncation_summary", ob, "truncation_summary missing from output_budget")
 
     def test_omitted_cluster_appears_in_truncation_summary(self):
+        """Spec 2 shape: whole-dropped lowest-ranked clusters recorded; kept clusters intact.
+
+        At a 9k cap the top-3 ranked clusters keep one anchor each and the two
+        lowest-ranked clusters drop whole — the exact contract from the brief.
+        """
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=30_000)
-        ob = result.get("output_budget") or {}
-        ts = ob.get("truncation_summary") or {}
+        result = enforce_review_context_budget(packet, max_chars=9_000)
+        self.assertLessEqual(len(canonical_json(result)), 9_000)
 
-        # If a cluster was dropped entirely, its files must appear in omitted_high_risk_clusters
-        review_leads = result.get("review_leads") or {}
-        changed_symbols = review_leads.get("changed_symbols") or []
-        retained_paths = {row.get("path") for row in changed_symbols if isinstance(row, dict)}
+        retained_paths = self._retained_paths(result)
+        omitted_paths = self._ORIGINAL_PATHS - retained_paths
+        # Non-vacuous: this cap must actually drop whole clusters while keeping others.
+        self.assertTrue(omitted_paths, "expected whole clusters dropped at 9k cap; none were")
+        self.assertTrue(retained_paths, "expected kept clusters at 9k cap; none were")
 
-        original_paths = {f"src/module_{i}.py" for i in range(3)}
-        omitted_paths = original_paths - retained_paths
+        ts = (result.get("output_budget") or {}).get("truncation_summary") or {}
+        clusters = ts.get("omitted_high_risk_clusters") or []
+        self.assertIsInstance(clusters, list)
+        self.assertGreater(len(clusters), 0, "omitted clusters expected but omitted_high_risk_clusters is empty")
+        all_cluster_files = []
+        for cr in clusters:
+            self.assertIsInstance(cr, dict)
+            changed_files = cr.get("changed_files") or []
+            all_cluster_files.extend(changed_files)
+        # Every whole-dropped cluster must be recorded (<= 5 dropped here), and the
+        # summary must never claim a kept cluster was omitted.
+        for op in sorted(omitted_paths):
+            self.assertIn(op, all_cluster_files, f"omitted path {op} not in any cluster row")
+        for cf in all_cluster_files:
+            self.assertIn(cf, omitted_paths, f"summary claims kept cluster {cf} was omitted")
 
-        if omitted_paths:
-            clusters = ts.get("omitted_high_risk_clusters") or []
-            self.assertIsInstance(clusters, list)
-            # At least one cluster row must exist when something was omitted
-            self.assertGreater(len(clusters), 0, "omitted clusters expected but omitted_high_risk_clusters is empty")
-            all_cluster_files = []
-            for cr in clusters:
-                self.assertIsInstance(cr, dict)
-                changed_files = cr.get("changed_files") or []
-                all_cluster_files.extend(changed_files)
-            # The omitted paths must be recoverable from the cluster rows
-            for op in omitted_paths:
-                self.assertIn(op, all_cluster_files, f"omitted path {op} not in any cluster row")
-
-    def test_kept_clusters_intact(self):
-        """Hypothesis-referenced clusters (0 and 1) should be kept if any cluster is kept."""
+    def test_summary_records_top_ranked_dropped_clusters_at_extreme_cap(self):
+        """At an extreme cap not all dropped clusters fit; the recorded ones must be the
+        highest-ranked dropped clusters, in rank order, and all must really be omitted."""
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=30_000)
+        result = enforce_review_context_budget(packet, max_chars=8_000)
+        self.assertLessEqual(len(canonical_json(result)), 8_000)
+        retained_paths = self._retained_paths(result)
+        omitted_paths = self._ORIGINAL_PATHS - retained_paths
+        self.assertTrue(omitted_paths, "expected whole clusters dropped at 8k cap; none were")
+        ts = (result.get("output_budget") or {}).get("truncation_summary") or {}
+        clusters = ts.get("omitted_high_risk_clusters") or []
+        self.assertGreater(len(clusters), 0, "at least the top-ranked dropped cluster must be recorded")
+        recorded = [cf for cr in clusters for cf in (cr.get("changed_files") or [])]
+        for cf in recorded:
+            self.assertIn(cf, omitted_paths, f"summary claims kept cluster {cf} was omitted")
+        # Rank order: a hypothesis-referenced dropped cluster must be recorded first.
+        dropped_referenced = sorted(omitted_paths & {"src/module_0.py", "src/module_1.py"})
+        if dropped_referenced:
+            self.assertEqual(
+                recorded[0], dropped_referenced[0],
+                "highest-ranked (hypothesis-referenced) dropped cluster must be recorded first",
+            )
 
+    def test_kept_clusters_are_hypothesis_referenced(self):
+        """Retained clusters must come from the hypothesis-referenced set when fewer
+        clusters survive than were referenced (rank: referenced first)."""
+        packet = self._make_extreme_packet()
+        result = enforce_review_context_budget(packet, max_chars=8_000)
+        retained_paths = self._retained_paths(result)
+        # Non-vacuous: something must be retained and something dropped.
+        self.assertTrue(retained_paths, "no changed_symbols retained at all")
+        self.assertLess(len(retained_paths), 5, "expected cluster drops at 8k cap")
+        referenced = {"src/module_0.py", "src/module_1.py"}
+        if len(retained_paths) <= len(referenced):
+            self.assertTrue(
+                retained_paths <= referenced,
+                f"retained {retained_paths} includes non-referenced cluster while referenced clusters were dropped",
+            )
+
+    def test_one_anchor_per_cluster_before_second_row(self):
+        """Core P1 rule: no cluster keeps a 2nd row while another original cluster has 0,
+        at a cap where one-anchor-per-cluster fits."""
+        packet = self._make_extreme_packet()
+        result = enforce_review_context_budget(packet, max_chars=12_000)
+        self.assertLessEqual(len(canonical_json(result)), 12_000)
         review_leads = result.get("review_leads") or {}
-        changed_symbols = review_leads.get("changed_symbols") or []
-        retained_paths = {row.get("path") for row in changed_symbols if isinstance(row, dict)}
+        changed_symbols = [r for r in (review_leads.get("changed_symbols") or []) if isinstance(r, dict)]
+        self.assertTrue(changed_symbols, "no changed_symbols retained at 12k cap")
+        counts: dict = {}
+        for row in changed_symbols:
+            p = row.get("path")
+            counts[p] = counts.get(p, 0) + 1
+        uncovered = self._ORIGINAL_PATHS - set(counts)
+        doubled = {p for p, c in counts.items() if c >= 2}
+        if uncovered:
+            self.assertFalse(
+                doubled,
+                f"clusters {doubled} keep >= 2 rows while clusters {uncovered} have no anchor",
+            )
 
-        # If we retained any changed_symbols at all, hypothesis-referenced clusters should be first
-        if len(retained_paths) >= 2:
-            self.assertIn("src/module_0.py", retained_paths, "hypothesis-referenced cluster 0 dropped before cluster 2")
-            self.assertIn("src/module_1.py", retained_paths, "hypothesis-referenced cluster 1 dropped before cluster 2")
+    def test_truthful_omitted_counts(self):
+        """P2 omitted counts must equal pre-budget totals minus retained rows."""
+        packet = self._make_extreme_packet()
+        result = enforce_review_context_budget(packet, max_chars=8_000)
+        review_leads = result.get("review_leads") or {}
+        retained = len(review_leads.get("changed_symbols") or [])
+        actual_omitted = 50 - retained
+        # Non-vacuous: rows really were omitted at this cap.
+        self.assertGreater(actual_omitted, 0, "expected omitted changed symbols at 8k cap")
+        ts = (result.get("output_budget") or {}).get("truncation_summary") or {}
+        self.assertEqual(
+            ts.get("omitted_changed_symbol_count"),
+            actual_omitted,
+            f"summary reports {ts.get('omitted_changed_symbol_count')} omitted; actual {actual_omitted}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -494,17 +572,18 @@ class TestEndToEndClusterCoverage(unittest.TestCase):
         # Cap
         self.assertLessEqual(len(canonical_json(result)), 40_000)
 
-        # Cluster coverage: every file path must appear in changed_symbols if any remain
+        # Cluster coverage: every file path must appear in changed_symbols.
         review_leads = result["review_leads"]
         changed_symbols = review_leads.get("changed_symbols") or []
-        if changed_symbols:
-            retained_paths = {r.get("path") for r in changed_symbols if isinstance(r, dict)}
-            for i in range(3):
-                self.assertIn(
-                    f"src/module_{i}.py",
-                    retained_paths,
-                    f"cluster module_{i}.py missing from retained changed_symbols",
-                )
+        # Non-vacuous: rows must survive at the default cap for this fixture.
+        self.assertTrue(changed_symbols, "no changed_symbols retained; coverage assertions did not execute")
+        retained_paths = {r.get("path") for r in changed_symbols if isinstance(r, dict)}
+        for i in range(3):
+            self.assertIn(
+                f"src/module_{i}.py",
+                retained_paths,
+                f"cluster module_{i}.py missing from retained changed_symbols",
+            )
 
     def test_hypothesis_floor_preserved(self):
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)

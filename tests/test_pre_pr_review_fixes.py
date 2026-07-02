@@ -307,7 +307,9 @@ class TestFinalizeReviewHypothesisBudgetHardCapNoEvictable(unittest.TestCase):
         packet, original = self._scalar_only_packet(original_count=5, returned_count=2)
         # Set max_chars to the size of the packet before status is attached.
         max_chars = len(canonical_json(packet))
-        _finalize_review_hypothesis_budget(packet, original, max_chars=max_chars)
+        _finalize_review_hypothesis_budget(
+            packet, original, original_review_leads=packet.get("review_leads") or {}, max_chars=max_chars
+        )
         self.assertLessEqual(
             len(canonical_json(packet)),
             max_chars,
@@ -320,7 +322,9 @@ class TestFinalizeReviewHypothesisBudgetHardCapNoEvictable(unittest.TestCase):
         packet, original = self._scalar_only_packet(original_count=5, returned_count=2)
         # Provide ample budget so status can be retained.
         max_chars = len(canonical_json(packet)) + 500
-        _finalize_review_hypothesis_budget(packet, original, max_chars=max_chars)
+        _finalize_review_hypothesis_budget(
+            packet, original, original_review_leads=packet.get("review_leads") or {}, max_chars=max_chars
+        )
         self.assertIn(
             "review_hypothesis_status",
             packet,
@@ -670,7 +674,9 @@ class TestKZeroHypothesesStatus(unittest.TestCase):
         }
         original_hyps: list = []
         ample = len(canonical_json(packet)) + 10_000
-        _finalize_review_hypothesis_budget(packet, original_hyps, max_chars=ample)
+        _finalize_review_hypothesis_budget(
+            packet, original_hyps, original_review_leads=packet.get("review_leads") or {}, max_chars=ample
+        )
 
         status = packet.get("review_hypothesis_status")
         self.assertIsNotNone(status, "review_hypothesis_status must be present on zero-hypothesis useful packets")
@@ -727,7 +733,9 @@ class TestKLowCoverageHypothesisStatus(unittest.TestCase):
         packet = self._make_low_coverage_packet(with_stylesheet_hyp=False)
         original_hyps: list = []
         ample = len(canonical_json(packet)) + 10_000
-        _finalize_review_hypothesis_budget(packet, original_hyps, max_chars=ample)
+        _finalize_review_hypothesis_budget(
+            packet, original_hyps, original_review_leads=packet.get("review_leads") or {}, max_chars=ample
+        )
 
         status = packet.get("review_hypothesis_status")
         self.assertIsNotNone(status, "review_hypothesis_status must be present on low-coverage packets")
@@ -740,7 +748,9 @@ class TestKLowCoverageHypothesisStatus(unittest.TestCase):
         packet = self._make_low_coverage_packet(with_stylesheet_hyp=True)
         original_hyps = list(packet["review_hypotheses"])
         ample = len(canonical_json(packet)) + 10_000
-        _finalize_review_hypothesis_budget(packet, original_hyps, max_chars=ample)
+        _finalize_review_hypothesis_budget(
+            packet, original_hyps, original_review_leads=packet.get("review_leads") or {}, max_chars=ample
+        )
 
         status = packet.get("review_hypothesis_status")
         self.assertIsNotNone(status, "review_hypothesis_status must be present on low-coverage stylesheet packets")
@@ -1033,7 +1043,9 @@ class TestN4AvailableRiskTypes(unittest.TestCase):
         }
         original_hyps: list = []
         ample = len(canonical_json(packet)) + 10_000
-        _finalize_review_hypothesis_budget(packet, original_hyps, max_chars=ample)
+        _finalize_review_hypothesis_budget(
+            packet, original_hyps, original_review_leads=packet.get("review_leads") or {}, max_chars=ample
+        )
         status = packet.get("review_hypothesis_status") or {}
         art = status.get("available_risk_types")
         self.assertEqual(art, [], "available_risk_types must be [] when no hypotheses generated")
@@ -1048,7 +1060,9 @@ class TestN4AvailableRiskTypes(unittest.TestCase):
             h["risk_type"] = f"risk_type_{i:02d}"
             many_hyps.append(h)
         ample = len(canonical_json(packet)) + 50_000
-        _finalize_review_hypothesis_budget(packet, many_hyps, max_chars=ample)
+        _finalize_review_hypothesis_budget(
+            packet, many_hyps, original_review_leads=packet.get("review_leads") or {}, max_chars=ample
+        )
         status = packet.get("review_hypothesis_status") or {}
         art = status.get("available_risk_types") or []
         self.assertLessEqual(len(art), 12, "available_risk_types must be bounded at 12")

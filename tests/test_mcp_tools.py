@@ -4817,6 +4817,40 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(anchors_by_path["payments/gateway.py"]["match_kind"], "changed_file_without_range")
         self.assertEqual(anchors_by_path["payments/gateway.py"]["symbol_count"], 1)
 
+    def test_review_context_live_packet_cluster_coverage(self) -> None:
+        """Task P spec 5: end-to-end call_tool review_context on a multi-file change.
+
+        Every changed file with indexed symbols is a cluster; the live packet must carry
+        >= 1 changed-symbol anchor (with lead_id) per cluster, and a packet that was not
+        truncated must not carry a truncation_summary.
+        """
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py", "payments/gateway.py"],
+                    "changed_ranges": [
+                        {"path": "payments/checkout.py", "start_line": 10, "end_line": 10},
+                        {"path": "payments/gateway.py", "start_line": 5, "end_line": 5},
+                    ],
+                    "limit": 10,
+                },
+            )
+
+        self.assertEqual(result["status"], "found")
+        leads = [row for row in result["review_leads"]["changed_symbols"] if isinstance(row, dict)]
+        self.assertTrue(leads, "live packet has no changed-symbol lead rows")
+        retained_paths = {row.get("path") for row in leads}
+        for path in ("payments/checkout.py", "payments/gateway.py"):
+            self.assertIn(path, retained_paths, f"cluster {path} has no changed-symbol anchor in live packet")
+        for row in leads:
+            self.assertTrue(row.get("lead_id"), f"lead row missing lead_id: {row}")
+        budget = result.get("output_budget") or {}
+        if not budget.get("truncated"):
+            self.assertNotIn("truncation_summary", budget)
+
     def test_review_context_missing_changed_file_still_returns_repo_dependencies(self) -> None:
         with _fixture_snapshot() as kg:
             result = call_tool(kg, "review_context", {"repo": "payments", "changed_files": ["payments/missing.py"]})
