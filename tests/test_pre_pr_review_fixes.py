@@ -1,8 +1,10 @@
-"""Regression tests for three findings from the Codex pre-PR review:
+"""Regression tests for five findings from the Codex pre-PR review:
 
 1. hypothesis_id must be evidence-specific (same risk_type → different IDs for different leads)
 2. Unknown-only requested_surfaces must not expand to all defaults
 3. supporting_lead_ids must be reconciled after final budget eviction
+4. Whitespace tokens must be split into individual inspection terms
+5. Hard-cap guarantee must hold even when no rows are evictable after status attach
 """
 from __future__ import annotations
 
@@ -14,7 +16,10 @@ from source.kg.product.mcp_tools import (
     _review_context_surface_status,
     _review_context_unknown_surface_status_row,
 )
-from source.kg.product.output_budget import enforce_review_context_budget
+from source.kg.product.output_budget import (
+    _finalize_review_hypothesis_budget,
+    enforce_review_context_budget,
+)
 from source.kg.product.review_attribution import hypothesis_stable_id
 from source.kg.core.models import canonical_json
 
@@ -222,6 +227,95 @@ class TestUnknownSurfaceSymbolNameTruncation(unittest.TestCase):
                 _REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN,
                 f"term exceeds {_REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN} chars: {term!r}",
             )
+
+
+class TestUnknownSurfaceSpaceTokenSplit(unittest.TestCase):
+    """Fix 4: tokens containing spaces must be split into individual inspection terms."""
+
+    def test_space_containing_token_splits_into_words(self):
+        row = _review_context_unknown_surface_status_row(
+            "ability checks",
+            changed_symbols=[],
+        )
+        terms = row["source_inspection_terms"]
+        self.assertIn("ability", terms, f"expected 'ability' in terms: {terms}")
+        self.assertIn("checks", terms, f"expected 'checks' in terms: {terms}")
+
+    def test_hyphen_space_mixed_token_splits_all_words(self):
+        row = _review_context_unknown_surface_status_row(
+            "read-write access",
+            changed_symbols=[],
+        )
+        terms = row["source_inspection_terms"]
+        self.assertIn("read", terms)
+        self.assertIn("write", terms)
+        self.assertIn("access", terms)
+
+    def test_original_token_still_in_surface_field(self):
+        token = "ability checks"
+        row = _review_context_unknown_surface_status_row(token, changed_symbols=[])
+        # surface echoes the (possibly truncated) original token
+        self.assertEqual(row["surface"], token)
+
+
+class TestFinalizeReviewHypothesisBudgetHardCapNoEvictable(unittest.TestCase):
+    """Fix 5: hard-cap holds when status attach overflows and nothing is evictable."""
+
+    def _scalar_only_packet(self, original_count: int, returned_count: int) -> dict:
+        """Packet with no evictable list-of-dict rows and fewer hypotheses returned than available."""
+        hyps = [
+            {
+                "hypothesis_id": f"hypothesis:test_risk:id{i:04d}",
+                "risk_type": "test_risk",
+                "confidence": "weak",
+                "why": "x",
+                "evidence_refs": [],
+                "source_checks": [],
+                "supporting_lead_ids": [],
+            }
+            for i in range(returned_count)
+        ]
+        original = [
+            {
+                "hypothesis_id": f"hypothesis:test_risk:id{i:04d}",
+                "risk_type": "test_risk",
+                "confidence": "weak",
+                "why": "x",
+                "evidence_refs": [],
+                "source_checks": [],
+                "supporting_lead_ids": [],
+            }
+            for i in range(original_count)
+        ]
+        # Only scalar values + review_hypotheses (protected); no other list-of-dicts.
+        return {
+            "status": "found",
+            "review_hypotheses": hyps,
+        }, original
+
+    def test_packet_does_not_exceed_max_chars_when_no_rows_evictable(self):
+        packet, original = self._scalar_only_packet(original_count=5, returned_count=2)
+        # Set max_chars to the size of the packet before status is attached.
+        max_chars = len(canonical_json(packet))
+        _finalize_review_hypothesis_budget(packet, original, max_chars=max_chars)
+        self.assertLessEqual(
+            len(canonical_json(packet)),
+            max_chars,
+            "packet exceeded max_chars after finalize with no evictable rows",
+        )
+        # review_hypothesis_status must be absent (was dropped to honour the cap)
+        self.assertNotIn("review_hypothesis_status", packet)
+
+    def test_status_present_when_it_fits(self):
+        packet, original = self._scalar_only_packet(original_count=5, returned_count=2)
+        # Provide ample budget so status can be retained.
+        max_chars = len(canonical_json(packet)) + 500
+        _finalize_review_hypothesis_budget(packet, original, max_chars=max_chars)
+        self.assertIn(
+            "review_hypothesis_status",
+            packet,
+            "review_hypothesis_status should be present when budget allows",
+        )
 
 
 if __name__ == "__main__":

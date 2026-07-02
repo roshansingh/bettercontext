@@ -2922,6 +2922,10 @@ def _finalize_review_hypothesis_budget(
         budget = result.get("output_budget")
         if isinstance(budget, dict):
             budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
+    # If nothing was evictable but the status field pushed the packet over the cap, drop it.
+    # review_hypothesis_status is optional metadata; the hard-cap guarantee wins.
+    if _current_chars(result) > max_chars:
+        result.pop("review_hypothesis_status", None)
     # After all eviction is complete, drop stale lead IDs from hypotheses. hypothesis_id
     # is intentionally not recomputed — it was stamped at producer time from the pre-budget set.
     _reconcile_hypothesis_lead_ids(result)

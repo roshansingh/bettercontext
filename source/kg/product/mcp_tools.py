@@ -4396,7 +4396,7 @@ def _review_context_unknown_surface_status_row(
     changed_symbols: list[JsonObject],
 ) -> JsonObject:
     token = token[:_REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN]
-    words = [w for w in token.replace("-", "_").split("_") if w]
+    words = [w for w in token.replace("-", "_").replace(" ", "_").split("_") if w]
     terms: list[str] = []
     seen: set[str] = set()
     for t in [token] + words:
