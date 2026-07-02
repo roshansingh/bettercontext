@@ -3247,6 +3247,219 @@ function collectKafkaEvents(sourceFile) {
   return events;
 }
 
+// ---------------------------------------------------------------------------
+// Async-lifecycle risk signal collector
+// ---------------------------------------------------------------------------
+// Signal 1: async_callback_in_iteration
+//   Fires when .forEach() receives an async function/arrow as its first argument.
+//   Conservative: only matches the identifier `forEach` on a call expression.
+//
+// Signal 2: unawaited_async_call
+//   Fires when a call to a same-file async-declared function appears in a
+//   position where the result is not awaited, not returned, not .then/.catch
+//   chained, and not assigned to a variable.  Cross-file calls emit nothing
+//   (documented limitation).
+//
+// Both signals carry { signal, qualname, callee, line } and are capped at 3
+// per enclosing symbol (lowest line first).
+
+function collectAsyncFunctionNames(sourceFile) {
+  // Return a Set of top-level async function names declared in this file.
+  const names = new Set();
+  for (const statement of sourceFile.statements) {
+    if (
+      ts.isFunctionDeclaration(statement) &&
+      statement.name &&
+      nodeHasModifier(statement, ts.SyntaxKind.AsyncKeyword)
+    ) {
+      names.add(statement.name.text);
+    }
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        const init = declaration.initializer;
+        if (
+          init &&
+          (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) &&
+          nodeHasModifier(init, ts.SyntaxKind.AsyncKeyword) &&
+          ts.isIdentifier(declaration.name)
+        ) {
+          names.add(declaration.name.text);
+        }
+      }
+    }
+  }
+  return names;
+}
+
+function enclosingSymbolName(node, symbols) {
+  // Return the name of the top-level symbol whose [pos, end] range contains node.pos.
+  for (const sym of symbols) {
+    if (node.pos >= sym.pos && node.end <= sym.end) return sym.name;
+  }
+  return null;
+}
+
+function isAsyncFunctionArg(node) {
+  // True if node is an async function expression or arrow function.
+  return (
+    (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) &&
+    nodeHasModifier(node, ts.SyntaxKind.AsyncKeyword)
+  );
+}
+
+function isForEachCall(node) {
+  // True if node is a call expression whose callee ends with `.forEach`.
+  return (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.name.text === "forEach"
+  );
+}
+
+function isAwaitedContext(callNode) {
+  // True if the direct parent of this call expression is an AwaitExpression.
+  const parent = callNode.parent;
+  return parent != null && parent.kind === ts.SyntaxKind.AwaitExpression;
+}
+
+function isReturnedContext(callNode) {
+  // True if the call is directly inside a return statement.
+  const parent = callNode.parent;
+  return parent != null && parent.kind === ts.SyntaxKind.ReturnStatement;
+}
+
+function isThenCatchChained(callNode) {
+  // True if the result of the call is immediately .then() or .catch() chained.
+  // Pattern: callNode.parent is PropertyAccessExpression with name "then"/"catch"/"finally",
+  // and that property access is the expression of a CallExpression.
+  const parent = callNode.parent;
+  if (!parent) return false;
+  if (
+    ts.isPropertyAccessExpression(parent) &&
+    (parent.name.text === "then" || parent.name.text === "catch" || parent.name.text === "finally") &&
+    parent.parent != null &&
+    ts.isCallExpression(parent.parent) &&
+    parent.parent.expression === parent
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isAssignedContext(callNode) {
+  // True if the call appears on the RHS of a variable declaration or assignment.
+  const parent = callNode.parent;
+  if (!parent) return false;
+  // `const x = callNode` or `let x = callNode`
+  if (ts.isVariableDeclaration(parent) && parent.initializer === callNode) return true;
+  // `x = callNode`
+  if (ts.isBinaryExpression(parent) && parent.right === callNode) return true;
+  return false;
+}
+
+function isInsidePromiseAll(callNode) {
+  // True if the call is nested inside a Promise.all/allSettled/race/any invocation.
+  // Walk parent chain; cross array literals, arrow functions, and array-method
+  // call expressions (map/flatMap) until we either find Promise.* or hit a hard
+  // boundary (any other call expression, block, or function boundary).
+  let node = callNode.parent;
+  while (node) {
+    if (ts.isCallExpression(node)) {
+      const expr = node.expression;
+      if (
+        ts.isPropertyAccessExpression(expr) &&
+        ts.isIdentifier(expr.expression) &&
+        expr.expression.text === "Promise" &&
+        (expr.name.text === "all" || expr.name.text === "allSettled" || expr.name.text === "race" || expr.name.text === "any")
+      ) {
+        return true;
+      }
+      // Allow map/flatMap calls through (common pattern: Promise.all(arr.map(...)))
+      if (
+        ts.isPropertyAccessExpression(expr) &&
+        (expr.name.text === "map" || expr.name.text === "flatMap")
+      ) {
+        node = node.parent;
+        continue;
+      }
+      // Any other call: stop
+      return false;
+    }
+    if (ts.isArrayLiteralExpression(node) || ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+      node = node.parent;
+      continue;
+    }
+    // Anything else (block, statement, etc.) is a hard boundary
+    break;
+  }
+  return false;
+}
+
+function applySignalCap(rawSignals) {
+  // Group by qualname, keep lowest 3 lines per symbol.
+  const bySymbol = new Map();
+  for (const sig of rawSignals) {
+    const key = `${sig.signal}:${sig.qualname}`;
+    if (!bySymbol.has(key)) bySymbol.set(key, []);
+    bySymbol.get(key).push(sig);
+  }
+  const capped = [];
+  for (const sigs of bySymbol.values()) {
+    sigs.sort((a, b) => a.line - b.line);
+    capped.push(...sigs.slice(0, 3));
+  }
+  return capped;
+}
+
+function collectAsyncLifecycleSignals(sourceFile, symbols) {
+  const asyncNames = collectAsyncFunctionNames(sourceFile);
+  const rawSignals = [];
+
+  function visit(node) {
+    // Signal 1: forEach(async callback)
+    if (isForEachCall(node) && node.arguments.length > 0 && isAsyncFunctionArg(node.arguments[0])) {
+      const line = lineOf(sourceFile, node.getStart(sourceFile));
+      const qualname = enclosingSymbolName(node, symbols) ?? "<module>";
+      rawSignals.push({
+        signal: "async_callback_in_iteration",
+        qualname,
+        callee: "forEach",
+        line,
+      });
+    }
+
+    // Signal 2: unawaited call to same-file async fn
+    if (
+      ts.isCallExpression(node) &&
+      !isForEachCall(node) &&  // forEach handled above
+      !isAwaitedContext(node) &&
+      !isReturnedContext(node) &&
+      !isThenCatchChained(node) &&
+      !isAssignedContext(node) &&
+      !isInsidePromiseAll(node)
+    ) {
+      const name = callName(node.expression, sourceFile);
+      // Only the leaf name for same-file check (no dots = top-level call)
+      const leafName = name && !name.includes(".") ? name : null;
+      if (leafName && asyncNames.has(leafName)) {
+        const line = lineOf(sourceFile, node.getStart(sourceFile));
+        const qualname = enclosingSymbolName(node, symbols) ?? "<module>";
+        rawSignals.push({
+          signal: "unawaited_async_call",
+          qualname,
+          callee: leafName,
+          line,
+        });
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+
+  return applySignalCap(rawSignals);
+}
+
 const output = Object.create(null);
 for (const relativePath of files) {
   const absolutePath = path.join(repoRoot, relativePath);
@@ -3277,6 +3490,7 @@ for (const relativePath of files) {
         line: call.line,
       }))
     ),
+    async_lifecycle_signals: collectAsyncLifecycleSignals(sourceFile, symbols),
   };
 }
 

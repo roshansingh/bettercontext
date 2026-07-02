@@ -32,6 +32,7 @@ SUPPORTED_SUPPORT_FACT_PREDICATES: frozenset[str] = frozenset(
         "APPLIES_AUTHZ_POLICY",
         "USES_AUTHZ_CHECK",
         "HANDLES_ENDPOINT",
+        "code_risk_signal",
     }
 )
 

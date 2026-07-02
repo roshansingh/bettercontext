@@ -14,6 +14,7 @@ from source.kg.languages.known_stacks import load_known_stacks
 from source.kg.languages.types import ConsumerManifestExtractor, PackageResolver
 from source.kg.languages.typescript.consumer_manifest import TypeScriptConsumerManifestExtractor
 from source.kg.languages.typescript.extractors.extractor_adapter import TYPESCRIPT_COMPILER_API_ADAPTER
+from source.kg.languages.typescript.extractors.typescript_async_lifecycle import TYPESCRIPT_ASYNC_LIFECYCLE_ADAPTER
 from source.kg.languages.typescript.extractors.typescript_express_routes import TYPESCRIPT_EXPRESS_ROUTES_ADAPTER
 from source.kg.languages.typescript.extractors.typescript_message_transport import TYPESCRIPT_MESSAGE_TRANSPORT_ADAPTER
 from source.kg.languages.typescript.files import LANGUAGE_FILES, TypeScriptLanguageFiles
@@ -66,7 +67,12 @@ class TypeScriptLanguageSupport:
         return {}
 
     def adapters(self) -> tuple[Adapter, ...]:
-        return (TYPESCRIPT_EXPRESS_ROUTES_ADAPTER, TYPESCRIPT_MESSAGE_TRANSPORT_ADAPTER, TYPESCRIPT_COMPILER_API_ADAPTER)
+        return (
+            TYPESCRIPT_EXPRESS_ROUTES_ADAPTER,
+            TYPESCRIPT_MESSAGE_TRANSPORT_ADAPTER,
+            TYPESCRIPT_COMPILER_API_ADAPTER,
+            TYPESCRIPT_ASYNC_LIFECYCLE_ADAPTER,
+        )
 
     def known_stacks(self) -> dict[str, dict[str, str]]:
         return {"javascript": dict(_known_stack_imports())}
