@@ -2860,8 +2860,11 @@ def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]
 def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: list[JsonObject]) -> None:
     """Write review_hypothesis_status in-place on result.
 
-    Always emits the status dict so consumers can distinguish none-generated, budget-dropped,
+    Emits the status dict so consumers can distinguish none-generated, budget-dropped,
     mirror-only-dropped, and low-coverage paths without inspecting truncated_sections.
+    Exception: when even this status object would push the packet over max_chars and no
+    other rows are evictable, _finalize_review_hypothesis_budget drops it — the hard cap
+    always wins over metadata.
 
     Fields:
       available_count — hypotheses generated pre-budget
