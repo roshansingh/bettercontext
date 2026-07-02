@@ -281,28 +281,25 @@ class TestBuildKgRoundTrip(unittest.TestCase):
         added_fact_keys = {(f["predicate"], f["subject_id"], f["object_id"]) for f in delta.added_facts}
         removed_fact_keys = {(f["predicate"], f["subject_id"], f["object_id"]) for f in delta.removed_facts}
 
-        # Find the actual subject and object IDs from the real build
+        # alpha is UNCHANGED (same URN in base and head), so look it up from the base snapshot.
+        # beta exists only in base; gamma exists only in head.
+        # Use next() without a default so a missing entity crashes the test loudly.
         alpha_id = next(
-            (e["entity_id"] for es in delta.removed_entities.values() for e in es
-             if e["identity"].get("qualname") == "alpha"),
-            None
-        )
-        gamma_id = next(
-            (e["entity_id"] for es in delta.added_entities.values() for e in es
-             if e["identity"].get("qualname") == "gamma"),
-            None
+            e["entity_id"] for e in base_snap.entities
+            if e.get("identity", {}).get("qualname") == "alpha"
         )
         beta_id = next(
-            (e["entity_id"] for es in delta.removed_entities.values() for e in es
-             if e["identity"].get("qualname") == "beta"),
-            None
+            e["entity_id"] for e in base_snap.entities
+            if e.get("identity", {}).get("qualname") == "beta"
+        )
+        gamma_id = next(
+            e["entity_id"] for e in head_snap.entities
+            if e.get("identity", {}).get("qualname") == "gamma"
         )
 
-        # alpha should exist (unchanged), gamma is added, beta is removed
-        if alpha_id and gamma_id:
-            self.assertIn(("CALLS", alpha_id, gamma_id), added_fact_keys)
-        if alpha_id and beta_id:
-            self.assertIn(("CALLS", alpha_id, beta_id), removed_fact_keys)
+        # The real Python extractor emits CALLS at CodeSymbol grain (function-level subject).
+        self.assertIn(("CALLS", alpha_id, beta_id), removed_fact_keys)
+        self.assertIn(("CALLS", alpha_id, gamma_id), added_fact_keys)
 
 
 if __name__ == "__main__":
