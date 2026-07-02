@@ -2972,8 +2972,60 @@ def _largest_broad_context_row_list(node: object) -> tuple[str, list] | None:
     return best
 
 
+def _is_review_leads_label(label: str) -> bool:
+    """Return True if the dotted label is a review_leads or answer-packet top_* field.
+
+    These are the lead rows that pair with answer-packet mirror rows. N1: they are
+    evicted last (after all other non-hypothesis victims are exhausted) so the pair
+    survives; when they must be evicted, the coherent drop of both sides is handled
+    by the subsequent _sync_review_lead_status_from_packet call.
+    """
+    root = label.split(".")[0]
+    if root == "review_leads":
+        return True
+    if root == "review_answer_packet":
+        inner = label.split(".", 2)[1] if label.count(".") >= 1 else ""
+        return inner in {"top_changed_symbols", "top_direct_callers", "top_direct_callees", "top_transitive_callers"}
+    return False
+
+
+def _largest_non_lead_row_list(node: object) -> tuple[str, list] | None:
+    """Find the largest row-list that is NOT a review_leads/top_* lead section or hypothesis list.
+
+    Used by N1 to prefer evicting other sections (broad context, anchors, etc.) before
+    touching the lead pairs that must stay coherent.
+    """
+    best_size = 0
+    best: tuple[str, list] | None = None
+    stack: list[tuple[str, object]] = [("", node)]
+    while stack:
+        label, current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in _HARD_CAP_PROTECTED_KEYS or (not label and key in _HARD_CAP_PROTECTED_TOPLEVEL):
+                    continue
+                child_label = f"{label}.{key}" if label else key
+                if isinstance(value, list) and value and any(isinstance(x, dict) for x in value):
+                    if not _is_review_leads_label(child_label):
+                        size = len(canonical_json(value))
+                        if size > best_size:
+                            best_size, best = size, (child_label, value)
+                stack.append((child_label, value))
+        elif isinstance(current, list):
+            for index, item in enumerate(current):
+                stack.append((f"{label}[{index}]", item))
+    return best
+
+
 def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]:
     """Evict rows from the largest non-hypothesis row list until the packet fits.
+
+    N1 (flip): review_leads and answer-packet top_* lead rows are evicted last —
+    only after all other non-hypothesis victims (broad context, anchors, diff rows)
+    are exhausted. When a review_leads row must be evicted as a last resort, the
+    subsequent _sync_review_lead_status_from_packet call clips the corresponding
+    top_* mirror entry too (coherent drop of both sides). The subset invariant
+    (top_* ⊆ review_leads) is maintained throughout.
 
     Both ``review_hypotheses`` and ``review_answer_packet.top_review_hypotheses`` are
     protected: broad context rows are dropped before the last hypothesis, per the review
@@ -2989,7 +3041,10 @@ def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]
         protected_mirror = None
         if isinstance(answer_packet, dict):
             protected_mirror = answer_packet.pop("top_review_hypotheses", None)
-        target = _largest_row_list(result)
+        # N1: prefer non-lead victims; fall back to lead rows only when no other victims exist.
+        target = _largest_non_lead_row_list(result)
+        if target is None:
+            target = _largest_row_list(result)
         if protected is not None:
             result["review_hypotheses"] = protected
         if isinstance(answer_packet, dict) and protected_mirror is not None:
@@ -2999,6 +3054,11 @@ def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]
         label, rows = target
         rows.pop()
         evicted.add(label)
+        # N1 coherent drop: if we just evicted a review_leads row, sync the mirror
+        # immediately so the top_* entry is also removed — never leave mirror showing
+        # a lead_id that no longer exists in review_leads.
+        if _is_review_leads_label(label):
+            _sync_review_lead_status_from_packet(result)
     return evicted
 
 
