@@ -56,7 +56,7 @@ def diff_snapshots(base: KgSnapshot, head: KgSnapshot) -> GraphDelta:
     """
     base_tenant = base.manifest.get("tenant_id")
     head_tenant = head.manifest.get("tenant_id")
-    if base_tenant and head_tenant and base_tenant != head_tenant:
+    if base_tenant != head_tenant:
         raise ValueError(
             f"diff_snapshots: tenant mismatch — base has tenant_id={base_tenant!r}, "
             f"head has tenant_id={head_tenant!r}. Both snapshots must belong to the same tenant."

@@ -203,6 +203,36 @@ class TestTenantMismatchRaises(unittest.TestCase):
 
         self.assertIn("tenant", str(ctx.exception).lower())
 
+    def test_one_missing_tenant_raises_value_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            fn = _symbol("svc", "svc.core", "foo")
+
+            base_root = root / "base"
+            JsonlKgStore(base_root).write(
+                entities=[mod, fn],
+                facts=[],
+                evidence=[],
+                coverage=[],
+                manifest={"version": 1, "tenant_id": "tenant-a"},
+            )
+            head_root = root / "head"
+            JsonlKgStore(head_root).write(
+                entities=[mod, fn],
+                facts=[],
+                evidence=[],
+                coverage=[],
+                manifest={"version": 1},
+            )
+            base_snap = KgSnapshot(base_root)
+            head_snap = KgSnapshot(head_root)
+
+            with self.assertRaises(ValueError) as ctx:
+                diff_snapshots(base_snap, head_snap)
+
+        self.assertIn("tenant", str(ctx.exception).lower())
+
 
 class TestBuildKgRoundTrip(unittest.TestCase):
     """Build two real snapshots via build_kg and verify diff sees the structural change."""
@@ -247,6 +277,32 @@ class TestBuildKgRoundTrip(unittest.TestCase):
         }
         self.assertIn("gamma", added_qualnames)
         self.assertIn("beta", removed_qualnames)
+
+        added_fact_keys = {(f["predicate"], f["subject_id"], f["object_id"]) for f in delta.added_facts}
+        removed_fact_keys = {(f["predicate"], f["subject_id"], f["object_id"]) for f in delta.removed_facts}
+
+        # Find the actual subject and object IDs from the real build
+        alpha_id = next(
+            (e["entity_id"] for es in delta.removed_entities.values() for e in es
+             if e["identity"].get("qualname") == "alpha"),
+            None
+        )
+        gamma_id = next(
+            (e["entity_id"] for es in delta.added_entities.values() for e in es
+             if e["identity"].get("qualname") == "gamma"),
+            None
+        )
+        beta_id = next(
+            (e["entity_id"] for es in delta.removed_entities.values() for e in es
+             if e["identity"].get("qualname") == "beta"),
+            None
+        )
+
+        # alpha should exist (unchanged), gamma is added, beta is removed
+        if alpha_id and gamma_id:
+            self.assertIn(("CALLS", alpha_id, gamma_id), added_fact_keys)
+        if alpha_id and beta_id:
+            self.assertIn(("CALLS", alpha_id, beta_id), removed_fact_keys)
 
 
 if __name__ == "__main__":
