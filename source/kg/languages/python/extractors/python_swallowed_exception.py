@@ -104,6 +104,15 @@ class _SymbolRef:
     end_line: int
 
 
+def _node_line_span(node: ast.AST) -> tuple[int, int]:
+    """Single source of the (line, end_line) key so symbol collection and the
+    signal traversal can never disagree on defaults when end_lineno is
+    absent or None."""
+    line = getattr(node, "lineno", 1)
+    end = getattr(node, "end_lineno", None)
+    return (line, end if isinstance(end, int) else line)
+
+
 def _module_name(repo: RepoSnapshot, file_path: Path) -> str:
     relative = file_path.relative_to(repo.root).with_suffix("")
     parts = list(relative.parts)
@@ -142,8 +151,7 @@ def _collect_function_symbols(
                 kind = "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function"
                 if prefix:
                     kind = "method"
-                line = getattr(node, "lineno", 1)
-                end_line = getattr(node, "end_lineno", line)
+                line, end_line = _node_line_span(node)
                 entity = Entity(
                     kind="CodeSymbol",
                     identity={
@@ -286,7 +294,7 @@ def _collect_signals_from_file(
                     # Top-level class: visit its methods as collected symbols
                     _visit_body(node.body, fn_stack)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                sym_key = (getattr(node, "lineno", -1), getattr(node, "end_lineno", -1))
+                sym_key = _node_line_span(node)
                 sym_ref = collected_line_ranges.get(sym_key)
                 # Push the symbol (or None if not collected / nested)
                 new_stack = [sym_ref] + fn_stack
