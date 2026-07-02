@@ -98,7 +98,21 @@ class TestComponentListRenderIdentityDrift(unittest.TestCase):
             },
         )
         hyp = next(h for h in hypotheses if h["risk_type"] == "component_list_render_identity_drift")
-        self.assertIn(hyp["confidence"], {"medium", "weak"})
+        self.assertEqual(hyp["confidence"], "medium")
+
+    def test_negative_edge_not_touching_changed_symbols_does_not_emit(self):
+        # Component symbol changed, but the only edge connects two unrelated symbols
+        hypotheses = self._call(
+            changed_files=["src/Panel.tsx"],
+            changed_symbols=[_sym("Panel", "src/Panel.tsx", kind="class", lead_id="lead-11")],
+            direct_callees=[_edge("otherFn", "helperFn", "lead-edge-9")],
+            review_leads={
+                "changed_symbols": [{"lead_id": "lead-11", "path": "src/Panel.tsx"}],
+                "direct_callees": [{"lead_id": "lead-edge-9", "path": "src/other.ts"}],
+            },
+        )
+        risk_types = [h["risk_type"] for h in hypotheses]
+        self.assertNotIn("component_list_render_identity_drift", risk_types)
 
     def test_negative_no_edges_does_not_emit(self):
         # Component symbol with no edges → no trigger
@@ -429,6 +443,26 @@ class TestTestLocksInRegression(unittest.TestCase):
                 "direct_callees": [{"lead_id": "lead-te5"}],
             },
             review_lead_status={"coverage_status": "low_coverage"},
+        )
+        risk_types = [h["risk_type"] for h in hypotheses]
+        self.assertNotIn("test_locks_in_regression", risk_types)
+
+    def test_negative_edge_not_touching_changed_symbols_does_not_emit(self):
+        # Test file + code symbol, but the only edge connects two unrelated symbols
+        hypotheses = self._call(
+            changed_files=["src/report.py", "tests/test_report.py"],
+            changed_symbols=[
+                _sym("build_report", "src/report.py", lead_id="lead-t14"),
+                _sym("test_build_report", "tests/test_report.py", lead_id="lead-t15"),
+            ],
+            direct_callees=[_edge("unrelated_a", "unrelated_b", "lead-te7")],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-t14", "path": "src/report.py"},
+                    {"lead_id": "lead-t15", "path": "tests/test_report.py"},
+                ],
+                "direct_callees": [{"lead_id": "lead-te7"}],
+            },
         )
         risk_types = [h["risk_type"] for h in hypotheses]
         self.assertNotIn("test_locks_in_regression", risk_types)

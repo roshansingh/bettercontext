@@ -446,6 +446,13 @@ def _is_hook_name(name: str) -> bool:
     return len(name) > 3 and name.startswith("use") and name[3].isupper()
 
 
+def _edges_touch_names(edges: list[JsonObject], names: set[str]) -> bool:
+    for edge in edges:
+        if edge.get("subject") in names or edge.get("object") in names:
+            return True
+    return False
+
+
 def _component_list_render_identity_drift(
     *,
     changed_symbols: list[JsonObject],
@@ -456,7 +463,8 @@ def _component_list_render_identity_drift(
     component_syms = [s for s in changed_symbols if _is_component_symbol(s)]
     if not component_syms:
         return None
-    if not direct_callers and not direct_callees:
+    changed_names = {s.get("name") for s in changed_symbols if s.get("name")}
+    if not _edges_touch_names(direct_callers, changed_names) and not _edges_touch_names(direct_callees, changed_names):
         return None
     evidence_refs: list[JsonObject] = []
     for sym in component_syms[:5]:
@@ -553,7 +561,8 @@ def _test_locks_in_regression(
     non_test_syms = [s for s in changed_symbols if not _is_test_file(s.get("path") or "")]
     if not non_test_syms:
         return None
-    if not direct_callers and not direct_callees:
+    changed_names = {s.get("name") for s in changed_symbols if s.get("name")}
+    if not _edges_touch_names(direct_callers, changed_names) and not _edges_touch_names(direct_callees, changed_names):
         return None
     test_files = [f for f in changed_files if _is_test_file(f)]
     evidence_refs: list[JsonObject] = [{"path": f} for f in test_files[:5]]
