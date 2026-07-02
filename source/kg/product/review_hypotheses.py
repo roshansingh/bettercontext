@@ -421,14 +421,30 @@ def _path_extension(path: str) -> str:
     return path[dot_pos:] if dot_pos >= 0 else ""
 
 
+def _short_name(sym: JsonObject) -> str:
+    """Return the simple (last-segment) name from a symbol row.
+
+    Production rows from _symbol_result carry 'qualname' (short), 'display_name'
+    and 'qualified_name' (module-qualified).  Unit-test synthetic rows may use 'name'.
+    """
+    qualname = sym.get("qualname")
+    if qualname:
+        return str(qualname).rsplit(".", 1)[-1]
+    for key in ("display_name", "qualified_name"):
+        val = sym.get(key)
+        if val:
+            return str(val).rsplit(".", 1)[-1]
+    return str(sym.get("name") or "")
+
+
 def _is_component_symbol(sym: JsonObject) -> bool:
-    name = sym.get("name") or ""
+    name = _short_name(sym)
     path = sym.get("path") or ""
     return bool(name) and name[0].isupper() and _path_extension(path) in _FRONTEND_COMPONENT_EXTENSIONS
 
 
 def _is_hook_symbol(sym: JsonObject) -> bool:
-    name = sym.get("name") or ""
+    name = _short_name(sym)
     path = sym.get("path") or ""
     return (
         len(name) > 3
@@ -447,9 +463,21 @@ def _is_hook_name(name: str) -> bool:
 
 
 def _edges_touch_names(edges: list[JsonObject], names: set[str]) -> bool:
+    """Return True if any edge subject/object matches a name in *names*.
+
+    Matches bare names (unit-test rows) and qualified names like "module.fn"
+    (production _fact_result rows) where the last segment equals a name in *names*.
+    """
     for edge in edges:
-        if edge.get("subject") in names or edge.get("object") in names:
-            return True
+        for field in ("subject", "object"):
+            val = str(edge.get(field) or "")
+            if not val:
+                continue
+            if val in names:
+                return True
+            seg = val.rsplit(".", 1)[-1]
+            if seg in names:
+                return True
     return False
 
 
@@ -463,13 +491,13 @@ def _component_list_render_identity_drift(
     component_syms = [s for s in changed_symbols if _is_component_symbol(s)]
     if not component_syms:
         return None
-    changed_names = {s.get("name") for s in changed_symbols if s.get("name")}
+    changed_names = {_short_name(s) for s in changed_symbols if _short_name(s)}
     if not _edges_touch_names(direct_callers, changed_names) and not _edges_touch_names(direct_callees, changed_names):
         return None
     evidence_refs: list[JsonObject] = []
     for sym in component_syms[:5]:
         ref: JsonObject = {}
-        for key in ("path", "name", "kind"):
+        for key in ("path", "qualname", "name", "kind"):
             val = sym.get(key)
             if val is not None:
                 ref[key] = val
@@ -501,31 +529,43 @@ def _hook_gate_render_mismatch(
     hook_syms = [s for s in changed_symbols if _is_hook_symbol(s)]
     if not hook_syms:
         return None
-    hook_names = {s.get("name") for s in hook_syms if s.get("name")}
+    hook_names = {_short_name(s) for s in hook_syms if _short_name(s)}
     has_consumer_edge = False
     for edge in direct_callers:
-        subj = edge.get("subject") or ""
-        obj_ = edge.get("object") or ""
-        if obj_ in hook_names and (_is_component_name(subj) or _is_hook_name(subj)):
+        subj = str(edge.get("subject") or "")
+        obj_ = str(edge.get("object") or "")
+        subj_seg = subj.rsplit(".", 1)[-1]
+        obj_seg = obj_.rsplit(".", 1)[-1]
+        if (obj_ in hook_names or obj_seg in hook_names) and (
+            _is_component_name(subj_seg) or _is_hook_name(subj_seg)
+        ):
             has_consumer_edge = True
             break
-        if subj in hook_names and (_is_component_name(obj_) or _is_hook_name(obj_)):
+        if (subj in hook_names or subj_seg in hook_names) and (
+            _is_component_name(obj_seg) or _is_hook_name(obj_seg)
+        ):
             has_consumer_edge = True
             break
     if not has_consumer_edge:
         for edge in direct_callees:
-            subj = edge.get("subject") or ""
-            obj_ = edge.get("object") or ""
-            if subj in hook_names and (_is_component_name(obj_) or _is_hook_name(obj_)):
+            subj = str(edge.get("subject") or "")
+            obj_ = str(edge.get("object") or "")
+            subj_seg = subj.rsplit(".", 1)[-1]
+            obj_seg = obj_.rsplit(".", 1)[-1]
+            if (subj in hook_names or subj_seg in hook_names) and (
+                _is_component_name(obj_seg) or _is_hook_name(obj_seg)
+            ):
                 has_consumer_edge = True
                 break
-            if obj_ in hook_names and (_is_component_name(subj) or _is_hook_name(subj)):
+            if (obj_ in hook_names or obj_seg in hook_names) and (
+                _is_component_name(subj_seg) or _is_hook_name(subj_seg)
+            ):
                 has_consumer_edge = True
                 break
     evidence_refs: list[JsonObject] = []
     for sym in hook_syms[:5]:
         ref: JsonObject = {}
-        for key in ("path", "name", "kind"):
+        for key in ("path", "qualname", "name", "kind"):
             val = sym.get(key)
             if val is not None:
                 ref[key] = val
@@ -561,7 +601,7 @@ def _test_locks_in_regression(
     non_test_syms = [s for s in changed_symbols if not _is_test_file(s.get("path") or "")]
     if not non_test_syms:
         return None
-    changed_names = {s.get("name") for s in changed_symbols if s.get("name")}
+    changed_names = {_short_name(s) for s in changed_symbols if _short_name(s)}
     if not _edges_touch_names(direct_callers, changed_names) and not _edges_touch_names(direct_callees, changed_names):
         return None
     test_files = [f for f in changed_files if _is_test_file(f)]

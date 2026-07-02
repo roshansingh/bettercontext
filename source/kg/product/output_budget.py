@@ -2339,6 +2339,8 @@ def _compact_relation_endpoint(value: object) -> object:
 def _compact_review_backfill_row(path: tuple[str, ...], row: object) -> object:
     if not isinstance(row, dict):
         return deepcopy(row)
+    if path[-1] in {"review_hypotheses", "top_review_hypotheses"}:
+        return _compact_review_hypothesis(row)
     if path[-1] in {
         "direct_callers",
         "direct_callees",

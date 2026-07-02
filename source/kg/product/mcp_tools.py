@@ -2321,7 +2321,9 @@ def _review_context_properties() -> JsonObject:
                 "and contracts are accepted. Built-in review sections and broad answer categories such as callers, "
                 "reverse_impact, services, and deployables are always returned or covered by other packet sections, "
                 "and may be requested as no-op aliases. Owner/maintainer requests are accepted as explicit coverage "
-                "gaps that point to planning_context.ownership_context."
+                "gaps that point to planning_context.ownership_context. "
+                "Unknown surface names are not rejected — they produce unsupported_or_unlinked surface_status rows "
+                "with source_inspection_terms so the agent can continue with manual inspection."
             ),
         },
         "include_deploy_blockers": {"type": "boolean", "default": False},

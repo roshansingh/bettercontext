@@ -1837,6 +1837,95 @@ class McpToolsTest(unittest.TestCase):
         self.assertNotIn("direct_callers", budgeted["output_budget"]["truncated_sections"])
         self.assertIn("review_leads.direct_callers", budgeted["output_budget"]["truncated_sections"])
 
+    def test_review_backfill_restores_hypothesis_when_headroom_allows(self) -> None:
+        # Packet where initial compaction keeps only 1 hypothesis but there is
+        # headroom to backfill the second.  After enforce_review_context_budget,
+        # both hypotheses must be present and review_lead_status.returned counts
+        # must reflect what is actually shown.
+        hyp1 = {
+            "hypothesis_id": "hyp_backfill_0",
+            "risk_type": "direct_call_contract_drift",
+            "confidence": "strong",
+            "why": "First hypothesis",
+            "evidence_refs": [{"repo": "repo", "path": "pkg/a.py", "line_start": 1}],
+            "source_checks": ["Check callers."],
+            "supporting_lead_ids": ["lead-1"],
+        }
+        hyp2 = {
+            "hypothesis_id": "hyp_backfill_1",
+            "risk_type": "test_locks_in_regression",
+            "confidence": "weak",
+            "why": "Second hypothesis",
+            "evidence_refs": [{"repo": "repo", "path": "tests/test_a.py", "line_start": 5}],
+            "source_checks": ["Check tests."],
+            "supporting_lead_ids": ["lead-2"],
+        }
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 1,
+            "changed_symbol_count": 1,
+            "direct_impact_count": 1,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+            "available": {"changed_symbol_count": 1, "direct_caller_count": 1},
+        }
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"direct_caller_count": 1},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "top_review_hypotheses": [hyp1, hyp2],
+            },
+            "review_hypotheses": [hyp1, hyp2],
+            "review_leads": {
+                "changed_files": ["pkg/a.py"],
+                "changed_symbols": [
+                    {"lead_id": "lead-1", "qualname": "func_a", "path": "pkg/a.py", "line_start": 1}
+                ],
+                "direct_callers": [
+                    {
+                        "predicate": "CALLS",
+                        "depth": 1,
+                        "subject": "pkg.b.caller",
+                        "object": "pkg.a.func_a",
+                        "lead_id": "lead-c1",
+                    }
+                ],
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": [
+                {
+                    "predicate": "CALLS",
+                    "depth": 1,
+                    "subject": "pkg.b.caller",
+                    "object": "pkg.a.func_a",
+                    "lead_id": "lead-c1",
+                }
+            ],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+        # Cap generous enough to fit both hypotheses but tight enough that we
+        # need the backfill path to exercise it.
+        budgeted = enforce_review_context_budget(result, max_chars=50_000)
+
+        hyps = budgeted.get("review_hypotheses", [])
+        self.assertEqual(len(hyps), 2, "backfill must restore both hypotheses when headroom allows")
+        hyp_ids = {h["hypothesis_id"] for h in hyps}
+        self.assertIn("hyp_backfill_0", hyp_ids)
+        self.assertIn("hyp_backfill_1", hyp_ids)
+
     def test_review_context_budget_degrades_to_lead_only_for_non_row_answer_packet_bloat(self) -> None:
         relation_rows = [
             {
@@ -2123,15 +2212,21 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(budgeted["review_hypotheses"][0]["hypothesis_id"], "hyp_0")
 
     def test_review_context_budget_emits_hypothesis_status_when_truncated(self) -> None:
+        # Hypothesis rows are large enough (~2000 chars each when compacted) that
+        # only 1-3 fit within a 4500-char cap after backfill.  This guarantees
+        # truncation even with the now-working hypothesis backfill dispatch.
         hypotheses = [
             {
                 "hypothesis_id": f"hyp_{i}",
                 "risk_type": "data_mutation_risk",
                 "confidence": 0.7,
-                "why": f"Hypothesis {i} reason " + "w" * 120,
-                "evidence_refs": [{"repo": "repo", "path": f"pkg/h_{i}.py", "line_start": i, "line_end": i}],
-                "source_checks": [{"repo": "repo", "path": f"pkg/h_{i}.py"}],
-                "supporting_lead_ids": [f"lead_{i}"],
+                "why": f"Hypothesis {i} reason " + "w" * 1_200,
+                "evidence_refs": [
+                    {"repo": "repo", "path": f"pkg/h_{i}.py", "line_start": i, "line_end": i}
+                    for _ in range(3)
+                ],
+                "source_checks": [f"Check {i} step {j}" for j in range(2)],
+                "supporting_lead_ids": [f"lead_{i}_{j}" for j in range(5)],
             }
             for i in range(5)
         ]
@@ -2184,11 +2279,10 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        # 8,000 chars is tight enough that only some of the 5 hypotheses fit, so this
-        # test always exercises the truncation-status path (never vacuous).
-        budgeted = enforce_review_context_budget(result, max_chars=8_000)
+        # 4,500 chars is tight enough that only some of the 5 large hypotheses fit.
+        budgeted = enforce_review_context_budget(result, max_chars=4_500)
 
-        self.assertLessEqual(len(canonical_json(budgeted)), 8_000)
+        self.assertLessEqual(len(canonical_json(budgeted)), 4_500)
         returned_hyps = budgeted.get("review_hypotheses", [])
         # Truncation must actually happen at this cap, and the floor must hold.
         self.assertGreater(len(returned_hyps), 0)
@@ -7052,6 +7146,144 @@ class _FakeConnection:
 class _TimeoutReader:
     def read(self, size: int) -> bytes:
         raise TimeoutError("stalled")
+
+
+class TestNewHypothesisFamiliesIntegration(unittest.TestCase):
+    """Integration tests for the three new hypothesis families (F).
+
+    Each test builds a minimal JSONL snapshot then calls review_context end-to-end
+    to assert the corresponding risk_type surfaces in review_hypotheses.
+    """
+
+    def _build_snapshot(self, entities, facts, root):
+        JsonlKgStore(root).write(
+            entities=entities,
+            facts=facts,
+            evidence=[],
+            coverage=[],
+            manifest={"version": 1},
+        )
+        return KgSnapshot(root)
+
+    def test_component_list_render_identity_drift_fires_on_tsx_component(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            component = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "ui",
+                    "module": "src.ItemList",
+                    "qualname": "ItemList",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "src/ItemList.tsx", "line": 5, "end_line": 25},
+            )
+            row_component = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "ui",
+                    "module": "src.WidgetRow",
+                    "qualname": "WidgetRow",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "src/WidgetRow.tsx", "line": 1, "end_line": 10},
+            )
+            calls_fact = Fact("CALLS", component.entity_id, row_component.entity_id)
+            kg = self._build_snapshot([component, row_component], [calls_fact], root)
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "ui",
+                    "changed_files": ["src/ItemList.tsx"],
+                    "changed_ranges": [{"path": "src/ItemList.tsx", "start_line": 5, "end_line": 25}],
+                },
+            )
+        risk_types = [h["risk_type"] for h in result["review_hypotheses"]]
+        self.assertIn("component_list_render_identity_drift", risk_types)
+
+    def test_hook_gate_render_mismatch_fires_on_hook_with_component_consumer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hook = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "ui",
+                    "module": "src.useGate",
+                    "qualname": "useGate",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "src/useGate.ts", "line": 1, "end_line": 20},
+            )
+            consumer = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "ui",
+                    "module": "src.WidgetRow",
+                    "qualname": "WidgetRow",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "src/WidgetRow.tsx", "line": 1, "end_line": 15},
+            )
+            calls_fact = Fact("CALLS", consumer.entity_id, hook.entity_id)
+            kg = self._build_snapshot([hook, consumer], [calls_fact], root)
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "ui",
+                    "changed_files": ["src/useGate.ts"],
+                    "changed_ranges": [{"path": "src/useGate.ts", "start_line": 1, "end_line": 20}],
+                },
+            )
+        risk_types = [h["risk_type"] for h in result["review_hypotheses"]]
+        self.assertIn("hook_gate_render_mismatch", risk_types)
+
+    def test_test_locks_in_regression_fires_on_test_plus_code_with_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            code_sym = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "lib",
+                    "module": "src.processor",
+                    "qualname": "process",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "src/processor.py", "line": 10, "end_line": 30},
+            )
+            test_sym = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "lib",
+                    "module": "tests.test_processor",
+                    "qualname": "test_process",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "tests/test_processor.py", "line": 5, "end_line": 15},
+            )
+            calls_fact = Fact("CALLS", test_sym.entity_id, code_sym.entity_id)
+            kg = self._build_snapshot([code_sym, test_sym], [calls_fact], root)
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "lib",
+                    "changed_files": ["src/processor.py", "tests/test_processor.py"],
+                    "changed_ranges": [
+                        {"path": "src/processor.py", "start_line": 10, "end_line": 30},
+                        {"path": "tests/test_processor.py", "start_line": 5, "end_line": 15},
+                    ],
+                },
+            )
+        risk_types = [h["risk_type"] for h in result["review_hypotheses"]]
+        self.assertIn("test_locks_in_regression", risk_types)
 
 
 if __name__ == "__main__":

@@ -23,14 +23,33 @@ def _base_context(**overrides):
 
 
 def _sym(name: str, path: str, kind: str = "function", lead_id: str | None = None) -> dict:
-    s = {"name": name, "kind": kind, "path": path}
+    """Build a production-shaped symbol row.
+
+    Uses qualname (short) and display_name (module-qualified), matching what
+    _symbol_result returns.  The synthetic module is derived from path for
+    display_name so edge suffix matching works end-to-end.
+    """
+    stem = path.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    s = {
+        "qualname": name,
+        "display_name": f"{stem}.{name}",
+        "qualified_name": f"{stem}.{name}",
+        "kind": kind,
+        "path": path,
+    }
     if lead_id:
         s["lead_id"] = lead_id
     return s
 
 
 def _edge(subject: str, object_: str, lead_id: str = "lead-edge") -> dict:
-    return {"subject": subject, "object": object_, "lead_id": lead_id}
+    """Build a production-shaped edge row.
+
+    Wraps bare names in a synthetic module prefix to match _fact_result format
+    ("{module}.{qualname}").  Tests that check subject/object by bare name still
+    work because _edges_touch_names does suffix matching.
+    """
+    return {"subject": f"mod.{subject}", "object": f"mod.{object_}", "lead_id": lead_id}
 
 
 class TestComponentListRenderIdentityDrift(unittest.TestCase):
