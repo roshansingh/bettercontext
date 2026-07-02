@@ -932,11 +932,10 @@ def _clip_answer_packet_top_to_review_leads(
         clipped = [
             row
             for row in ap_rows
-            if isinstance(row, dict) and (
-                not isinstance(row.get("lead_id"), str)
-                or not row.get("lead_id")
-                or row["lead_id"] in surviving_ids
-            )
+            if not isinstance(row, dict)
+            or not isinstance(row.get("lead_id"), str)
+            or not row.get("lead_id")
+            or row["lead_id"] in surviving_ids
         ]
         answer_packet[ap_field] = clipped
 

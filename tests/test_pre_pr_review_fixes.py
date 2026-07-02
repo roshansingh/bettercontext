@@ -11,6 +11,7 @@
 9. (J/K) Lead-only fallback: status present with answer_packet_returned_count == 0 when no mirror
 10. (J/K) Zero-hypotheses useful packet: status available=0 returned=0 reason=none_generated
 11. (J/K) Low-coverage paths: non-stylesheet gets reason=low_coverage; stylesheet keeps hyp with reason budget/null
+12. (Copilot) _clip_answer_packet_top_to_review_leads keeps non-dict rows and dict rows without lead_id
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from source.kg.product.mcp_tools import (
     _review_context_unknown_surface_status_row,
 )
 from source.kg.product.output_budget import (
+    _clip_answer_packet_top_to_review_leads,
     _finalize_review_hypothesis_budget,
     _protect_review_hypotheses_floor,
     enforce_review_context_budget,
@@ -1050,6 +1052,45 @@ class TestN4AvailableRiskTypes(unittest.TestCase):
         status = packet.get("review_hypothesis_status") or {}
         art = status.get("available_risk_types") or []
         self.assertLessEqual(len(art), 12, "available_risk_types must be bounded at 12")
+
+
+class TestClipAnswerPacketTopNonDictRows(unittest.TestCase):
+    """Finding 12 (Copilot): _clip_answer_packet_top_to_review_leads must keep non-dict rows
+    and dict rows lacking lead_id as-is; only clip dict rows whose lead_id is absent from
+    surviving review_leads."""
+
+    def test_non_dict_row_kept(self) -> None:
+        """A plain string row in top_changed_symbols survives clipping."""
+        answer_packet = {"top_changed_symbols": ["plain_string_row"]}
+        review_leads = {"changed_symbols": []}
+        _clip_answer_packet_top_to_review_leads(answer_packet, review_leads)
+        self.assertEqual(answer_packet["top_changed_symbols"], ["plain_string_row"])
+
+    def test_dict_row_without_lead_id_kept(self) -> None:
+        """A dict row with no lead_id survives clipping regardless of surviving_ids."""
+        no_lead_row = {"qualname": "foo.bar", "path": "a.py"}
+        answer_packet = {"top_changed_symbols": [no_lead_row]}
+        review_leads = {"changed_symbols": []}
+        _clip_answer_packet_top_to_review_leads(answer_packet, review_leads)
+        self.assertEqual(answer_packet["top_changed_symbols"], [no_lead_row])
+
+    def test_dict_row_with_dead_lead_id_clipped(self) -> None:
+        """A dict row whose lead_id is absent from review_leads is clipped."""
+        dead_row = {"lead_id": "dead-id", "qualname": "x.y"}
+        answer_packet = {"top_changed_symbols": [dead_row]}
+        review_leads = {"changed_symbols": [{"lead_id": "other-id"}]}
+        _clip_answer_packet_top_to_review_leads(answer_packet, review_leads)
+        self.assertEqual(answer_packet["top_changed_symbols"], [])
+
+    def test_mixed_list_keeps_first_two_clips_third(self) -> None:
+        """plain string + dict without lead_id kept; dict with dead lead_id clipped."""
+        plain = "string_row"
+        no_lead = {"qualname": "a.b"}
+        dead = {"lead_id": "gone", "qualname": "c.d"}
+        answer_packet = {"top_changed_symbols": [plain, no_lead, dead]}
+        review_leads = {"changed_symbols": []}
+        _clip_answer_packet_top_to_review_leads(answer_packet, review_leads)
+        self.assertEqual(answer_packet["top_changed_symbols"], [plain, no_lead])
 
 
 if __name__ == "__main__":

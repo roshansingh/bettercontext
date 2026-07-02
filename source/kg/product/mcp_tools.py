@@ -2172,7 +2172,7 @@ def _optional_review_surfaces_tolerant(
             continue
         canonical = REVIEW_CONTEXT_SURFACE_ALIASES.get(normalized_value)
         if canonical is None:
-            if value not in unknown:
+            if normalized_value not in {tok.strip().lower().replace("-", "_").replace(" ", "_") for tok in unknown}:
                 unknown.append(value)
             continue
         if canonical not in surfaces:

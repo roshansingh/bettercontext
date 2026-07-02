@@ -15,6 +15,7 @@ from source.kg.product.application_impact import application_impact_packet
 from source.kg.product.mcp_tools import (
     ENDPOINT_PATH_SHAPE_MATCH_BASIS,
     TOOL_NAMES,
+    _optional_review_surfaces_tolerant,
     _planning_context_has_resolved_anchor,
     _planning_context_authz_surface_reference,
     _planning_context_symbol_impact,
@@ -7356,6 +7357,30 @@ class TestHypothesisStatusE2E(unittest.TestCase):
             self.assertIsNone(reason, f"reason must be null when nothing truncated, got {reason!r}")
         if truncated > 0 or mirror_count < returned:
             self.assertIn(reason, ("budget", "none_generated", "low_coverage"), f"unexpected reason: {reason!r}")
+
+
+class TestOptionalReviewSurfacesTolerantDedupe(unittest.TestCase):
+    """Finding 2 (Copilot): unknown-surface dedupe must use normalized token so case/separator
+    variants that map to the same normalized form produce only one unknown row."""
+
+    def test_case_and_separator_variants_dedupe(self) -> None:
+        """AuthZ + authz and rule-actions + rule_actions → 2 unknown rows, first spelling kept."""
+        _surfaces, unknown = _optional_review_surfaces_tolerant(
+            {"requested_surfaces": ["AuthZ", "authz", "rule-actions", "rule_actions"]},
+            "requested_surfaces",
+        )
+        self.assertEqual(len(unknown), 2, f"expected 2 unknown rows, got {unknown}")
+        self.assertEqual(unknown[0], "AuthZ")
+        self.assertEqual(unknown[1], "rule-actions")
+
+    def test_identical_tokens_dedupe(self) -> None:
+        """Exact-same unknown token appears only once."""
+        _surfaces, unknown = _optional_review_surfaces_tolerant(
+            {"requested_surfaces": ["foobar", "foobar"]},
+            "requested_surfaces",
+        )
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0], "foobar")
 
 
 if __name__ == "__main__":
