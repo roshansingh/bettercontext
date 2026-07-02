@@ -8,7 +8,13 @@ from source.kg.build.pipeline import build_kg
 from source.kg.core.models import Coverage, Entity, Evidence, Fact
 from source.kg.core.store import JsonlKgStore
 from source.kg.query.snapshot import KgSnapshot
-from source.kg.query.graph_diff import GraphDelta, diff_snapshots
+from source.kg.query.graph_diff import (
+    GraphDelta,
+    diff_snapshots,
+    removed_symbols_with_surviving_referrers,
+    call_edge_delta_for_paths,
+    removed_test_references,
+)
 
 
 TENANT = "default"
@@ -300,6 +306,260 @@ class TestBuildKgRoundTrip(unittest.TestCase):
         # The real Python extractor emits CALLS at CodeSymbol grain (function-level subject).
         self.assertIn(("CALLS", alpha_id, beta_id), removed_fact_keys)
         self.assertIn(("CALLS", alpha_id, gamma_id), added_fact_keys)
+
+
+def _symbol_with_path(repo: str, module: str, qualname: str, path: str, kind: str = "function") -> Entity:
+    return Entity(
+        "CodeSymbol",
+        {"tenant_id": TENANT, "repo": repo, "module": module, "qualname": qualname, "symbol_kind": kind},
+        {"path": path, "line": 1},
+    )
+
+
+class TestRemovedSymbolsWithSurvivingReferrers(unittest.TestCase):
+    """
+    Positive: fn_beta removed; fn_alpha (referrer via CALLS) survives → one row.
+    Negative: both beta AND alpha removed → no row.
+    Negative: beta removed but no referrers at all → no row.
+    """
+
+    def _build_base(self, tmpdir: Path, alpha: Entity, beta: Entity, call: Fact) -> KgSnapshot:
+        mod = _module("svc", "svc.core")
+        return _make_snapshot(tmpdir, "base", [mod, alpha, beta], [call])
+
+    def _build_head(self, tmpdir: Path, alpha: Entity) -> KgSnapshot:
+        mod = _module("svc", "svc.core")
+        return _make_snapshot(tmpdir, "head", [mod, alpha], [])
+
+    def test_positive_surviving_referrer_produces_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "svc.core", "alpha", "svc/core.py")
+            fn_beta = _symbol_with_path("svc", "svc.core", "beta", "svc/core.py")
+            call = _calls_fact(fn_alpha, fn_beta)
+
+            base = self._build_base(root, fn_alpha, fn_beta, call)
+            head = self._build_head(root, fn_alpha)
+            delta = diff_snapshots(base, head)
+            rows = removed_symbols_with_surviving_referrers(delta, base, head)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["removed_symbol"]["urn"], fn_beta.urn)
+        self.assertEqual(len(row["surviving_referrers"]), 1)
+        self.assertEqual(row["surviving_referrers"][0]["urn"], fn_alpha.urn)
+        # Coordinates sourced from entity properties (not evidence).
+        self.assertEqual(row["removed_symbol"]["coordinates"].get("path"), "svc/core.py")
+        self.assertEqual(row["surviving_referrers"][0]["coordinates"].get("path"), "svc/core.py")
+
+    def test_negative_referrer_also_removed_produces_no_row(self) -> None:
+        """Both beta and alpha removed — no surviving referrers."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "svc.core", "alpha", "svc/core.py")
+            fn_beta = _symbol_with_path("svc", "svc.core", "beta", "svc/core.py")
+            call = _calls_fact(fn_alpha, fn_beta)
+            mod = _module("svc", "svc.core")
+
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta], [call])
+            # head has neither alpha nor beta
+            head = _make_snapshot(root, "head", [mod], [])
+            delta = diff_snapshots(base, head)
+            rows = removed_symbols_with_surviving_referrers(delta, base, head)
+
+        self.assertEqual(rows, [])
+
+    def test_negative_no_referrers_produces_no_row(self) -> None:
+        """beta removed, but no fact points at it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "svc.core", "alpha", "svc/core.py")
+            fn_beta = _symbol_with_path("svc", "svc.core", "beta", "svc/core.py")
+            mod = _module("svc", "svc.core")
+
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta], [])
+            head = _make_snapshot(root, "head", [mod, fn_alpha], [])
+            delta = diff_snapshots(base, head)
+            rows = removed_symbols_with_surviving_referrers(delta, base, head)
+
+        self.assertEqual(rows, [])
+
+    def test_empty_delta_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "svc.core", "alpha", "svc/core.py")
+            mod = _module("svc", "svc.core")
+            snap = _make_snapshot(root, "snap", [mod, fn_alpha], [])
+            delta = diff_snapshots(snap, snap)
+            rows = removed_symbols_with_surviving_referrers(delta, snap, snap)
+
+        self.assertEqual(rows, [])
+
+
+class TestCallEdgeDeltaForPaths(unittest.TestCase):
+    """
+    Positive: CALLS fact whose subject entity has a path in the given set → included.
+    Negative: CALLS fact whose neither subject nor object matches any given path → excluded.
+    Non-CALLS removed/added facts are not returned.
+    """
+
+    def test_positive_added_fact_matching_path_included(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "svc.core", "alpha", "svc/core.py")
+            fn_beta = _symbol_with_path("svc", "svc.core", "beta", "svc/core.py")
+            fn_gamma = _symbol_with_path("svc", "svc.util", "gamma", "svc/util.py")
+            call_ab = _calls_fact(fn_alpha, fn_beta)
+            call_ag = _calls_fact(fn_alpha, fn_gamma)
+            mod_core = _module("svc", "svc.core")
+            mod_util = _module("svc", "svc.util")
+
+            base = _make_snapshot(root, "base", [mod_core, mod_util, fn_alpha, fn_beta, fn_gamma], [call_ab])
+            head = _make_snapshot(root, "head", [mod_core, mod_util, fn_alpha, fn_beta, fn_gamma], [call_ag])
+            delta = diff_snapshots(base, head)
+            rows = call_edge_delta_for_paths(delta, base, head, ["svc/core.py"])
+
+        # call_ag added — subject alpha is in svc/core.py → included
+        added = [r for r in rows if r["change_kind"] == "added"]
+        removed = [r for r in rows if r["change_kind"] == "removed"]
+        self.assertEqual(len(added), 1)
+        self.assertEqual(added[0]["subject_id"], fn_alpha.entity_id)
+        # call_ab removed — subject alpha in svc/core.py → included
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0]["subject_id"], fn_alpha.entity_id)
+
+    def test_negative_edge_outside_paths_excluded(self) -> None:
+        """Edge touches only svc/util.py; we query svc/core.py → excluded."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "svc.util", "alpha", "svc/util.py")
+            fn_beta = _symbol_with_path("svc", "svc.util", "beta", "svc/util.py")
+            fn_gamma = _symbol_with_path("svc", "svc.util", "gamma", "svc/util.py")
+            call_ab = _calls_fact(fn_alpha, fn_beta)
+            call_ag = _calls_fact(fn_alpha, fn_gamma)
+            mod = _module("svc", "svc.util")
+
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta, fn_gamma], [call_ab])
+            head = _make_snapshot(root, "head", [mod, fn_alpha, fn_beta, fn_gamma], [call_ag])
+            delta = diff_snapshots(base, head)
+            rows = call_edge_delta_for_paths(delta, base, head, ["svc/core.py"])
+
+        self.assertEqual(rows, [])
+
+    def test_empty_paths_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "svc.core", "alpha", "svc/core.py")
+            fn_beta = _symbol_with_path("svc", "svc.core", "beta", "svc/core.py")
+            fn_gamma = _symbol_with_path("svc", "svc.core", "gamma", "svc/core.py")
+            call_ab = _calls_fact(fn_alpha, fn_beta)
+            call_ag = _calls_fact(fn_alpha, fn_gamma)
+            mod = _module("svc", "svc.core")
+
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta, fn_gamma], [call_ab])
+            head = _make_snapshot(root, "head", [mod, fn_alpha, fn_beta, fn_gamma], [call_ag])
+            delta = diff_snapshots(base, head)
+            rows = call_edge_delta_for_paths(delta, base, head, [])
+
+        self.assertEqual(rows, [])
+
+    def test_object_path_match_includes_edge(self) -> None:
+        """Removed CALLS fact where the OBJECT entity matches the given path."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "svc.util", "alpha", "svc/util.py")
+            fn_beta = _symbol_with_path("svc", "svc.core", "beta", "svc/core.py")
+            fn_gamma = _symbol_with_path("svc", "svc.util", "gamma", "svc/util.py")
+            call_ab = _calls_fact(fn_alpha, fn_beta)
+            call_ag = _calls_fact(fn_alpha, fn_gamma)
+            mod_core = _module("svc", "svc.core")
+            mod_util = _module("svc", "svc.util")
+
+            base = _make_snapshot(root, "base", [mod_core, mod_util, fn_alpha, fn_beta, fn_gamma], [call_ab])
+            head = _make_snapshot(root, "head", [mod_core, mod_util, fn_alpha, fn_beta, fn_gamma], [call_ag])
+            delta = diff_snapshots(base, head)
+            # query svc/core.py — only call_ab removed (object=beta is in svc/core.py)
+            rows = call_edge_delta_for_paths(delta, base, head, ["svc/core.py"])
+
+        removed = [r for r in rows if r["change_kind"] == "removed"]
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0]["object_id"], fn_beta.entity_id)
+        # call_ag added — neither subject nor object is in svc/core.py
+        added = [r for r in rows if r["change_kind"] == "added"]
+        self.assertEqual(len(added), 0)
+
+
+class TestRemovedTestReferences(unittest.TestCase):
+    """
+    Positive: removed CALLS fact whose subject has a test-classified path and
+              whose object still exists in head → one row.
+    Negative: subject path not test-classified → excluded.
+    Negative: object removed from head → excluded.
+    """
+
+    def test_positive_test_subject_surviving_object_in_head(self) -> None:
+        """Test subject calls a non-test symbol; the test->sym call removed but sym survives."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_test = _symbol_with_path("svc", "tests.test_core", "test_alpha", "tests/test_core.py")
+            fn_alpha = _symbol_with_path("svc", "svc.core", "alpha", "svc/core.py")
+            fn_beta = _symbol_with_path("svc", "svc.core", "beta", "svc/core.py")
+            call_ta = _calls_fact(fn_test, fn_alpha)
+            call_tb = _calls_fact(fn_test, fn_beta)
+            mod_test = _module("svc", "tests.test_core")
+            mod_core = _module("svc", "svc.core")
+
+            # base: test calls alpha AND beta
+            base = _make_snapshot(root, "base", [mod_test, mod_core, fn_test, fn_alpha, fn_beta], [call_ta, call_tb])
+            # head: test->beta call removed but fn_beta STILL EXISTS in head; test->alpha still there
+            head = _make_snapshot(root, "head", [mod_test, mod_core, fn_test, fn_alpha, fn_beta], [call_ta])
+            delta = diff_snapshots(base, head)
+            rows = removed_test_references(delta, base, head)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["predicate"], "CALLS")
+        self.assertEqual(row["subject"]["urn"], fn_test.urn)
+        self.assertEqual(row["object"]["urn"], fn_beta.urn)
+        # Subject path is test-classified
+        self.assertIn("test", row["subject"]["path"])
+
+    def test_negative_non_test_subject_excluded(self) -> None:
+        """Removed CALLS fact whose subject is NOT a test file → excluded."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "svc.core", "alpha", "svc/core.py")
+            fn_beta = _symbol_with_path("svc", "svc.core", "beta", "svc/core.py")
+            fn_gamma = _symbol_with_path("svc", "svc.core", "gamma", "svc/core.py")
+            call_ab = _calls_fact(fn_alpha, fn_beta)
+            call_ag = _calls_fact(fn_alpha, fn_gamma)
+            mod = _module("svc", "svc.core")
+
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta, fn_gamma], [call_ab])
+            head = _make_snapshot(root, "head", [mod, fn_alpha, fn_beta, fn_gamma], [call_ag])
+            delta = diff_snapshots(base, head)
+            rows = removed_test_references(delta, base, head)
+
+        self.assertEqual(rows, [])
+
+    def test_negative_object_removed_from_head_excluded(self) -> None:
+        """Object not in head → row excluded even when subject is a test file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_test = _symbol_with_path("svc", "tests.test_core", "test_alpha", "tests/test_core.py")
+            fn_beta = _symbol_with_path("svc", "svc.core", "beta", "svc/core.py")
+            call_tb = _calls_fact(fn_test, fn_beta)
+            mod_test = _module("svc", "tests.test_core")
+            mod_core = _module("svc", "svc.core")
+
+            # base: test calls beta
+            base = _make_snapshot(root, "base", [mod_test, mod_core, fn_test, fn_beta], [call_tb])
+            # head: fn_beta removed from head entirely
+            head = _make_snapshot(root, "head", [mod_test, mod_core, fn_test], [])
+            delta = diff_snapshots(base, head)
+            rows = removed_test_references(delta, base, head)
+
+        self.assertEqual(rows, [])
 
 
 if __name__ == "__main__":
