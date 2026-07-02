@@ -3378,9 +3378,19 @@ def _review_context_risk_signals(
 ) -> list[JsonObject]:
     """Retrieve code_risk_signal support facts for changed symbols and files.
 
-    Returns up to *limit* signal rows, each augmented with a ``_evidence`` list
-    containing the evidence rows that carry ``bytes_ref`` coordinates (so the
-    hypothesis builder can extract paths without a separate KG lookup).
+    Returns up to *limit* signal rows (default 12), each augmented with a
+    ``_evidence`` list containing the evidence rows that carry ``bytes_ref``
+    coordinates (so the hypothesis builder can extract paths without a separate
+    KG lookup).
+
+    Two bounds are applied in sequence:
+      1. Per-subject cap (3): at most 3 signals per subject_id, ordered by
+         range-overlap first then lowest evidence line.
+      2. Total retrieval bound (*limit*, default 12): the post-cap list is
+         sorted deterministically — range-overlap signals first, then
+         subject-matched signals, then by (evidence path, evidence line) —
+         and truncated to *limit*.  With 6 subjects × 3 = 18 possible rows
+         after step 1, this bound is the enforced global ceiling.
 
     Scoping rules:
       1. subject_id directly matches the symbol_id of a changed-symbol row
@@ -3477,7 +3487,41 @@ def _review_context_risk_signals(
     # Per-subject retrieval cap: keep at most 3 signals per enclosing subject,
     # selected by relevance: changed-range overlap first, then lowest evidence line.
     results = _cap_risk_signals_per_subject(results, range_filters=range_filters, limit_per_subject=3)
-    return results
+
+    # Total retrieval bound: apply deterministic order so the strongest *limit*
+    # rows survive.  Priority: range-overlap signals first, then subject-matched
+    # signals, then by (evidence path, evidence line) for stable ordering.
+    def _total_sort_key(sig: JsonObject) -> tuple[int, int, str, int]:
+        overlaps_range = 0
+        matched_by_subj = 1
+        min_path = ""
+        min_line = 999_999
+        sid = sig.get("subject_id")
+        if isinstance(sid, str) and sid in changed_entity_ids:
+            matched_by_subj = 0
+        for ev in (sig.get("_evidence") or []):
+            br = ev.get("bytes_ref") if isinstance(ev, dict) else None
+            if not isinstance(br, dict):
+                continue
+            ev_ls = br.get("line_start")
+            ev_le = br.get("line_end")
+            ev_path = br.get("path") or ""
+            if isinstance(ev_ls, int):
+                if not min_path or ev_path < min_path or (ev_path == min_path and ev_ls < min_line):
+                    min_path = ev_path
+                    min_line = ev_ls
+            if isinstance(ev_ls, int) and isinstance(ev_le, int):
+                p_norm = _planning_context_normalize_path(ev_path)
+                path_ranges = range_filters.get(p_norm, [])
+                if path_ranges and any(
+                    ev_ls <= rng_end and rng_start <= ev_le
+                    for rng_start, rng_end in path_ranges
+                ):
+                    overlaps_range = 1
+        return (1 - overlaps_range, matched_by_subj, min_path, min_line)
+
+    results.sort(key=_total_sort_key)
+    return results[:limit]
 
 
 def _planning_context_from_query(kg: KgSnapshot, *, query: str, limit: int) -> JsonObject:

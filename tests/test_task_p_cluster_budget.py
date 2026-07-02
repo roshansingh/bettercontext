@@ -888,5 +888,101 @@ class TestSnapshotEdgeCountsForRanking(unittest.TestCase):
             )
 
 
+class TestContractDedupPresenceGuard(unittest.TestCase):
+    """Fix 2: contract-dedup must only delete review_answer_packet.claim_contract /
+    scope_contract when the top-level copy exists and is a dict.  When the top-level
+    copy is absent, the answer-packet entry is the only copy and must be retained.
+    """
+
+    def _make_over_budget_packet_no_top_level_contract(self) -> dict:
+        """Packet where review_answer_packet has claim_contract but top-level does NOT."""
+        files = [f"src/mod_{i}.py" for i in range(4)]
+        changed_symbols = [
+            _make_changed_symbol(f"lead:cs:{i}", files[i], f"fn_{i}")
+            for i in range(4)
+        ]
+        # Bulky broad-context to push over budget
+        bulky = [{"k": "x" * 200, "v": "y" * 200} for _ in range(50)]
+        answer_packet = {
+            "status": "ok",
+            # claim_contract present only in the answer-packet, NOT at top-level
+            "claim_contract": {"fields": ["field_" + "x" * 20] * 10},
+            "scope_contract": {"repos": ["repo_" + "r" * 20] * 10},
+            "top_changed_symbols": list(changed_symbols),
+        }
+        review_leads = {
+            "changed_symbols": list(changed_symbols),
+            "changed_files": list(files),
+        }
+        review_lead_status = {
+            "changed_symbol_count": 4,
+            "changed_anchor_count": 4,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+            "coverage_status": "ok",
+            "available": {
+                "changed_symbol_count": 4,
+                "direct_caller_count": 0,
+                "direct_callee_count": 0,
+                "transitive_caller_count": 0,
+                "source_coordinate_count": 0,
+            },
+        }
+        packet = {
+            "tool": "review_context",
+            "status": "ok",
+            "repo": "repo-a",
+            "summary": {"changed_symbol_count": 4},
+            "review_leads": review_leads,
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": answer_packet,
+            "changed_symbols": list(changed_symbols),
+            # No top-level claim_contract / scope_contract
+            "application_impact": {"direct_callers": bulky},
+            "output_budget": {"engine_version": "test"},
+        }
+        return add_review_lead_ids(packet)
+
+    def test_answer_packet_contract_retained_when_top_level_absent(self) -> None:
+        """When top-level claim_contract is absent, answer-packet copy must not be deleted."""
+        from source.kg.product.output_budget import REVIEW_CONTEXT_MAX_CHARS, enforce_review_context_budget
+        packet = self._make_over_budget_packet_no_top_level_contract()
+        # Confirm top-level contract is absent in fixture
+        self.assertNotIn("claim_contract", packet, "fixture must not have top-level claim_contract")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        answer_packet = result.get("review_answer_packet") or {}
+        # answer-packet entry must be retained since there's no top-level duplicate
+        self.assertIn(
+            "claim_contract",
+            answer_packet,
+            "review_answer_packet.claim_contract must be retained when top-level copy is absent",
+        )
+
+    def test_answer_packet_contract_removed_when_top_level_present(self) -> None:
+        """When top-level claim_contract is a dict, answer-packet duplicate may be evicted."""
+        from source.kg.product.output_budget import enforce_review_context_budget
+        packet = self._make_over_budget_packet_no_top_level_contract()
+        # Add top-level copies so the dedup guard allows removal
+        packet["claim_contract"] = {"fields": ["field_" + "x" * 20] * 10}
+        packet["scope_contract"] = {"repos": ["repo_" + "r" * 20] * 10}
+        # Push well over budget so tier-2 is reached
+        max_chars = 3_000
+        if len(canonical_json(packet)) <= max_chars:
+            self.skipTest("fixture does not exceed small cap; adjust test geometry")
+        result = enforce_review_context_budget(packet, max_chars=max_chars)
+        # After eviction the answer-packet duplicate should have been removed
+        answer_packet = result.get("review_answer_packet") or {}
+        # At least one of the two contract keys should be gone (the loop removes one per iteration)
+        both_present = (
+            "claim_contract" in answer_packet and "scope_contract" in answer_packet
+        )
+        self.assertFalse(
+            both_present,
+            "at least one answer-packet contract key must be removed when top-level copy exists",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

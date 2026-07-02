@@ -2983,9 +2983,12 @@ def _evict_broad_context_to_fit(result: JsonObject, *, max_chars: int) -> set[st
             continue
         # Tier 2: boilerplate/inventory — only reached when broad context is empty.
         # 2a. Duplicated contract dicts in review_answer_packet (already at top-level).
+        # Only remove from the answer-packet when a top-level copy exists and is a dict;
+        # if the top-level copy is absent the answer-packet entry is the only copy and
+        # must be retained.
         if isinstance(answer_packet, dict):
             for dup_key in ("claim_contract", "scope_contract"):
-                if dup_key in answer_packet:
+                if dup_key in answer_packet and isinstance(result.get(dup_key), dict):
                     del answer_packet[dup_key]
                     evicted.add(f"review_answer_packet.{dup_key}")
                     break
@@ -3661,6 +3664,12 @@ def _repair_cluster_coverage(
             # stop when even tier-2 eviction cannot make room (lower-ranked clusters
             # are cheaper but also lower-priority, so if this one fails, break).
             compact_anchor = _compact_symbol(original_by_cluster[path][0])
+            # anchor_cost budgets one copy of the anchor.  The `if changed` block below
+            # mirrors review_leads.changed_symbols into the top-level changed_symbols list
+            # (growth ×2 per anchor), so actual total cost can be up to 2× this value.
+            # The post-repair _evict_review_rows_to_fit call in
+            # _finalize_review_hypothesis_budget is the backstop that reclaims any
+            # overshoot; do not remove that loop without re-budgeting here.
             anchor_cost = len(canonical_json(compact_anchor))
             _evict_broad_context_to_fit(
                 result, max_chars=max(1, max_chars - anchor_cost - _HARD_CAP_AREA_RESERVE // 4)

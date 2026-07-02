@@ -8031,5 +8031,149 @@ class TestR1FundingBoilerplateVictim(unittest.TestCase):
         self.assertTrue(retained, "review_leads.changed_symbols must be non-empty after boilerplate eviction")
 
 
+class TestTotalRetrievalBound(unittest.TestCase):
+    """Fix 1: _review_context_risk_signals total retrieval bound (limit=12).
+
+    6 subjects × 5 signals each = 30 raw; per-subject cap (3) reduces to 18;
+    total bound (limit=12) must reduce to exactly 12, range-overlap signals first.
+    """
+
+    def _build_multi_subject_kg(self, n_subjects: int, signals_per_subject: int) -> tuple[KgSnapshot, list[Entity]]:
+        """Build a KG with n_subjects symbols, each having signals_per_subject risk signals.
+
+        Evidence for signal i of subject j is at line (j*100 + i*2 + 1).
+        Subject 0's signals are in-range (range covers lines 1-10); all others are not,
+        so subject 0's signals rank first (overlap=1) in the total sort order.
+        """
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        root = Path(tmpdir)
+        subjects: list[Entity] = []
+        support_facts: list[Fact] = []
+        evidence_rows: list[Evidence] = []
+
+        for j in range(n_subjects):
+            sym = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "testrepo",
+                    "module": f"pkg.mod_{j}",
+                    "qualname": f"fn_{j}",
+                    "symbol_kind": "function",
+                },
+                properties={"path": f"pkg/mod_{j}.py", "line": 1},
+            )
+            subjects.append(sym)
+            for i in range(signals_per_subject):
+                line = j * 100 + i * 2 + 1
+                sf = Fact(
+                    predicate="code_risk_signal",
+                    subject_id=sym.entity_id,
+                    object_id=sym.entity_id,
+                    qualifier={
+                        "risk_family": "swallowed_exception",
+                        "exception_type": "bare",
+                        "qualname": f"fn_{j}",
+                        "line": line,
+                    },
+                )
+                ev = Evidence(
+                    target_type="fact",
+                    target_id=sf.fact_id,
+                    derivation_class="deterministic_static",
+                    source_system="test",
+                    source_ref={"extractor": "test"},
+                    bytes_ref={
+                        "repo": "testrepo",
+                        "commit_sha": "abc",
+                        "path": f"pkg/mod_{j}.py",
+                        "line_start": line,
+                        "line_end": line,
+                    },
+                    confidence=1.0,
+                )
+                support_facts.append(sf)
+                evidence_rows.append(ev)
+
+        JsonlKgStore(root).write(
+            entities=subjects,
+            facts=[],
+            support_facts=support_facts,
+            evidence=evidence_rows,
+            coverage=[],
+            manifest={"version": 1, "repo_name": "testrepo", "repo_path": str(root)},
+        )
+        return KgSnapshot(root), subjects
+
+    def test_6_subjects_5_signals_returns_exactly_12(self) -> None:
+        """6 subjects × 5 signals; per-subject cap=3 → 18; total limit=12 → exactly 12."""
+        kg, subjects = self._build_multi_subject_kg(n_subjects=6, signals_per_subject=5)
+        # Subject 0 is in changed_symbols (subject-match) and in-range (lines 1-9 overlap range 1-10).
+        changed_sym = {
+            "symbol_id": subjects[0].entity_id,
+            "qualname": "fn_0",
+            "path": "pkg/mod_0.py",
+        }
+        changed_files = [f"pkg/mod_{j}.py" for j in range(6)]
+        range_filters = {"pkg/mod_0.py": [(1, 10)]}
+        results = _review_context_risk_signals(
+            kg,
+            repo="testrepo",
+            changed_symbols=[changed_sym],
+            changed_files=changed_files,
+            range_filters=range_filters,
+            limit=12,
+        )
+        self.assertEqual(len(results), 12, f"expected exactly 12, got {len(results)}")
+
+    def test_overlap_signals_rank_first(self) -> None:
+        """Range-overlap signals must appear before subject-matched and plain path-matched rows."""
+        kg, subjects = self._build_multi_subject_kg(n_subjects=6, signals_per_subject=5)
+        changed_sym = {
+            "symbol_id": subjects[0].entity_id,
+            "qualname": "fn_0",
+            "path": "pkg/mod_0.py",
+        }
+        changed_files = [f"pkg/mod_{j}.py" for j in range(6)]
+        # Subject 0 lines: 1, 3, 5, 7, 9 (i*2+1 for i=0..4); range 1-10 overlaps all.
+        range_filters = {"pkg/mod_0.py": [(1, 10)]}
+        results = _review_context_risk_signals(
+            kg,
+            repo="testrepo",
+            changed_symbols=[changed_sym],
+            changed_files=changed_files,
+            range_filters=range_filters,
+            limit=12,
+        )
+        # Per-subject cap is 3; subject 0 has lines 1,3,5 overlapping range → 3 overlap rows.
+        overlap_count = 0
+        for sig in results:
+            for ev in (sig.get("_evidence") or []):
+                br = ev.get("bytes_ref") if isinstance(ev, dict) else None
+                if isinstance(br, dict):
+                    ls, le = br.get("line_start"), br.get("line_end")
+                    if isinstance(ls, int) and isinstance(le, int) and ls >= 1 and le <= 10:
+                        overlap_count += 1
+                        break
+        # At least 3 overlap rows must appear (subject 0, capped at 3).
+        self.assertGreaterEqual(overlap_count, 3, "at least 3 range-overlap signals must appear first")
+        # All overlap rows must precede all non-overlap rows in the result list.
+        saw_non_overlap = False
+        for sig in results:
+            is_overlap = False
+            for ev in (sig.get("_evidence") or []):
+                br = ev.get("bytes_ref") if isinstance(ev, dict) else None
+                if isinstance(br, dict):
+                    ls, le = br.get("line_start"), br.get("line_end")
+                    if isinstance(ls, int) and isinstance(le, int) and ls >= 1 and le <= 10:
+                        is_overlap = True
+                        break
+            if is_overlap:
+                self.assertFalse(saw_non_overlap, "overlap signal appeared after non-overlap signal")
+            else:
+                saw_non_overlap = True
+
+
 if __name__ == "__main__":
     unittest.main()

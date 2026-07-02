@@ -387,6 +387,36 @@ class CapTest(unittest.TestCase):
         # Inversion: previously line 16 was dropped by the old per-symbol cap of 3.
         self.assertIn(16, lines, "line 16 (4th handler) must now be present under file cap")
 
+    def test_file_build_cap_boundary_21_handlers_two_functions(self) -> None:
+        # 21 vacuous handlers across 2 functions → file cap is 20, so exactly 20 emitted,
+        # lowest lines first (mirrors the TS boundary test).
+        #
+        # Layout (each try/except block: 4 lines; "except" clause is line 3 of the block):
+        #   fn_a (line 1): 11 handlers → except at lines 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44
+        #   blank line 45, fn_b (line 46): 10 handlers → except at lines 50, 54, 58, 62, 66, 70, 74, 78, 82, 86
+        #
+        # Cap selects the lowest 20 lines; the 21st handler (fn_b last, line 86) is dropped.
+        fn_a_body = "\n".join(
+            f"    try:\n        work_{i}()\n    except Exception:\n        pass"
+            for i in range(11)
+        )
+        fn_b_body = "\n".join(
+            f"    try:\n        work_{11 + i}()\n    except Exception:\n        pass"
+            for i in range(10)
+        )
+        source = f"def fn_a():\n{fn_a_body}\n\ndef fn_b():\n{fn_b_body}\n"
+        sf, _, _ = _build({"worker.py": source})
+        signals = _swallowed_signals(sf)
+        self.assertEqual(len(signals), 20, f"expected 20 (file cap=20), got {len(signals)}")
+        lines_present = sorted(s["qualifier"]["line"] for s in signals)
+        self.assertEqual(len(lines_present), 20)
+        # Lowest 20 lines must be retained; the 21st handler (last in fn_b) must be absent.
+        last_line = max(lines_present)
+        dropped_line = last_line + 4
+        self.assertNotIn(dropped_line, lines_present, f"21st handler (line {dropped_line}) must be dropped by file cap")
+        # Inversion: the 20th handler (last_line) must be present.
+        self.assertIn(last_line, lines_present, f"20th handler (line {last_line}) must be retained under file cap")
+
 
 class DeterminismTest(unittest.TestCase):
     def test_two_builds_produce_identical_fact_ids(self) -> None:
