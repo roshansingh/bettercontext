@@ -2294,8 +2294,8 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(status["returned_count"], len(returned_hyps))
         self.assertIn("review_hypotheses", budgeted["output_budget"]["truncated_sections"])
 
-    def test_review_context_budget_no_hypothesis_status_when_zero_hypotheses(self) -> None:
-        # Packet with no hypotheses: no fake hypothesis injected, no review_hypothesis_status.
+    def test_review_context_budget_hypothesis_status_none_generated_when_zero_hypotheses(self) -> None:
+        # Packet with no hypotheses: no fake hypothesis injected; status emitted with reason=none_generated.
         review_lead_status = {
             "coverage_status": "useful",
             "recommended_action": "use_supercontext_packet",
@@ -2336,7 +2336,14 @@ class McpToolsTest(unittest.TestCase):
 
         self.assertLessEqual(len(canonical_json(budgeted)), 10_000)
         self.assertNotIn("review_hypotheses", budgeted)
-        self.assertNotIn("review_hypothesis_status", budgeted)
+        # K: status always present — even when zero hypotheses were generated.
+        status = budgeted.get("review_hypothesis_status")
+        self.assertIsNotNone(status, "review_hypothesis_status must be present even for zero-hypothesis packets")
+        self.assertEqual(status.get("available_count"), 0)
+        self.assertEqual(status.get("returned_count"), 0)
+        self.assertEqual(status.get("answer_packet_returned_count"), 0)
+        self.assertEqual(status.get("truncated_count"), 0)
+        self.assertEqual(status.get("reason"), "none_generated")
 
     def test_reverse_impact_callable_partition_rule(self) -> None:
         from source.kg.query.reverse_impact import _is_callable_symbol
@@ -7309,6 +7316,46 @@ class TestNewHypothesisFamiliesIntegration(unittest.TestCase):
             )
         risk_types = [h["risk_type"] for h in result["review_hypotheses"]]
         self.assertIn("test_locks_in_regression", risk_types)
+
+
+class TestHypothesisStatusE2E(unittest.TestCase):
+    """Task K test 6: E2E call_tool on the fixture snapshot produces review_hypothesis_status with consistent counts."""
+
+    def test_review_hypothesis_status_present_and_consistent_on_fixture(self) -> None:
+        with _fixture_snapshot(upstream_checkout_caller=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                },
+            )
+
+        status = result.get("review_hypothesis_status")
+        self.assertIsNotNone(status, "review_hypothesis_status must be present in live call_tool result")
+        available = status.get("available_count", -1)
+        returned = status.get("returned_count", -1)
+        mirror_count = status.get("answer_packet_returned_count", -1)
+        truncated = status.get("truncated_count", -1)
+
+        # Counts must be non-negative integers
+        self.assertGreaterEqual(available, 0, "available_count must be >= 0")
+        self.assertGreaterEqual(returned, 0, "returned_count must be >= 0")
+        self.assertGreaterEqual(mirror_count, 0, "answer_packet_returned_count must be >= 0")
+        # truncated_count = available - returned
+        self.assertEqual(truncated, available - returned, "truncated_count must equal available_count - returned_count")
+        # returned <= available
+        self.assertLessEqual(returned, available, "returned_count must not exceed available_count")
+        # mirror <= returned
+        self.assertLessEqual(mirror_count, returned, "answer_packet_returned_count must not exceed returned_count")
+        # reason consistency
+        reason = status.get("reason")
+        if truncated == 0 and mirror_count == returned:
+            self.assertIsNone(reason, f"reason must be null when nothing truncated, got {reason!r}")
+        if truncated > 0 or mirror_count < returned:
+            self.assertIn(reason, ("budget", "none_generated", "low_coverage"), f"unexpected reason: {reason!r}")
 
 
 if __name__ == "__main__":

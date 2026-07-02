@@ -6,6 +6,11 @@
 4. Whitespace tokens must be split into individual inspection terms
 5. Hard-cap guarantee must hold even when no rows are evictable after status attach
 6. Stale returned counts after floor eviction must be resynced
+7. (J/K) Mirror floor: top_review_hypotheses mirror always has floor-of-1 under compaction
+8. (J/K) Comfortable budget: mirror keeps up to 3, status reason null, counts equal
+9. (J/K) Lead-only fallback: status present with answer_packet_returned_count == 0 when no mirror
+10. (J/K) Zero-hypotheses useful packet: status available=0 returned=0 reason=none_generated
+11. (J/K) Low-coverage paths: non-stylesheet gets reason=low_coverage; stylesheet keeps hyp with reason budget/null
 """
 from __future__ import annotations
 
@@ -414,6 +419,327 @@ class TestFloorEvictionResyncsReturnedCounts(unittest.TestCase):
         status = result.get("review_lead_status") or {}
         available = status.get("available")
         self.assertEqual(available, original_available, "available counts must not be mutated by floor eviction")
+
+
+def _make_hypothesis(risk_type: str, index: int, n_callers: int = 5) -> dict:
+    lead_ids = [f"lead:direct_caller:c{i:03d}" for i in range(n_callers)]
+    return {
+        "hypothesis_id": hypothesis_stable_id(risk_type, lead_ids, [{"repo": "svc", "path": f"src/f{index}.py"}]),
+        "risk_type": risk_type,
+        "confidence": "strong",
+        "why": f"Why reason {index}",
+        "evidence_refs": [{"repo": "svc", "path": f"src/f{index}.py", "line_start": index * 10, "line_end": index * 10 + 5}],
+        "source_checks": [f"check{index}"],
+        "supporting_lead_ids": lead_ids,
+    }
+
+
+def _make_heavy_packet(n_hyps: int, n_callers: int) -> tuple[dict, list[dict]]:
+    """Build a packet with n_hyps hypotheses, answer_packet.top_review_hypotheses, and n_callers caller rows."""
+    callers = [
+        {
+            "lead_id": f"lead:direct_caller:c{i:03d}",
+            "lead_kind": "direct_caller",
+            "repo": "svc",
+            "path": f"src/caller_{i}.py",
+            "line_start": i * 10,
+            "line_end": i * 10 + 5,
+            "subject": f"mod.caller_{i}",
+            "object": "mod.target",
+            "why": "x" * 200,
+        }
+        for i in range(n_callers)
+    ]
+    hypotheses = [_make_hypothesis("direct_call_contract_drift", i) for i in range(n_hyps)]
+    review_leads = {
+        "changed_symbols": [],
+        "direct_callers": callers,
+        "direct_callees": [],
+        "transitive_callers": [],
+        "source_coordinates": [],
+    }
+    review_answer_packet: dict = {
+        "status": "found",
+        "top_diff_anchors": [],
+        "top_changed_symbols": [],
+        "top_direct_callers": [],
+        "top_direct_callees": [],
+        "top_transitive_callers": [],
+        "top_review_hypotheses": list(hypotheses),
+    }
+    original_hyps = list(hypotheses)
+    packet = {
+        "status": "found",
+        "review_hypotheses": list(hypotheses),
+        "review_answer_packet": review_answer_packet,
+        "review_leads": review_leads,
+        "review_lead_status": {
+            "coverage_status": "useful",
+            "available": {"direct_caller_count": n_callers},
+            "returned": {"direct_caller_count": n_callers},
+            "changed_symbol_count": 0,
+            "direct_impact_count": n_callers,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+        },
+        "output_budget": {"truncated": False, "truncated_sections": []},
+    }
+    return packet, original_hyps
+
+
+class TestJMirrorFloorHeavyCompaction(unittest.TestCase):
+    """Task J: mirror floor survives heavy compaction; Task K: rich status counts are consistent."""
+
+    def test_mirror_floor_survives_compaction_and_status_consistent(self):
+        # 3 hypotheses, many callers to force budget pressure
+        packet, original_hyps = _make_heavy_packet(n_hyps=3, n_callers=50)
+        full_size = len(canonical_json(packet))
+        # Tight budget — forces compaction
+        tight = full_size // 3
+        result = enforce_review_context_budget(packet, max_chars=tight)
+
+        top_hyps = result.get("review_hypotheses") or []
+        mirror = (result.get("review_answer_packet") or {}).get("top_review_hypotheses") or []
+        status = result.get("review_hypothesis_status")
+
+        # Top-level floor: at least 1 hypothesis
+        self.assertGreaterEqual(len(top_hyps), 1, "top-level review_hypotheses must have floor-of-1")
+        # Mirror floor: at least 1 hypothesis
+        self.assertGreaterEqual(len(mirror), 1, "mirror top_review_hypotheses must have floor-of-1")
+        # Same top hypothesis_id in both lists
+        self.assertEqual(top_hyps[0].get("hypothesis_id"), mirror[0].get("hypothesis_id"), "mirror top hypothesis_id must match top-level")
+        # Packet must not exceed cap
+        self.assertLessEqual(len(canonical_json(result)), tight, "packet must not exceed max_chars after budget")
+        # Status must be present with rich shape
+        self.assertIsNotNone(status, "review_hypothesis_status must be present")
+        self.assertEqual(status.get("available_count"), 3)
+        self.assertGreaterEqual(status.get("returned_count", 0), 1)
+        self.assertGreaterEqual(status.get("answer_packet_returned_count", 0), 1)
+        expected_truncated = status.get("available_count", 0) - status.get("returned_count", 0)
+        self.assertEqual(status.get("truncated_count"), expected_truncated)
+        self.assertEqual(status.get("reason"), "budget")
+
+
+class TestJMirrorFloorComfortableBudget(unittest.TestCase):
+    """Task J/K: comfortable budget → mirror keeps up to 3; status reason null; counts equal."""
+
+    def test_comfortable_budget_mirror_full_and_status_null_reason(self):
+        packet, original_hyps = _make_heavy_packet(n_hyps=3, n_callers=1)
+        # Ample budget
+        ample = len(canonical_json(packet)) + 10_000
+        result = enforce_review_context_budget(packet, max_chars=ample)
+
+        top_hyps = result.get("review_hypotheses") or []
+        mirror = (result.get("review_answer_packet") or {}).get("top_review_hypotheses") or []
+        status = result.get("review_hypothesis_status")
+
+        self.assertEqual(len(top_hyps), 3, "all 3 hypotheses should be returned under comfortable budget")
+        self.assertEqual(len(mirror), 3, "mirror should return all 3 under comfortable budget")
+        self.assertIsNotNone(status, "review_hypothesis_status must always be present on useful packets")
+        self.assertEqual(status.get("available_count"), 3)
+        self.assertEqual(status.get("returned_count"), 3)
+        self.assertEqual(status.get("answer_packet_returned_count"), 3)
+        self.assertEqual(status.get("truncated_count"), 0)
+        self.assertIsNone(status.get("reason"), "reason should be null when all returned everywhere")
+
+
+class TestJMirrorFloorLeadOnlyFallback(unittest.TestCase):
+    """Task J/K: lead-only fallback: status present; if no answer packet mirror, answer_packet_returned_count == 0 with reason budget."""
+
+    def _build_huge_packet(self, n_hyps: int, n_callers: int) -> tuple[dict, list[dict]]:
+        """Build a packet with extremely fat caller rows to force lead-only path."""
+        callers = [
+            {
+                "lead_id": f"lead:direct_caller:c{i:03d}",
+                "lead_kind": "direct_caller",
+                "repo": "svc",
+                "path": f"src/caller_{i}.py",
+                "line_start": i * 10,
+                "line_end": i * 10 + 5,
+                "subject": f"mod.caller_{i}",
+                "object": "mod.target",
+                "why": "x" * 2000,
+                "evidence": "z" * 2000,
+            }
+            for i in range(n_callers)
+        ]
+        hypotheses = [_make_hypothesis("direct_call_contract_drift", i) for i in range(n_hyps)]
+        review_leads = {
+            "changed_symbols": [],
+            "direct_callers": callers,
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+        }
+        review_answer_packet: dict = {
+            "status": "found",
+            "top_diff_anchors": [],
+            "top_changed_symbols": [],
+            "top_direct_callers": callers[:5],
+            "top_direct_callees": [],
+            "top_transitive_callers": [],
+            "top_review_hypotheses": list(hypotheses),
+        }
+        packet = {
+            "status": "found",
+            "review_hypotheses": list(hypotheses),
+            "review_answer_packet": review_answer_packet,
+            "review_leads": review_leads,
+            "review_lead_status": {
+                "coverage_status": "useful",
+                "available": {"direct_caller_count": n_callers},
+                "returned": {"direct_caller_count": n_callers},
+                "changed_symbol_count": 0,
+                "direct_impact_count": n_callers,
+                "transitive_impact_count": 0,
+                "source_coordinate_count": 0,
+            },
+            "output_budget": {"truncated": False, "truncated_sections": []},
+        }
+        return packet, list(hypotheses)
+
+    def test_lead_only_path_status_present(self):
+        packet, original_hyps = self._build_huge_packet(n_hyps=2, n_callers=30)
+        full_size = len(canonical_json(packet))
+        # Very tight budget to force lead-only path
+        very_tight = full_size // 20
+        result = enforce_review_context_budget(packet, max_chars=very_tight)
+
+        status = result.get("review_hypothesis_status")
+        self.assertIsNotNone(status, "review_hypothesis_status must be present even in lead-only path")
+        # answer_packet_returned_count must be defined
+        self.assertIn("answer_packet_returned_count", status)
+        # If mirror is empty, reason should be budget
+        mirror_count = status.get("answer_packet_returned_count", -1)
+        if mirror_count == 0:
+            self.assertEqual(status.get("reason"), "budget", "reason must be budget when mirror is empty")
+        # Packet must not exceed cap
+        self.assertLessEqual(len(canonical_json(result)), very_tight, "packet must not exceed max_chars")
+
+
+class TestKZeroHypothesesStatus(unittest.TestCase):
+    """Task K: zero-hypotheses useful packet → status available=0, returned=0, reason=none_generated."""
+
+    def test_zero_hypotheses_useful_packet_status(self):
+        # Useful packet (has callers) but no hypotheses generated
+        callers = [
+            {
+                "lead_id": f"lead:direct_caller:c{i:03d}",
+                "lead_kind": "direct_caller",
+                "repo": "svc",
+                "path": f"src/caller_{i}.py",
+                "line_start": i * 10,
+                "line_end": i * 10 + 5,
+                "subject": f"mod.caller_{i}",
+                "object": "mod.target",
+            }
+            for i in range(3)
+        ]
+        review_leads = {"changed_symbols": [], "direct_callers": callers, "direct_callees": [], "transitive_callers": [], "source_coordinates": []}
+        packet = {
+            "status": "found",
+            "review_hypotheses": [],
+            "review_answer_packet": {
+                "status": "found",
+                "top_diff_anchors": [],
+                "top_changed_symbols": [],
+                "top_direct_callers": callers,
+                "top_direct_callees": [],
+                "top_transitive_callers": [],
+                "top_review_hypotheses": [],
+            },
+            "review_leads": review_leads,
+            "review_lead_status": {
+                "coverage_status": "useful",
+                "available": {"direct_caller_count": 3},
+                "returned": {"direct_caller_count": 3},
+                "changed_symbol_count": 0,
+                "direct_impact_count": 3,
+                "transitive_impact_count": 0,
+                "source_coordinate_count": 0,
+            },
+        }
+        original_hyps: list = []
+        ample = len(canonical_json(packet)) + 10_000
+        _finalize_review_hypothesis_budget(packet, original_hyps, max_chars=ample)
+
+        status = packet.get("review_hypothesis_status")
+        self.assertIsNotNone(status, "review_hypothesis_status must be present on zero-hypothesis useful packets")
+        self.assertEqual(status.get("available_count"), 0)
+        self.assertEqual(status.get("returned_count"), 0)
+        self.assertEqual(status.get("answer_packet_returned_count"), 0)
+        self.assertEqual(status.get("truncated_count"), 0)
+        self.assertEqual(status.get("reason"), "none_generated")
+        # No fake hypothesis rows injected
+        self.assertEqual(packet.get("review_hypotheses"), [])
+        mirror = (packet.get("review_answer_packet") or {}).get("top_review_hypotheses")
+        self.assertEqual(mirror, [])
+
+
+class TestKLowCoverageHypothesisStatus(unittest.TestCase):
+    """Task K: low-coverage non-stylesheet → reason=low_coverage; stylesheet hyp keeps reason null/budget."""
+
+    def _make_low_coverage_packet(self, with_stylesheet_hyp: bool) -> dict:
+        stylesheet_hyp = {
+            "hypothesis_id": hypothesis_stable_id("low_coverage_stylesheet_gap", [], []),
+            "risk_type": "low_coverage_stylesheet_gap",
+            "confidence": "weak",
+            "why": "Stylesheet gap",
+            "evidence_refs": [],
+            "source_checks": [],
+            "supporting_lead_ids": [],
+        }
+        hyps = [stylesheet_hyp] if with_stylesheet_hyp else []
+        return {
+            "status": "found",
+            "review_hypotheses": list(hyps),
+            "review_answer_packet": {
+                "status": "found",
+                "top_diff_anchors": [],
+                "top_changed_symbols": [],
+                "top_direct_callers": [],
+                "top_direct_callees": [],
+                "top_transitive_callers": [],
+                "top_review_hypotheses": list(hyps),
+            },
+            "review_leads": {"changed_symbols": [], "direct_callers": [], "direct_callees": [], "transitive_callers": [], "source_coordinates": []},
+            "review_lead_status": {
+                "coverage_status": "low_coverage",
+                "available": {"direct_caller_count": 0},
+                "returned": {"direct_caller_count": 0},
+                "changed_symbol_count": 0,
+                "direct_impact_count": 0,
+                "transitive_impact_count": 0,
+                "source_coordinate_count": 0,
+            },
+        }
+
+    def test_low_coverage_non_stylesheet_status(self):
+        packet = self._make_low_coverage_packet(with_stylesheet_hyp=False)
+        original_hyps: list = []
+        ample = len(canonical_json(packet)) + 10_000
+        _finalize_review_hypothesis_budget(packet, original_hyps, max_chars=ample)
+
+        status = packet.get("review_hypothesis_status")
+        self.assertIsNotNone(status, "review_hypothesis_status must be present on low-coverage packets")
+        self.assertEqual(status.get("reason"), "low_coverage")
+        self.assertEqual(status.get("available_count"), 0)
+        self.assertEqual(status.get("returned_count"), 0)
+        self.assertEqual(status.get("answer_packet_returned_count"), 0)
+
+    def test_low_coverage_stylesheet_hyp_status(self):
+        packet = self._make_low_coverage_packet(with_stylesheet_hyp=True)
+        original_hyps = list(packet["review_hypotheses"])
+        ample = len(canonical_json(packet)) + 10_000
+        _finalize_review_hypothesis_budget(packet, original_hyps, max_chars=ample)
+
+        status = packet.get("review_hypothesis_status")
+        self.assertIsNotNone(status, "review_hypothesis_status must be present on low-coverage stylesheet packets")
+        # 1 hypothesis available and returned → reason null or budget (all returned → null)
+        self.assertEqual(status.get("available_count"), 1)
+        self.assertEqual(status.get("returned_count"), 1)
+        reason = status.get("reason")
+        self.assertIn(reason, (None, "budget"), f"expected reason null or budget, got {reason!r}")
 
 
 if __name__ == "__main__":

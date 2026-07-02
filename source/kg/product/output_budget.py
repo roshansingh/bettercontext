@@ -489,13 +489,14 @@ def enforce_review_context_budget(
       7. broad application/runtime/framework context
     """
     measured = len(canonical_json(result))
-    if measured <= max_chars:
-        return result
-    # Record original hypotheses before any compaction so the floor and status helpers can
-    # reference the pre-budget list throughout all paths.
     original_hypotheses = [
         row for row in _list_value(result.get("review_hypotheses")) if isinstance(row, dict)
     ]
+    if measured <= max_chars:
+        # Sync mirror and emit status even when no compaction is needed so every packet
+        # carries review_hypothesis_status regardless of packet size.
+        _finalize_review_hypothesis_budget(result, original_hypotheses, max_chars=max_chars)
+        return result
     for row_limit in _REVIEW_DETAIL_ROW_LIMITS:
         compact, truncated_sections = _compact_review_detail(result, limit=row_limit)
         _attach_detail_budget_metadata(
@@ -2786,9 +2787,10 @@ def _protect_review_hypotheses_floor(
 
     Called after hard-cap or signal-cap passes that may have evicted all hypotheses while
     keeping broad context rows. If the packet has no hypotheses but the original had some,
-    inserts the top compacted hypothesis and, when the insertion pushes the packet over
-    ``max_chars``, evicts rows from the largest other row list until it fits again — broad
-    context is dropped before the last hypothesis, per the review budget priority order.
+    inserts the top compacted hypothesis in both the top-level list and the answer-packet
+    mirror, and, when the insertion pushes the packet over ``max_chars``, evicts rows from
+    the largest other row list until it fits again — broad context is dropped before the
+    last hypothesis, per the review budget priority order.
     """
     if not original_hypotheses:
         return result
@@ -2799,15 +2801,23 @@ def _protect_review_hypotheses_floor(
     top_compact = _compact_review_hypothesis(original_hypotheses[0])
     result = deepcopy(result)
     result["review_hypotheses"] = [top_compact]
+    # Restore mirror floor too.
+    answer_packet = result.get("review_answer_packet")
+    if isinstance(answer_packet, dict):
+        mirror = answer_packet.get("top_review_hypotheses")
+        if not isinstance(mirror, list) or not mirror:
+            answer_packet["top_review_hypotheses"] = [top_compact]
     truncated: set[str] = set()
     budget = result.get("output_budget")
     if isinstance(budget, dict):
         truncated = set(budget.get("truncated_sections") or [])
         if len(original_hypotheses) > 1:
             truncated.add("review_hypotheses")
+            truncated.add("review_answer_packet.top_review_hypotheses")
         else:
             truncated.discard("review_hypotheses")
-    # Compensating eviction: the restored hypothesis must never push the packet over the cap.
+            truncated.discard("review_answer_packet.top_review_hypotheses")
+    # Compensating eviction: the restored hypotheses must never push the packet over the cap.
     evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
     truncated |= evicted
     if evicted:
@@ -2820,18 +2830,25 @@ def _protect_review_hypotheses_floor(
 def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]:
     """Evict rows from the largest non-hypothesis row list until the packet fits.
 
-    The top-level ``review_hypotheses`` list is protected: broad context rows are dropped
-    before the last hypothesis, per the review budget priority order. Mutates ``result``
-    in place and returns the labels of lists that lost rows.
+    Both ``review_hypotheses`` and ``review_answer_packet.top_review_hypotheses`` are
+    protected: broad context rows are dropped before the last hypothesis, per the review
+    budget priority order. Mutates ``result`` in place and returns the labels of lists that
+    lost rows.
     """
     evicted: set[str] = set()
     guard = 0
     while _current_chars(result) > max_chars and guard < 5_000:
         guard += 1
         protected = result.pop("review_hypotheses", None)
+        answer_packet = result.get("review_answer_packet")
+        protected_mirror = None
+        if isinstance(answer_packet, dict):
+            protected_mirror = answer_packet.pop("top_review_hypotheses", None)
         target = _largest_row_list(result)
         if protected is not None:
             result["review_hypotheses"] = protected
+        if isinstance(answer_packet, dict) and protected_mirror is not None:
+            answer_packet["top_review_hypotheses"] = protected_mirror
         if target is None:
             break
         label, rows = target
@@ -2841,23 +2858,46 @@ def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]
 
 
 def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: list[JsonObject]) -> None:
-    """Add review_hypothesis_status when returned count < available count.
+    """Write review_hypothesis_status in-place on result.
 
-    Writes the status dict in-place on result. No-op when zero hypotheses were generated
-    (available_count = 0) or when all generated hypotheses are returned.
+    Always emits the status dict so consumers can distinguish none-generated, budget-dropped,
+    mirror-only-dropped, and low-coverage paths without inspecting truncated_sections.
+
+    Fields:
+      available_count — hypotheses generated pre-budget
+      returned_count — top-level survivors
+      answer_packet_returned_count — mirror survivors in review_answer_packet.top_review_hypotheses
+      truncated_count — available - returned
+      reason — "none_generated" | "budget" | "low_coverage" | null
     """
     available = len(original_hypotheses)
-    if available == 0:
-        return
     returned = len([h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)])
-    if returned >= available:
-        return
+    answer_packet = result.get("review_answer_packet")
+    if isinstance(answer_packet, dict):
+        mirror_hyps = answer_packet.get("top_review_hypotheses")
+        mirror_count = len([h for h in _list_value(mirror_hyps) if isinstance(h, dict)])
+    else:
+        mirror_count = 0
+    truncated_count = available - returned
+    coverage_status = ""
+    lead_status = result.get("review_lead_status")
+    if isinstance(lead_status, dict):
+        coverage_status = lead_status.get("coverage_status") or ""
+    if available == 0 and coverage_status == "low_coverage":
+        reason: str | None = "low_coverage"
+    elif available == 0:
+        reason = "none_generated"
+    elif truncated_count > 0 or mirror_count < returned:
+        reason = "budget"
+    else:
+        reason = None
     result["review_hypothesis_status"] = {
         "available_count": available,
         "returned_count": returned,
+        "answer_packet_returned_count": mirror_count,
+        "truncated_count": truncated_count,
+        "reason": reason,
     }
-    if returned == 0:
-        result["review_hypothesis_status"]["reason"] = "omitted_due_to_budget"
 
 
 def _collect_surviving_lead_ids(result: JsonObject) -> set[str]:
@@ -2909,12 +2949,15 @@ def _reconcile_hypothesis_lead_ids(result: JsonObject) -> None:
 def _finalize_review_hypothesis_budget(
     result: JsonObject, original_hypotheses: list[JsonObject], *, max_chars: int
 ) -> None:
-    """Attach review_hypothesis_status and keep the packet under the cap.
+    """Sync the answer-packet mirror, attach review_hypothesis_status, and keep under the cap.
 
     The status metadata is added after the budget passes measured the packet, so its extra
     chars must be paid for by evicting broad rows — never by exceeding the cap and never by
     dropping the protected hypotheses. Mutates ``result`` in place.
     """
+    # Sync mirror within budget: keep as many top-level hypotheses as fit in the mirror,
+    # starting from the highest-ranked (first). If none fit, mirror is empty — recorded in status.
+    _sync_review_hypothesis_mirror_within_budget(result, max_chars=max_chars)
     _attach_review_hypothesis_status(result, original_hypotheses)
     # The truncated_sections bookkeeping itself costs chars, so iterate until stable.
     for _ in range(5):
@@ -2922,6 +2965,7 @@ def _finalize_review_hypothesis_budget(
         if not evicted:
             break
         _sync_review_lead_status_from_packet(result)
+        _attach_review_hypothesis_status(result, original_hypotheses)
         budget = result.get("output_budget")
         if isinstance(budget, dict):
             budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
@@ -2932,6 +2976,35 @@ def _finalize_review_hypothesis_budget(
     # After all eviction is complete, drop stale lead IDs from hypotheses. hypothesis_id
     # is intentionally not recomputed — it was stamped at producer time from the pre-budget set.
     _reconcile_hypothesis_lead_ids(result)
+
+
+_REVIEW_HYPOTHESIS_MIRROR_CAP = 3
+
+
+def _sync_review_hypothesis_mirror_within_budget(result: JsonObject, *, max_chars: int) -> None:
+    """Sync the mirror, adding rows only while the packet stays within max_chars.
+
+    Starts with an empty mirror and adds compacted top-level hypotheses one at a time,
+    stopping when the next row would exceed the cap. This keeps the mirror in sync with the
+    top-level list without growing the packet beyond the budget.
+    """
+    answer_packet = result.get("review_answer_packet")
+    if not isinstance(answer_packet, dict):
+        return
+    top_hyps = result.get("review_hypotheses")
+    if not isinstance(top_hyps, list):
+        answer_packet["top_review_hypotheses"] = []
+        return
+    # Start by clearing any existing mirror rows (they may be stale from a prior pass).
+    answer_packet["top_review_hypotheses"] = []
+    for hyp in top_hyps[:_REVIEW_HYPOTHESIS_MIRROR_CAP]:
+        if not isinstance(hyp, dict):
+            continue
+        compact_hyp = _compact_review_hypothesis(hyp)
+        answer_packet["top_review_hypotheses"].append(compact_hyp)
+        if _current_chars(result) > max_chars:
+            answer_packet["top_review_hypotheses"].pop()
+            break
 
 
 def _compact_diff_anchor(value: object) -> JsonObject:
