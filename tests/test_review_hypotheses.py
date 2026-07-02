@@ -187,6 +187,30 @@ class TestComponentListRenderIdentityDrift(unittest.TestCase):
         risk_types = [h["risk_type"] for h in hypotheses]
         self.assertNotIn("component_list_render_identity_drift", risk_types)
 
+    def test_supporting_lead_ids_contain_only_component_touching_leads(self):
+        # Component symbol lead-comp + non-component symbol lead-util; only edge touches component.
+        # supporting_lead_ids must contain lead-comp and lead-edge-comp but NOT lead-util.
+        hypotheses = self._call(
+            changed_files=["src/Widget.tsx", "src/utils.tsx"],
+            changed_symbols=[
+                _sym("Widget", "src/Widget.tsx", kind="class", lead_id="lead-comp"),
+                _sym("formatData", "src/utils.tsx", lead_id="lead-util"),
+            ],
+            direct_callees=[_edge("Widget", "Child", "lead-edge-comp")],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-comp", "path": "src/Widget.tsx"},
+                    {"lead_id": "lead-util", "path": "src/utils.tsx"},
+                ],
+                "direct_callees": [{"lead_id": "lead-edge-comp", "subject": "mod.Widget", "object": "mod.Child"}],
+            },
+        )
+        hyp = next(h for h in hypotheses if h["risk_type"] == "component_list_render_identity_drift")
+        slids = set(hyp["supporting_lead_ids"])
+        self.assertIn("lead-comp", slids)
+        self.assertIn("lead-edge-comp", slids)
+        self.assertNotIn("lead-util", slids)
+
     def test_negative_low_coverage_does_not_emit(self):
         # low_coverage gate must suppress new families
         hypotheses = self._call(

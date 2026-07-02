@@ -512,8 +512,27 @@ def _component_list_render_identity_drift(
                 ref[key] = val
         if ref:
             evidence_refs.append(ref)
-    # supporting_lead_ids from leads that involve component-touching evidence.
-    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "direct_callers", "direct_callees"))
+    # supporting_lead_ids: component symbol rows + edge rows touching a component name.
+    lead_ids: list[str] = []
+    for row in review_leads.get("changed_symbols") or []:
+        if not isinstance(row, dict):
+            continue
+        lid = row.get("lead_id")
+        if not isinstance(lid, str) or not lid:
+            continue
+        # match by path to component symbol paths
+        row_path = row.get("path") or ""
+        if any(row_path == (s.get("path") or "") for s in component_syms):
+            lead_ids.append(lid)
+    for field in ("direct_callers", "direct_callees"):
+        for row in review_leads.get(field) or []:
+            if not isinstance(row, dict):
+                continue
+            lid = row.get("lead_id")
+            if not isinstance(lid, str) or not lid:
+                continue
+            if _edges_touch_names([row], component_names):
+                lead_ids.append(lid)
     confidence = "medium" if lead_ids else "weak"
     source_checks = [
         "Inspect changed component render paths for list keys and branch parity.",
@@ -581,7 +600,31 @@ def _hook_gate_render_mismatch(
                 ref[key] = val
         if ref:
             evidence_refs.append(ref)
-    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "direct_callers", "direct_callees"))
+    # supporting_lead_ids: hook symbol rows + edge rows touching a hook name with component/hook endpoint.
+    lead_ids = []
+    for row in review_leads.get("changed_symbols") or []:
+        if not isinstance(row, dict):
+            continue
+        lid = row.get("lead_id")
+        if not isinstance(lid, str) or not lid:
+            continue
+        row_path = row.get("path") or ""
+        if any(row_path == (s.get("path") or "") for s in hook_syms):
+            lead_ids.append(lid)
+    for field in ("direct_callers", "direct_callees"):
+        for row in review_leads.get(field) or []:
+            if not isinstance(row, dict):
+                continue
+            lid = row.get("lead_id")
+            if not isinstance(lid, str) or not lid:
+                continue
+            subj = str(row.get("subject") or "")
+            obj_ = str(row.get("object") or "")
+            subj_seg = subj.rsplit(".", 1)[-1]
+            obj_seg = obj_.rsplit(".", 1)[-1]
+            hook_touched = (subj in hook_names or subj_seg in hook_names or obj_ in hook_names or obj_seg in hook_names)
+            if hook_touched:
+                lead_ids.append(lid)
     confidence = "medium" if has_consumer_edge else "weak"
     source_checks = [
         "Compare hook return contract against each consuming call site's usage and render gate.",
@@ -629,7 +672,26 @@ def _test_locks_in_regression(
         "Verify updated tests exercise behavior (interaction and outcome), not just presence or text.",
         "Check whether test assertions reflect new invariants or lock in a regression.",
     ]
-    lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
+    # supporting_lead_ids: non-test symbol rows + edge rows touching a non-test symbol name.
+    lead_ids = []
+    for row in review_leads.get("changed_symbols") or []:
+        if not isinstance(row, dict):
+            continue
+        lid = row.get("lead_id")
+        if not isinstance(lid, str) or not lid:
+            continue
+        row_path = row.get("path") or ""
+        if any(row_path == (s.get("path") or "") for s in non_test_syms):
+            lead_ids.append(lid)
+    for field in ("direct_callers", "direct_callees"):
+        for row in review_leads.get(field) or []:
+            if not isinstance(row, dict):
+                continue
+            lid = row.get("lead_id")
+            if not isinstance(lid, str) or not lid:
+                continue
+            if _edges_touch_names([row], non_test_names):
+                lead_ids.append(lid)
     return _make_hypothesis(
         risk_type="test_locks_in_regression",
         confidence="weak",
