@@ -3190,7 +3190,10 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
         },
         "repo_dependencies": repo_dependencies,
         "source_coordinates": stamped_source_coordinates,
-        "review_hypotheses": [],
+        "review_hypotheses": [
+            h for h in (result.get("review_hypotheses") or [])
+            if isinstance(h, dict) and h.get("risk_type") == "low_coverage_stylesheet_gap"
+        ],
         "answerability": answerability,
         "coverage_warnings": result.get("coverage_warnings", []),
         "unsupported_scopes": result.get("unsupported_scopes", []),

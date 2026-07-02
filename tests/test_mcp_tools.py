@@ -5291,6 +5291,41 @@ class McpToolsTest(unittest.TestCase):
             )
         )
 
+    def test_review_context_low_coverage_non_stylesheet_emits_empty_hypotheses(self) -> None:
+        with _fixture_snapshot(app_surface=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/config.yaml"],
+                    "changed_ranges": [{"path": "payments/config.yaml", "start_line": 4, "end_line": 6}],
+                    "limit": 10,
+                },
+            )
+        self.assertEqual(result["review_lead_status"]["coverage_status"], "low_coverage")
+        self.assertEqual(result["review_hypotheses"], [])
+
+    def test_review_context_stylesheet_low_coverage_emits_gap_hypothesis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            from source.kg.core.store import JsonlKgStore
+            JsonlKgStore(root).write(entities=[], facts=[], evidence=[], coverage=[], manifest={"version": 1})
+            from source.kg.query.snapshot import KgSnapshot as _KgSnapshot
+            kg = _KgSnapshot(root)
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "styles",
+                    "changed_files": ["app/assets/stylesheets/buttons.scss"],
+                    "changed_ranges": [{"path": "app/assets/stylesheets/buttons.scss", "start_line": 1, "end_line": 20}],
+                },
+            )
+        self.assertEqual(result["review_lead_status"]["coverage_status"], "low_coverage")
+        self.assertEqual(result["review_hypotheses"][0]["risk_type"], "low_coverage_stylesheet_gap")
+        self.assertIn("stylesheet", result["review_hypotheses"][0]["why"].lower())
+
 
 def _review_context_fixture_with_changed_call_edges() -> KgSnapshot:
     ctx = _fixture_snapshot(upstream_checkout_caller=True)
