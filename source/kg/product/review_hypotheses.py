@@ -13,6 +13,21 @@ _CONFIDENCE_RANK = {"strong": 2, "medium": 1, "weak": 0}
 _FRAMEWORK_IMPACT_KEYS = ("changed_models", "model_fields", "model_relations", "serializers", "views", "tasks")
 _RUNTIME_SURFACE_KEYS = ("endpoints", "endpoint_consumers", "event_channels", "deploy_mappings")
 
+# O2: Specific-class families. Post-1e74bf2 probe evidence (Grafana 106778, limit=25) showed
+# specific families generating on real repos but losing visible slots to generics because
+# generic families (direct_call_contract_drift) accumulate more supporting leads by construction.
+# Stable partition: specific-class first, generic-class second, within each class the existing
+# 4-part comparator order is preserved. Mirror slot selection takes the head of this order,
+# so hook_gate_render_mismatch outranks direct_call_contract_drift in top_review_hypotheses.
+_SPECIFIC_CLASS_FAMILIES: frozenset[str] = frozenset(
+    {
+        "component_list_render_identity_drift",
+        "hook_gate_render_mismatch",
+        "test_locks_in_regression",
+        "low_coverage_stylesheet_gap",
+    }
+)
+
 
 def review_hypotheses_for_context(
     *,
@@ -102,7 +117,13 @@ def review_hypotheses_for_context(
         )
     )
     cap = 5
-    return list(hypotheses[:cap])
+    selected = list(hypotheses[:cap])
+    # O2: Stable partition — specific-class families before generic-class. The 4-part
+    # comparator order is preserved within each class. Mirror slot selection takes the
+    # head of this order, so specific families appear in top_review_hypotheses before generics.
+    specifics = [h for h in selected if str(h.get("risk_type") or "") in _SPECIFIC_CLASS_FAMILIES]
+    generics = [h for h in selected if str(h.get("risk_type") or "") not in _SPECIFIC_CLASS_FAMILIES]
+    return specifics + generics
 
 
 def _has_framework_signal(framework_impact: JsonObject) -> bool:
