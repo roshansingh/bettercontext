@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from source.kg.core.models import JsonObject
+from source.kg.core.models import JsonObject, canonical_json
 from source.kg.query.snapshot import KgSnapshot
 
 # ---------------------------------------------------------------------------
@@ -63,10 +63,8 @@ def _entity_coordinates(entity: JsonObject, snap: KgSnapshot) -> JsonObject:
 # fact_id is stable (models.py:140 — hash of predicate + subject_id + object_id + qualifier),
 # but we key by natural tuple so the contract is explicit and immune to any future ID-scheme change.
 def _fact_natural_key(fact: JsonObject) -> tuple[str, str, str, str]:
-    import json
-
     qualifier = fact.get("qualifier") or {}
-    canonical_q = json.dumps(qualifier, sort_keys=True, separators=(",", ":"))
+    canonical_q = canonical_json(qualifier)
     return (
         str(fact.get("predicate", "")),
         str(fact.get("subject_id", "")),
@@ -81,19 +79,40 @@ class GraphDelta:
 
     added_entities / removed_entities: dict[kind, list[entity_record]], sorted by URN.
     added_facts / removed_facts: list[fact_record], sorted by (predicate, subject_id, object_id).
+    uninstrumented_scopes: deduplicated, sorted list of scope_ref dicts from coverage rows
+        whose state == 'uninstrumented' in either base or head snapshot.
+
+    Attribute-visibility note: this diff operates at identity level.  Attribute-only
+    changes — body edits without qualname change, line-number shifts, property drift — are
+    INVISIBLE as entity changes; body edits surface only indirectly through added/removed
+    fact rows (e.g. CALLS edges added or dropped as a result).  Callers should not interpret
+    an empty entity delta as "nothing changed" without also checking the fact delta.
+
+    Uninstrumented-scope note: an empty entity/fact delta combined with non-empty
+    uninstrumented_scopes must be read as "no change detected WITHIN INSTRUMENTED SCOPE" —
+    changes inside uninstrumented scopes are not visible to this diff.
     """
 
     added_entities: dict[str, list[JsonObject]] = field(default_factory=dict)
     removed_entities: dict[str, list[JsonObject]] = field(default_factory=dict)
     added_facts: list[JsonObject] = field(default_factory=list)
     removed_facts: list[JsonObject] = field(default_factory=list)
+    uninstrumented_scopes: list[JsonObject] = field(default_factory=list)
 
     def summary(self) -> JsonObject:
+        """Return counts of structural changes and uninstrumented scopes.
+
+        When added_entities, removed_entities, added_facts, and removed_facts are all
+        zero but uninstrumented_scopes is non-empty, read the result as "no change
+        detected WITHIN INSTRUMENTED SCOPE" — the delta is silent about uninstrumented
+        languages, paths, or repos.
+        """
         return {
             "added_entities": sum(len(v) for v in self.added_entities.values()),
             "removed_entities": sum(len(v) for v in self.removed_entities.values()),
             "added_facts": len(self.added_facts),
             "removed_facts": len(self.removed_facts),
+            "uninstrumented_scopes": self.uninstrumented_scopes,
         }
 
 
@@ -105,7 +124,17 @@ def diff_snapshots(base: KgSnapshot, head: KgSnapshot) -> GraphDelta:
 
     Evidence rows and timestamps are excluded — they differ across builds by construction.
 
-    Raises ValueError if base and head carry different tenant_ids.
+    Attribute-visibility: identity-level diff only.  Attribute-only changes (body edits
+    without qualname change, line-number shifts, property drift) are invisible as entity
+    changes; body edits surface only indirectly via added/removed fact rows (e.g. CALLS).
+
+    Uninstrumented scopes: coverage rows with state == 'uninstrumented' from base and head
+    are unioned, deduplicated by scope_ref, and surfaced in GraphDelta.uninstrumented_scopes.
+    An empty entity/fact delta combined with non-empty uninstrumented_scopes means "no
+    change detected WITHIN INSTRUMENTED SCOPE" — not "no change."
+
+    Tenant handling: raises ValueError if base and head carry different tenant_ids.
+    When both manifests omit tenant_id (None == None), diff proceeds without error.
     """
     base_tenant = base.manifest.get("tenant_id")
     head_tenant = head.manifest.get("tenant_id")
@@ -157,11 +186,29 @@ def diff_snapshots(base: KgSnapshot, head: KgSnapshot) -> GraphDelta:
         key=lambda f: (str(f.get("predicate", "")), str(f.get("subject_id", "")), str(f.get("object_id", ""))),
     )
 
+    # --- uninstrumented scopes ---
+    # Union coverage rows with state == 'uninstrumented' from both snapshots.
+    # Deduplicate by canonical_json(scope_ref) so identical scopes from base and head
+    # are not double-counted.  Sort for determinism.
+    seen_scope_keys: set[str] = set()
+    uninstrumented_scopes: list[JsonObject] = []
+    for row in list(base.coverage) + list(head.coverage):
+        if row.get("state") != "uninstrumented":
+            continue
+        scope_ref = row.get("scope_ref") or {}
+        key = canonical_json(scope_ref)
+        if key in seen_scope_keys:
+            continue
+        seen_scope_keys.add(key)
+        uninstrumented_scopes.append(scope_ref)
+    uninstrumented_scopes.sort(key=canonical_json)
+
     return GraphDelta(
         added_entities=added_entities,
         removed_entities=removed_entities,
         added_facts=added_facts,
         removed_facts=removed_facts,
+        uninstrumented_scopes=uninstrumented_scopes,
     )
 
 
@@ -266,7 +313,7 @@ def call_edge_delta_for_paths(
     ("../" is NOT stripped; "./x" and "x" match, "../x" and "x" do not).
     Entities without a path property are excluded.
 
-    Output rows (sorted by (change_kind, predicate, subject_id, object_id)):
+    Output rows (sorted by (change_kind, subject_id, object_id)):
       change_kind: "added" | "removed"
       predicate: always "CALLS"
       subject_id / object_id: entity IDs from the respective snapshot

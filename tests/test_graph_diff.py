@@ -26,17 +26,27 @@ def _make_snapshot(
     entities: list[Entity],
     facts: list[Fact],
     evidence: list[Evidence] | None = None,
+    coverage: list[Coverage] | None = None,
 ) -> KgSnapshot:
     root = tmpdir / name
-    coverage: list[Coverage] = []
     JsonlKgStore(root).write(
         entities=entities,
         facts=facts,
         evidence=evidence or [],
-        coverage=coverage,
+        coverage=coverage or [],
         manifest={"version": 1, "tenant_id": TENANT},
     )
     return KgSnapshot(root)
+
+
+def _uninstrumented_coverage(repo: str, language: str, path_prefix: str = ".") -> Coverage:
+    return Coverage(
+        tenant_id=TENANT,
+        predicate="LANGUAGE_SUPPORT",
+        scope_ref={"language": language, "path_prefix": path_prefix, "repo": repo},
+        state="uninstrumented",
+        source_system="repo_discovery",
+    )
 
 
 def _module(repo: str, module: str) -> Entity:
@@ -67,11 +77,13 @@ class TestSelfDiffIsEmpty(unittest.TestCase):
         self.assertEqual(delta.removed_entities, {})
         self.assertEqual(delta.added_facts, [])
         self.assertEqual(delta.removed_facts, [])
+        self.assertEqual(delta.uninstrumented_scopes, [])
         counts = delta.summary()
         self.assertEqual(counts["added_entities"], 0)
         self.assertEqual(counts["removed_entities"], 0)
         self.assertEqual(counts["added_facts"], 0)
         self.assertEqual(counts["removed_facts"], 0)
+        self.assertEqual(counts["uninstrumented_scopes"], [])
 
 
 class TestBasicDiff(unittest.TestCase):
@@ -623,6 +635,76 @@ class TestRemovedTestReferences(unittest.TestCase):
             rows = removed_test_references(delta, base, head)
 
         self.assertEqual(rows, [])
+
+
+class TestUninstrumentedScopes(unittest.TestCase):
+    """GraphDelta.uninstrumented_scopes surfaces state='uninstrumented' coverage rows."""
+
+    def test_uninstrumented_coverage_surfaces_in_summary(self) -> None:
+        """Snapshot pair with an uninstrumented coverage row → scope appears in summary."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            fn_a = _symbol("svc", "svc.core", "alpha")
+            cov = _uninstrumented_coverage("svc", "shell", ".")
+
+            # Both base and head are identical — entity/fact delta is empty.
+            base = _make_snapshot(root, "base", [mod, fn_a], [], coverage=[cov])
+            head = _make_snapshot(root, "head", [mod, fn_a], [], coverage=[cov])
+            delta = diff_snapshots(base, head)
+
+        # Entity and fact delta must be empty (same snapshots).
+        self.assertEqual(delta.added_entities, {})
+        self.assertEqual(delta.removed_entities, {})
+        self.assertEqual(delta.added_facts, [])
+        self.assertEqual(delta.removed_facts, [])
+
+        # Uninstrumented scope must be surfaced.
+        self.assertEqual(len(delta.uninstrumented_scopes), 1)
+        scope = delta.uninstrumented_scopes[0]
+        self.assertEqual(scope["repo"], "svc")
+        self.assertEqual(scope["language"], "shell")
+
+        # summary() must carry the same scope.
+        counts = delta.summary()
+        self.assertEqual(len(counts["uninstrumented_scopes"]), 1)
+        # Non-vacuous: confirm the assertion actually executes on a live value.
+        self.assertIsInstance(counts["uninstrumented_scopes"][0], dict)
+
+    def test_no_uninstrumented_coverage_gives_empty_list(self) -> None:
+        """Pair without uninstrumented rows → uninstrumented_scopes is empty."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            fn_a = _symbol("svc", "svc.core", "alpha")
+            # instrumented coverage row — must NOT appear in uninstrumented_scopes.
+            instr_cov = Coverage(
+                tenant_id=TENANT,
+                predicate="LANGUAGE_SUPPORT",
+                scope_ref={"language": "python", "path_prefix": ".", "repo": "svc"},
+                state="instrumented",
+                source_system="repo_discovery",
+            )
+
+            snap = _make_snapshot(root, "snap", [mod, fn_a], [], coverage=[instr_cov])
+            delta = diff_snapshots(snap, snap)
+
+        self.assertEqual(delta.uninstrumented_scopes, [])
+        self.assertEqual(delta.summary()["uninstrumented_scopes"], [])
+
+    def test_deduplication_across_base_and_head(self) -> None:
+        """Same uninstrumented scope in both base and head appears only once."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            fn_a = _symbol("svc", "svc.core", "alpha")
+            cov = _uninstrumented_coverage("svc", "shell", ".")
+
+            base = _make_snapshot(root, "base", [mod, fn_a], [], coverage=[cov])
+            head = _make_snapshot(root, "head", [mod, fn_a], [], coverage=[cov])
+            delta = diff_snapshots(base, head)
+
+        self.assertEqual(len(delta.uninstrumented_scopes), 1)
 
 
 if __name__ == "__main__":
