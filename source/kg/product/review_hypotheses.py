@@ -13,20 +13,6 @@ _CONFIDENCE_RANK = {"strong": 2, "medium": 1, "weak": 0}
 _FRAMEWORK_IMPACT_KEYS = ("changed_models", "model_fields", "model_relations", "serializers", "views", "tasks")
 _RUNTIME_SURFACE_KEYS = ("endpoints", "endpoint_consumers", "event_channels", "deploy_mappings")
 
-# N3: Specific-class families. Generic families structurally accumulate more supporting
-# leads, so pure lead-count ranking starves actionable specific families. When truncating
-# to N >= 2 and any specific-class hypothesis was generated but none made the top N,
-# replace the LAST generic slot with the highest-ranked specific-class hypothesis.
-# Deterministic (stable sort + first-match), at most one substitution.
-_SPECIFIC_CLASS_FAMILIES: frozenset[str] = frozenset(
-    {
-        "component_list_render_identity_drift",
-        "hook_gate_render_mismatch",
-        "test_locks_in_regression",
-        "low_coverage_stylesheet_gap",
-    }
-)
-
 
 def review_hypotheses_for_context(
     *,
@@ -116,28 +102,7 @@ def review_hypotheses_for_context(
         )
     )
     cap = 5
-    selected = list(hypotheses[:cap])
-    # N3: Family-diversity substitution at truncation time only.
-    # When truncating to N >= 2 and a specific-class hypothesis was generated but none made
-    # the top N, replace the LAST generic slot with the highest-ranked specific hypothesis.
-    # The comparator is unchanged; this is a single post-sort substitution, deterministic.
-    if len(selected) >= 2 and len(hypotheses) > len(selected):
-        selected_types = {str(h.get("risk_type") or "") for h in selected}
-        has_specific = any(rt in _SPECIFIC_CLASS_FAMILIES for rt in selected_types)
-        if not has_specific:
-            # Find the highest-ranked specific-class hypothesis not already in selected.
-            specific_candidate: JsonObject | None = None
-            for h in hypotheses[len(selected) :]:
-                if str(h.get("risk_type") or "") in _SPECIFIC_CLASS_FAMILIES:
-                    specific_candidate = h
-                    break
-            if specific_candidate is not None:
-                # Replace the last generic (non-specific) slot in selected.
-                for i in range(len(selected) - 1, -1, -1):
-                    if str(selected[i].get("risk_type") or "") not in _SPECIFIC_CLASS_FAMILIES:
-                        selected[i] = specific_candidate
-                        break
-    return selected
+    return list(hypotheses[:cap])
 
 
 def _has_framework_signal(framework_impact: JsonObject) -> bool:
