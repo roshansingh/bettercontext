@@ -799,11 +799,10 @@ def _test_locks_in_regression(
 
 
 def _changed_symbol_entity_ids(changed_symbols: list[JsonObject]) -> set[str]:
-    """Return the set of entity_ids (subject_id) for changed-symbol rows.
+    """Return the set of entity_ids for changed-symbol rows.
 
     Symbol rows from _symbol_result carry 'entity_id' directly.  Synthetic
-    test rows may omit it.  We also index by (repo, path, qualname) so that
-    support-fact subjects without an entity_id can still be matched.
+    test rows may omit it; those rows simply contribute nothing to the set.
     """
     ids: set[str] = set()
     for sym in changed_symbols:
@@ -879,8 +878,6 @@ def _evidence_refs_from_risk_signals(signals: list[JsonObject]) -> list[JsonObje
 def _lead_ids_for_signal_subjects(
     signals: list[JsonObject],
     changed_symbols: list[JsonObject],
-    direct_callers: list[JsonObject],
-    direct_callees: list[JsonObject],
     review_leads: JsonObject,
 ) -> list[str]:
     """Return lead_ids from changed_symbols whose path/entity matches a signal subject."""
@@ -964,7 +961,7 @@ def _async_side_effect_lifecycle_drift(
     risk_signals: list[JsonObject],
     review_leads: JsonObject,
 ) -> JsonObject | None:
-    """Trigger: >=1 code_risk_signal with async-lifecycle family on changed symbols/files."""
+    """Trigger: >=1 code_risk_signal with async-lifecycle family on changed symbols (by entity_id or path)."""
     changed_entity_ids = _changed_symbol_entity_ids(changed_symbols)
     changed_paths = _changed_symbol_paths(changed_symbols)
     matching = [
@@ -976,7 +973,7 @@ def _async_side_effect_lifecycle_drift(
         return None
     evidence_refs = _evidence_refs_from_risk_signals(matching)
     lead_ids = _lead_ids_for_signal_subjects(
-        matching, changed_symbols, direct_callers, direct_callees, review_leads
+        matching, changed_symbols, review_leads
     )
     has_direct_edge = bool(direct_callers or direct_callees)
     confidence = "medium" if (lead_ids and has_direct_edge) else "weak"
@@ -1007,7 +1004,7 @@ def _swallowed_exception_state_drift(
     risk_signals: list[JsonObject],
     review_leads: JsonObject,
 ) -> JsonObject | None:
-    """Trigger: >=1 code_risk_signal with swallowed_exception family on changed symbols/files."""
+    """Trigger: >=1 code_risk_signal with swallowed_exception family on changed symbols (by entity_id or path)."""
     changed_entity_ids = _changed_symbol_entity_ids(changed_symbols)
     changed_paths = _changed_symbol_paths(changed_symbols)
     matching = [
@@ -1019,7 +1016,7 @@ def _swallowed_exception_state_drift(
         return None
     evidence_refs = _evidence_refs_from_risk_signals(matching)
     lead_ids = _lead_ids_for_signal_subjects(
-        matching, changed_symbols, direct_callers, direct_callees, review_leads
+        matching, changed_symbols, review_leads
     )
     has_direct_edge = bool(direct_callers or direct_callees)
     confidence = "medium" if (lead_ids and has_direct_edge) else "weak"

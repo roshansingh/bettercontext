@@ -12,7 +12,6 @@ TDD: these tests are written before the implementation. They verify:
 - bytes_ref is present and complete on every emitted signal
 - qualifier contains risk_family, exception_type, detail
 - determinism: two builds produce identical fact_ids
-- syntax error → coverage refusal row (no crash)
 """
 from __future__ import annotations
 
@@ -125,6 +124,24 @@ def process(item):
     except Exception:
         result = None
         log_error(result)
+"""
+
+# Positive: except (Exception, BaseException): pass → all elements broad → fires as tuple_broad
+_TUPLE_BROAD_PASS = """\
+def store_item(item):
+    try:
+        db.insert(item)
+    except (Exception, BaseException):
+        pass
+"""
+
+# Negative: except (Exception, ValueError): pass → mixed (one narrow) → must NOT fire
+_TUPLE_MIXED_SUPPRESSED = """\
+def load_item(key):
+    try:
+        return store[key]
+    except (Exception, ValueError):
+        pass
 """
 
 # Cap test: one function with 4 bare-except-pass handlers → only 3 signals
@@ -250,6 +267,20 @@ class NegativeTest(unittest.TestCase):
         self.assertEqual(signals, [], f"handler with assignment+call must not emit signal: {signals}")
 
 
+class TupleBroadHandlerTest(unittest.TestCase):
+    def test_tuple_all_broad_emits_tuple_broad_signal(self) -> None:
+        sf, _, _ = _build({"worker.py": _TUPLE_BROAD_PASS})
+        signals = _swallowed_signals(sf)
+        self.assertGreater(len(signals), 0, "expected swallowed_exception signal for except (Exception, BaseException): pass")
+        exc_types = {s["qualifier"]["exception_type"] for s in signals}
+        self.assertIn("tuple_broad", exc_types, f"expected exception_type=tuple_broad, got: {exc_types}")
+
+    def test_tuple_mixed_narrow_suppressed(self) -> None:
+        sf, _, _ = _build({"worker.py": _TUPLE_MIXED_SUPPRESSED})
+        signals = _swallowed_signals(sf)
+        self.assertEqual(signals, [], f"except (Exception, ValueError): must not emit signal (one narrow element): {signals}")
+
+
 class QualifierAndBytesRefTest(unittest.TestCase):
     def test_qualifier_has_required_fields(self) -> None:
         sf, _, _ = _build({"worker.py": _EXCEPT_EXCEPTION_PASS})
@@ -300,17 +331,11 @@ class CapTest(unittest.TestCase):
         ]
         self.assertEqual(len(signals), 3)
         lines = sorted(s["qualifier"]["line"] for s in signals)
-        # lines must be sorted ascending (lowest 3 selected)
-        self.assertEqual(lines, sorted(lines))
-        all_signals = [
-            s for s in _swallowed_signals(sf)
-            if s["qualifier"].get("qualname") == "multi_try"
-        ]
-        all_lines = sorted(s["qualifier"]["line"] for s in all_signals)
-        max_possible_line = max(all_lines)
-        # The 4th handler (highest line) should be absent — inversion: if 4 present this fails
-        # We assert exactly 3 signals, not 4
-        self.assertNotEqual(len(all_signals), 4, "cap not applied: 4 signals instead of 3")
+        # _CAP_EXCEEDED: 4 except Exception: pass handlers at lines 4, 8, 12, 16.
+        # Cap keeps lowest 3 → [4, 8, 12]; line 16 (4th handler) is absent.
+        self.assertEqual(lines, [4, 8, 12], f"expected lowest 3 handler lines [4,8,12], got {lines}")
+        # Inversion: line 16 must be absent (proves 4th handler was dropped, not a different 3)
+        self.assertNotIn(16, lines, "line 16 (4th except handler) must be dropped by cap")
 
 
 class DeterminismTest(unittest.TestCase):

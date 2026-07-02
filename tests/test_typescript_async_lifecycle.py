@@ -239,11 +239,11 @@ class SignalCapTest(unittest.TestCase):
             and s["qualifier"]["qualname"] == "batchProcess"
         ]
         lines = sorted(s["qualifier"]["line"] for s in signals)
-        # Lines 2, 3, 4 expected (1-indexed, cap drops line 5)
-        self.assertEqual(lines, lines, "lines must be sorted ascending")
-        self.assertEqual(len(lines), 3)
-        # The 4th call at the highest line should be absent
-        self.assertNotIn(max(lines) + 1, lines)
+        # _CAP_EXCEEDED: 4 forEach(async) calls on lines 2, 3, 4, 5 (1-indexed).
+        # Cap keeps lowest 3 → [2, 3, 4]; line 5 (the 4th handler) is absent.
+        self.assertEqual(lines, [2, 3, 4], f"expected lowest 3 lines [2,3,4], got {lines}")
+        # Inversion: line 5 must be absent (proves the 4th handler was dropped, not a different 3)
+        self.assertNotIn(5, lines, "line 5 (4th forEach) must be dropped by cap")
 
     def test_cap_is_combined_across_families(self) -> None:
         # 2 async_callback_in_iteration + 2 unawaited_async_call in one symbol;

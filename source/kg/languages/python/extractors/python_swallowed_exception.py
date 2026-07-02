@@ -248,10 +248,6 @@ def _collect_signals_from_file(
     """Walk all except handlers in the file and return vacuous broad-exception ones."""
     module_name = _module_name(repo, file_path)
     symbols = _collect_function_symbols(repo, file_path, module_name, tree, tenant_id)
-    # Map each AST node id → SymbolRef for enclosing lookup
-    node_to_symbol: dict[int, _SymbolRef] = {}
-    if isinstance(tree, ast.Module):
-        _map_nodes_to_symbols(tree.body, symbols, node_to_symbol, prefix="")
 
     signals: list[_Signal] = []
     # Walk the whole file for try/except nodes
@@ -299,16 +295,6 @@ def _enclosing_symbol(
     if not candidates:
         return None
     return max(candidates, key=lambda s: s.line)
-
-
-def _map_nodes_to_symbols(
-    body: list[ast.stmt],
-    symbols: list[_SymbolRef],
-    node_to_symbol: dict[int, _SymbolRef],
-    prefix: str,
-) -> None:
-    # Not actually used for lookup — enclosing is done by line range comparison
-    pass
 
 
 # ---------------------------------------------------------------------------
