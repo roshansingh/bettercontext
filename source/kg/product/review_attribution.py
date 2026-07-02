@@ -23,6 +23,36 @@ LEAD_COUNT_KEYS = {
 }
 
 
+def hypothesis_stable_id(
+    risk_type: str,
+    supporting_lead_ids: list[str],
+    evidence_refs: list[JsonObject],
+) -> str:
+    """Build an evidence-specific hypothesis_id from risk_type, lead IDs, and evidence coords.
+
+    Hashes risk_type + sorted supporting_lead_ids + sorted (repo,path,line_start,line_end)
+    tuples from evidence_refs so every distinct evidence set gets a distinct ID, while the
+    same inputs always produce the same ID regardless of call order.
+    """
+    coord_tuples = sorted(
+        (
+            ref.get("repo") or "",
+            ref.get("path") or "",
+            ref.get("line_start"),
+            ref.get("line_end"),
+        )
+        for ref in evidence_refs
+        if isinstance(ref, dict)
+    )
+    payload: JsonObject = {
+        "risk_type": risk_type,
+        "supporting_lead_ids": sorted(supporting_lead_ids),
+        "evidence_coords": [list(t) for t in coord_tuples],
+    }
+    digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:16]
+    return f"hypothesis:{risk_type}:{digest}"
+
+
 def review_stable_id(prefix: str, row: JsonObject, *, fallback_kind: str) -> str:
     existing = row.get(f"{prefix}_id")
     if isinstance(existing, str) and existing.strip():

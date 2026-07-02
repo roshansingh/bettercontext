@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from source.kg.core.models import JsonObject
-from source.kg.product.review_attribution import review_stable_id
+from source.kg.product.review_attribution import hypothesis_stable_id
 
 _TEST_PATH_SEGMENTS = frozenset({"test", "tests", "spec", "specs", "__tests__"})
 _CONFIG_EXTENSIONS = frozenset({".json", ".yaml", ".yml", ".toml", ".ini", ".env"})
@@ -137,7 +137,7 @@ def _make_hypothesis(
         "source_checks": source_checks,
         "supporting_lead_ids": supporting_lead_ids,
     }
-    row["hypothesis_id"] = review_stable_id("hypothesis", row, fallback_kind=risk_type)
+    row["hypothesis_id"] = hypothesis_stable_id(risk_type, supporting_lead_ids, evidence_refs)
     return row
 
 

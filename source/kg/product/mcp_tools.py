@@ -4369,7 +4369,7 @@ def _review_context_surface_status(
     unknown_surfaces: list[str] | None = None,
     changed_symbols: list[JsonObject] | None = None,
 ) -> list[JsonObject]:
-    surfaces = requested_surfaces or list(REVIEW_CONTEXT_SURFACES)
+    surfaces = requested_surfaces if (requested_surfaces or unknown_surfaces) else list(REVIEW_CONTEXT_SURFACES)
     rows: list[JsonObject] = [
         _review_context_surface_status_row(
             surface,

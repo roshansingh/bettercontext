@@ -2857,6 +2857,52 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
         result["review_hypothesis_status"]["reason"] = "omitted_due_to_budget"
 
 
+def _collect_surviving_lead_ids(result: JsonObject) -> set[str]:
+    """Return the set of lead_ids present in review_leads after all budget eviction."""
+    surviving: set[str] = set()
+    review_leads = result.get("review_leads")
+    if not isinstance(review_leads, dict):
+        return surviving
+    for rows in review_leads.values():
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    lead_id = row.get("lead_id")
+                    if isinstance(lead_id, str) and lead_id:
+                        surviving.add(lead_id)
+    return surviving
+
+
+def _reconcile_hypothesis_lead_ids(result: JsonObject) -> None:
+    """Filter supporting_lead_ids in hypotheses to only ids that survived budget eviction.
+
+    hypothesis_id is computed at producer time from the pre-budget lead set and must NOT
+    be recomputed here — attribution stability across compaction is the contract. Hypotheses
+    whose lead list empties are kept; evidence_refs still guide inspection.
+    """
+    surviving = _collect_surviving_lead_ids(result)
+    for hyp_list_key in ("review_hypotheses",):
+        hyp_list = result.get(hyp_list_key)
+        if not isinstance(hyp_list, list):
+            continue
+        for hyp in hyp_list:
+            if not isinstance(hyp, dict):
+                continue
+            lead_ids = hyp.get("supporting_lead_ids")
+            if isinstance(lead_ids, list):
+                hyp["supporting_lead_ids"] = [lid for lid in lead_ids if lid in surviving]
+    answer_packet = result.get("review_answer_packet")
+    if isinstance(answer_packet, dict):
+        top_hyps = answer_packet.get("top_review_hypotheses")
+        if isinstance(top_hyps, list):
+            for hyp in top_hyps:
+                if not isinstance(hyp, dict):
+                    continue
+                lead_ids = hyp.get("supporting_lead_ids")
+                if isinstance(lead_ids, list):
+                    hyp["supporting_lead_ids"] = [lid for lid in lead_ids if lid in surviving]
+
+
 def _finalize_review_hypothesis_budget(
     result: JsonObject, original_hypotheses: list[JsonObject], *, max_chars: int
 ) -> None:
@@ -2871,11 +2917,14 @@ def _finalize_review_hypothesis_budget(
     for _ in range(5):
         evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
         if not evicted:
-            return
+            break
         _sync_review_lead_status_from_packet(result)
         budget = result.get("output_budget")
         if isinstance(budget, dict):
             budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
+    # After all eviction is complete, drop stale lead IDs from hypotheses. hypothesis_id
+    # is intentionally not recomputed — it was stamped at producer time from the pre-budget set.
+    _reconcile_hypothesis_lead_ids(result)
 
 
 def _compact_diff_anchor(value: object) -> JsonObject:
