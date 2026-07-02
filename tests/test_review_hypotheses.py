@@ -202,6 +202,27 @@ class TestComponentListRenderIdentityDrift(unittest.TestCase):
         risk_types = [h["risk_type"] for h in hypotheses]
         self.assertNotIn("component_list_render_identity_drift", risk_types)
 
+    def test_negative_edge_only_on_non_component_symbol_does_not_fire(self):
+        # Changed .tsx component + changed non-component; only non-component has edges.
+        # Family must NOT fire because no edge touches a component symbol.
+        hypotheses = self._call(
+            changed_files=["src/Table.tsx", "src/utils.tsx"],
+            changed_symbols=[
+                _sym("Table", "src/Table.tsx", kind="class", lead_id="lead-comp-1"),
+                _sym("formatRow", "src/utils.tsx", lead_id="lead-util-1"),
+            ],
+            direct_callees=[_edge("formatRow", "helper", "lead-edge-util")],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-comp-1", "path": "src/Table.tsx"},
+                    {"lead_id": "lead-util-1", "path": "src/utils.tsx"},
+                ],
+                "direct_callees": [{"lead_id": "lead-edge-util", "path": "src/helper.tsx"}],
+            },
+        )
+        risk_types = [h["risk_type"] for h in hypotheses]
+        self.assertNotIn("component_list_render_identity_drift", risk_types)
+
 
 class TestHookGateRenderMismatch(unittest.TestCase):
     """Family: hook_gate_render_mismatch"""
@@ -481,6 +502,27 @@ class TestTestLocksInRegression(unittest.TestCase):
                     {"lead_id": "lead-t15", "path": "tests/test_report.py"},
                 ],
                 "direct_callees": [{"lead_id": "lead-te7"}],
+            },
+        )
+        risk_types = [h["risk_type"] for h in hypotheses]
+        self.assertNotIn("test_locks_in_regression", risk_types)
+
+    def test_negative_edge_only_on_test_symbol_does_not_fire(self):
+        # Changed test file + changed code symbol; only the test symbol has edges.
+        # Family must NOT fire because no edge touches a non-test code symbol.
+        hypotheses = self._call(
+            changed_files=["src/loader.py", "tests/test_loader.py"],
+            changed_symbols=[
+                _sym("load", "src/loader.py", lead_id="lead-code-1"),
+                _sym("test_load", "tests/test_loader.py", lead_id="lead-test-1"),
+            ],
+            direct_callees=[_edge("test_load", "mock_helper", "lead-te-test-only")],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-code-1", "path": "src/loader.py"},
+                    {"lead_id": "lead-test-1", "path": "tests/test_loader.py"},
+                ],
+                "direct_callees": [{"lead_id": "lead-te-test-only"}],
             },
         )
         risk_types = [h["risk_type"] for h in hypotheses]

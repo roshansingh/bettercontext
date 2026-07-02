@@ -1,10 +1,11 @@
-"""Regression tests for five findings from the Codex pre-PR review:
+"""Regression tests for Copilot and Codex pre-PR review findings:
 
 1. hypothesis_id must be evidence-specific (same risk_type → different IDs for different leads)
 2. Unknown-only requested_surfaces must not expand to all defaults
 3. supporting_lead_ids must be reconciled after final budget eviction
 4. Whitespace tokens must be split into individual inspection terms
 5. Hard-cap guarantee must hold even when no rows are evictable after status attach
+6. Stale returned counts after floor eviction must be resynced
 """
 from __future__ import annotations
 
@@ -18,8 +19,10 @@ from source.kg.product.mcp_tools import (
 )
 from source.kg.product.output_budget import (
     _finalize_review_hypothesis_budget,
+    _protect_review_hypotheses_floor,
     enforce_review_context_budget,
 )
+from source.kg.product.review_attribution import review_lead_counts
 from source.kg.product.review_attribution import hypothesis_stable_id
 from source.kg.core.models import canonical_json
 
@@ -316,6 +319,101 @@ class TestFinalizeReviewHypothesisBudgetHardCapNoEvictable(unittest.TestCase):
             packet,
             "review_hypothesis_status should be present when budget allows",
         )
+
+
+class TestFloorEvictionResyncsReturnedCounts(unittest.TestCase):
+    """Fix 6: floor eviction in _protect_review_hypotheses_floor must resync returned counts."""
+
+    def _packet_with_lead_rows(self, n_callers: int) -> dict:
+        """Packet with review_lead_status.returned set to n_callers, plus one hypothesis."""
+        callers = [
+            {
+                "lead_id": f"lead:direct_caller:c{i:03d}",
+                "lead_kind": "direct_caller",
+                "repo": "svc",
+                "path": f"src/caller_{i}.py",
+                "line_start": i * 10,
+                "line_end": i * 10 + 5,
+                "subject": f"mod.caller_{i}",
+                "object": "mod.target",
+            }
+            for i in range(n_callers)
+        ]
+        all_lead_ids = [r["lead_id"] for r in callers]
+        review_leads = {
+            "changed_symbols": [],
+            "direct_callers": callers,
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+        }
+        hypothesis = {
+            "hypothesis_id": hypothesis_stable_id("direct_call_contract_drift", all_lead_ids, []),
+            "risk_type": "direct_call_contract_drift",
+            "confidence": "strong",
+            "why": "Callers may drift.",
+            "evidence_refs": [],
+            "source_checks": ["check callers"],
+            "supporting_lead_ids": all_lead_ids,
+        }
+        original_returned = review_lead_counts(review_leads)
+        return {
+            "status": "found",
+            "review_leads": review_leads,
+            "review_lead_status": {
+                "available": original_returned,
+                "returned": original_returned,
+                "changed_symbol_count": 0,
+                "direct_impact_count": n_callers,
+                "transitive_impact_count": 0,
+                "source_coordinate_count": 0,
+            },
+            "review_hypotheses": [hypothesis],
+            "output_budget": {"truncated": False, "truncated_sections": []},
+        }
+
+    def test_returned_counts_equal_surviving_rows_after_floor_eviction(self):
+        # Force a packet large enough that _protect_review_hypotheses_floor will evict
+        # some review_leads rows when it restores the hypothesis.
+        n = 30
+        packet = self._packet_with_lead_rows(n)
+
+        # Remove hypotheses so the floor fires, then set a tight budget.
+        original_hypotheses = list(packet["review_hypotheses"])
+        packet["review_hypotheses"] = []
+        tight_budget = len(canonical_json(packet)) // 2
+
+        result = _protect_review_hypotheses_floor(packet, original_hypotheses, max_chars=tight_budget)
+
+        review_leads = result.get("review_leads") or {}
+        status = result.get("review_lead_status") or {}
+        returned = status.get("returned") or {}
+
+        # Count actual surviving direct_callers
+        surviving_callers = review_leads.get("direct_callers") or []
+        actual_direct_impact = len(surviving_callers)
+
+        # returned["direct_caller_count"] must equal the actual surviving count
+        reported_direct_callers = returned.get("direct_caller_count", -1) if isinstance(returned, dict) else -1
+        self.assertEqual(
+            reported_direct_callers,
+            actual_direct_impact,
+            f"returned.direct_caller_count={reported_direct_callers} != surviving={actual_direct_impact}",
+        )
+
+    def test_available_counts_preserved_after_floor_eviction(self):
+        n = 20
+        packet = self._packet_with_lead_rows(n)
+        original_available = dict(packet["review_lead_status"]["available"])
+        original_hypotheses = list(packet["review_hypotheses"])
+        packet["review_hypotheses"] = []
+        tight_budget = len(canonical_json(packet)) // 2
+
+        result = _protect_review_hypotheses_floor(packet, original_hypotheses, max_chars=tight_budget)
+
+        status = result.get("review_lead_status") or {}
+        available = status.get("available")
+        self.assertEqual(available, original_available, "available counts must not be mutated by floor eviction")
 
 
 if __name__ == "__main__":

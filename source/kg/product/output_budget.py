@@ -2808,7 +2808,10 @@ def _protect_review_hypotheses_floor(
         else:
             truncated.discard("review_hypotheses")
     # Compensating eviction: the restored hypothesis must never push the packet over the cap.
-    truncated |= _evict_review_rows_to_fit(result, max_chars=max_chars)
+    evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
+    truncated |= evicted
+    if evicted:
+        _sync_review_lead_status_from_packet(result)
     if isinstance(budget, dict):
         budget["truncated_sections"] = sorted(truncated)
     return result

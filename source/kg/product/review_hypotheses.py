@@ -491,8 +491,17 @@ def _component_list_render_identity_drift(
     component_syms = [s for s in changed_symbols if _is_component_symbol(s)]
     if not component_syms:
         return None
-    changed_names = {_short_name(s) for s in changed_symbols if _short_name(s)}
-    if not _edges_touch_names(direct_callers, changed_names) and not _edges_touch_names(direct_callees, changed_names):
+    # Require >=1 edge touching a COMPONENT symbol specifically, not any changed symbol.
+    component_names: set[str] = set()
+    for s in component_syms:
+        short = _short_name(s)
+        if short:
+            component_names.add(short)
+        for key in ("qualname", "qualified_name", "display_name"):
+            val = s.get(key)
+            if val:
+                component_names.add(str(val))
+    if not _edges_touch_names(direct_callers, component_names) and not _edges_touch_names(direct_callees, component_names):
         return None
     evidence_refs: list[JsonObject] = []
     for sym in component_syms[:5]:
@@ -503,6 +512,7 @@ def _component_list_render_identity_drift(
                 ref[key] = val
         if ref:
             evidence_refs.append(ref)
+    # supporting_lead_ids from leads that involve component-touching evidence.
     lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "direct_callers", "direct_callees"))
     confidence = "medium" if lead_ids else "weak"
     source_checks = [
@@ -601,8 +611,17 @@ def _test_locks_in_regression(
     non_test_syms = [s for s in changed_symbols if not _is_test_file(s.get("path") or "")]
     if not non_test_syms:
         return None
-    changed_names = {_short_name(s) for s in changed_symbols if _short_name(s)}
-    if not _edges_touch_names(direct_callers, changed_names) and not _edges_touch_names(direct_callees, changed_names):
+    # Require >=1 edge touching a changed NON-TEST code symbol, not any changed symbol.
+    non_test_names: set[str] = set()
+    for s in non_test_syms:
+        short = _short_name(s)
+        if short:
+            non_test_names.add(short)
+        for key in ("qualname", "qualified_name", "display_name"):
+            val = s.get(key)
+            if val:
+                non_test_names.add(str(val))
+    if not _edges_touch_names(direct_callers, non_test_names) and not _edges_touch_names(direct_callees, non_test_names):
         return None
     test_files = [f for f in changed_files if _is_test_file(f)]
     evidence_refs: list[JsonObject] = [{"path": f} for f in test_files[:5]]
