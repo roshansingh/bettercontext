@@ -6438,9 +6438,11 @@ _TOOLS: dict[str, McpTool] = {
             "framework_impact includes parser-backed support facts for Django/Celery model fields, model relations, serializers, view/model bindings, tasks, and bounded model relationship paths when present. "
             "authz_surface is available from planning_context/get_service_brief for endpoint-to-handler permission evidence; use source inspection for dynamic middleware or framework defaults not represented in the packet. "
             "application_impact groups changed app/package namespace surfaces into API/model/serializer/worker/scheduled-job sections, app-scoped runtime facts, and unlinked cross-repo name leads that require separate verification when those sections are present or explicitly requested. "
+            "review_hypotheses contains hypothesis_id-tagged candidate source-inspection leads with risk_type, confidence, and evidence_refs; read them as inspection candidates, not proven facts. "
             "Use it when you know the changed files and need deterministic static review context before drilling into narrower MCP tools. "
             "Large packets are bounded: when output_budget is present the detail rows were compacted to a coordinate-bearing head start, so inspect source coordinates or call narrower changed_ranges/exact tools for omitted detail. "
-            "Does not infer deploy blockers unless explicitly requested, summarize diffs with an LLM, or invent cross-repo and runtime-only impact."
+            "Does not infer deploy blockers unless explicitly requested, summarize diffs with an LLM, or invent cross-repo and runtime-only impact. "
+            "Read review_hypotheses as candidate source-inspection leads, not proven bugs. If using a hypothesis in a review finding, include its hypothesis_id and supporting lead_id values in the finding metadata when the review harness supports attribution."
         ),
         input_schema=_object_schema(_review_context_properties(), required=["repo", "changed_files"]),
         handler=_review_context,

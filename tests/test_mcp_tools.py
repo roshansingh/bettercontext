@@ -148,6 +148,12 @@ class McpToolsTest(unittest.TestCase):
             self.assertIn("coverage_gaps", description)
             self.assertIn("inspection_areas", description)
 
+    def test_review_context_tool_mentions_review_hypotheses_and_hypothesis_id(self) -> None:
+        definitions = tool_definitions()
+        review_tool = next(tool for tool in definitions if tool["name"] == "review_context")
+        self.assertIn("review_hypotheses", review_tool["description"])
+        self.assertIn("hypothesis_id", review_tool["description"])
+
     def test_default_tool_metadata_treats_missing_status_as_answerable(self) -> None:
         payload = _with_default_tool_metadata({"services": [{"name": "api"}]}, tool_name="search_services")
 
