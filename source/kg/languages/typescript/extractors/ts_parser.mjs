@@ -3321,26 +3321,47 @@ function isForEachCall(node) {
   );
 }
 
+// Walk up through ParenthesizedExpression nodes and return {parent, child} where
+// parent is the first non-paren ancestor and child is the immediate child of that
+// ancestor (i.e. the outermost paren wrapping callNode, or callNode itself if
+// there are no parens).  Used by all four suppression guards so that parenthesized
+// forms — await (f()), return (f()), (f()).then(...), const x = (f()) — are
+// treated identically to their unparenthesized counterparts.
+function effectiveParentSkippingParens(callNode) {
+  let child = callNode;
+  let parent = callNode.parent;
+  while (parent != null && ts.isParenthesizedExpression(parent)) {
+    child = parent;
+    parent = parent.parent;
+  }
+  return { parent, child };
+}
+
 function isAwaitedContext(callNode) {
-  // True if the direct parent of this call expression is an AwaitExpression.
-  const parent = callNode.parent;
+  // True if the call expression (possibly wrapped in parens) is awaited.
+  // Handles: await f(), await (f()), await ((f())).
+  const { parent } = effectiveParentSkippingParens(callNode);
   return parent != null && parent.kind === ts.SyntaxKind.AwaitExpression;
 }
 
 function isReturnedContext(callNode) {
-  // True if the call is directly inside a return statement.
-  const parent = callNode.parent;
+  // True if the call (possibly wrapped in parens) is directly inside a return statement.
+  // Handles: return f(), return (f()), return ((f())).
+  const { parent } = effectiveParentSkippingParens(callNode);
   return parent != null && parent.kind === ts.SyntaxKind.ReturnStatement;
 }
 
 function isThenCatchChained(callNode) {
-  // True if the result of the call is immediately .then() or .catch() chained.
-  // Pattern: callNode.parent is PropertyAccessExpression with name "then"/"catch"/"finally",
-  // and that property access is the expression of a CallExpression.
-  const parent = callNode.parent;
+  // True if the result of the call (possibly wrapped in parens) is immediately
+  // .then()/.catch()/.finally() chained.
+  // Handles: f().then(...), (f()).then(...).
+  // The effective child (outermost paren or callNode itself) must be the
+  // .expression side of the PropertyAccessExpression.
+  const { parent, child } = effectiveParentSkippingParens(callNode);
   if (!parent) return false;
   if (
     ts.isPropertyAccessExpression(parent) &&
+    parent.expression === child &&
     (parent.name.text === "then" || parent.name.text === "catch" || parent.name.text === "finally") &&
     parent.parent != null &&
     ts.isCallExpression(parent.parent) &&
@@ -3352,21 +3373,22 @@ function isThenCatchChained(callNode) {
 }
 
 function isAssignedContext(callNode) {
-  // True if the call appears on the RHS of a variable declaration or an
-  // assignment expression (simple `=` or compound `+=`, `-=`, etc.).
+  // True if the call (possibly wrapped in parens) appears on the RHS of a variable
+  // declaration or an assignment expression (simple `=` or compound `+=`, `-=`, etc.).
   // ts.isBinaryExpression also covers comparisons (===, !==), logical (||, &&),
   // and arithmetic (+, -, *) — restrict to assignment operators only so that
   // `ready === saveRecord(id)` and `flag || saveRecord(id)` still emit signals.
   // ASSIGNMENT_OPERATORS covers SyntaxKind.EqualsToken through the full
   // compound-assignment range (FirstAssignment..LastAssignment).
-  const parent = callNode.parent;
+  // Handles: const x = (f()), x = (f()), x += (f()).
+  const { parent, child } = effectiveParentSkippingParens(callNode);
   if (!parent) return false;
   // `const x = callNode` or `let x = callNode`
-  if (ts.isVariableDeclaration(parent) && parent.initializer === callNode) return true;
+  if (ts.isVariableDeclaration(parent) && parent.initializer === child) return true;
   // `x = callNode`, `x += callNode`, etc. — assignment operators only
   if (
     ts.isBinaryExpression(parent) &&
-    parent.right === callNode &&
+    parent.right === child &&
     ASSIGNMENT_OPERATORS.has(parent.operatorToken.kind)
   ) return true;
   return false;

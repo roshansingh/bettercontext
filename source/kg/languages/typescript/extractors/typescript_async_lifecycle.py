@@ -14,6 +14,15 @@ collector; the Python adapter trusts that invariant.
 Coverage rows (partially_instrumented) are emitted for any file whose
 async_lifecycle_signals key is absent or whose parse_diagnostics are non-empty,
 mirroring the proto_endpoints.py pattern.
+
+Symbol identity alignment: the adapter resolves symbol_kind from the ``symbols``
+list in the parsed file (produced by collectSymbols in ts_parser.mjs) to match
+the identity emitted by the main compiler_api_extractor.  For a top-level async
+function the kind is ``"function"``; for a class body the enclosing symbol is the
+class itself with kind ``"class"``.  If the qualname cannot be found in that list
+(e.g. a module-level ``<module>`` sentinel), the signal is skipped conservatively
+— it cannot be correlated to a main-extractor entity and would produce an orphaned
+fact.  This mirrors the Python-side fix in 5dd9f1b.
 """
 from __future__ import annotations
 
@@ -47,10 +56,7 @@ def _module_name(repo: RepoSnapshot, file_path: Path) -> str:
     return ".".join(parts) or repo.name
 
 
-def _symbol_entity(repo: RepoSnapshot, tenant_id: str, module_name: str, qualname: str) -> Entity:
-    # symbol_kind is unknown here; use "function" as the most common case for
-    # top-level async functions. The entity_id must match what the compiler API
-    # extractor emits for the same symbol so facts can be correlated.
+def _symbol_entity(repo: RepoSnapshot, tenant_id: str, module_name: str, qualname: str, symbol_kind: str) -> Entity:
     return Entity(
         kind="CodeSymbol",
         identity={
@@ -58,10 +64,22 @@ def _symbol_entity(repo: RepoSnapshot, tenant_id: str, module_name: str, qualnam
             "repo": repo.name,
             "module": module_name,
             "qualname": qualname,
-            "symbol_kind": "function",
+            "symbol_kind": symbol_kind,
         },
         properties={},
     )
+
+
+def _symbol_kind_from_parsed(parsed_file: dict[str, Any], qualname: str) -> str | None:
+    """Return the symbol_kind for qualname from the parsed file's symbols list.
+
+    Returns None if the qualname is not found, which means the signal cannot be
+    correlated to a main-extractor entity — caller should skip it.
+    """
+    for sym in parsed_file.get("symbols", []):
+        if isinstance(sym, dict) and sym.get("name") == qualname:
+            return str(sym.get("kind", "function"))
+    return None
 
 
 def _bytes_ref(repo: RepoSnapshot, relative_path: str, line: int) -> dict[str, Any]:
@@ -130,7 +148,15 @@ def _extract_signals(
             if isinstance(line, bool) or not isinstance(line, int):
                 continue
 
-            subject = _symbol_entity(repo, tenant_id, module_name, qualname)
+            # Resolve symbol_kind to match what compiler_api_extractor emits.
+            # Skip signals whose qualname cannot be found in the parsed symbols
+            # list — they would produce orphaned facts with no main-extractor
+            # counterpart (e.g. module-level <module> sentinel).
+            symbol_kind = _symbol_kind_from_parsed(parsed_file, qualname)
+            if symbol_kind is None:
+                continue
+
+            subject = _symbol_entity(repo, tenant_id, module_name, qualname, symbol_kind)
             qualifier: dict[str, Any] = {
                 "risk_family": signal,
                 "qualname": qualname,

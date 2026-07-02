@@ -158,6 +158,85 @@ export function triggerSave(id: string): void {
 }
 """
 
+# Negative (parenthesized await): await (saveRecord(id)) — must NOT fire
+_PAREN_AWAIT = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export async function triggerSave(id: string): Promise<void> {
+  await (saveRecord(id));
+}
+"""
+
+# Negative (parenthesized return): return (saveRecord(id)) — must NOT fire
+_PAREN_RETURN = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export async function triggerSave(id: string): Promise<Promise<void>> {
+  return (saveRecord(id));
+}
+"""
+
+# Negative (parenthesized then-chain): (saveRecord(id)).then(() => {}) — must NOT fire
+_PAREN_THEN = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export function triggerSave(id: string): void {
+  (saveRecord(id)).then(() => {});
+}
+"""
+
+# Negative (parenthesized assignment): const x = (saveRecord(id)) — must NOT fire
+_PAREN_ASSIGN = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export function triggerSave(id: string): void {
+  const p = (saveRecord(id));
+}
+"""
+
+# Negative (double-paren await): await ((saveRecord(id))) — must NOT fire
+_DOUBLE_PAREN_AWAIT = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export async function triggerSave(id: string): Promise<void> {
+  await ((saveRecord(id)));
+}
+"""
+
+# Positive: bare (saveRecord(id)); as expression statement — IS unawaited, MUST fire
+_PAREN_BARE_STATEMENT = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export function triggerSave(id: string): void {
+  (saveRecord(id));
+}
+"""
+
+# Root cause B: signal inside a class method — subject entity_id must match main extractor
+_CLASS_METHOD_UNAWAITED = """\
+async function saveRecord(id: string): Promise<void> {
+  await fetch('/api/' + id);
+}
+
+export class Saver {
+  trigger(id: string): void {
+    saveRecord(id);
+  }
+}
+"""
+
 
 def _build(files: dict[str, str]) -> tuple[list[dict], list[dict], list[dict]]:
     """Write files to a tempdir, run build_kg, return (support_facts, evidence, coverage)."""
@@ -352,3 +431,95 @@ class AssignmentContextDiscriminatorTest(unittest.TestCase):
             signals, [],
             f"call in variable declaration must be suppressed; no unawaited_async_call: {signals}",
         )
+
+
+@unittest.skipIf(not NODE_AVAILABLE, "node not available")
+class ParenthesizedSuppressionTest(unittest.TestCase):
+    """Root cause A: parenthesized forms must be treated like their unparenthesized counterparts."""
+
+    def test_paren_await_no_signal(self) -> None:
+        """await (saveRecord(id)) — awaited via paren → must NOT fire."""
+        sf, _, _ = _build({"p.ts": _PAREN_AWAIT})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertEqual(signals, [], f"await (f()) must be suppressed: {signals}")
+
+    def test_paren_return_no_signal(self) -> None:
+        """return (saveRecord(id)) — returned via paren → must NOT fire."""
+        sf, _, _ = _build({"p.ts": _PAREN_RETURN})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertEqual(signals, [], f"return (f()) must be suppressed: {signals}")
+
+    def test_paren_then_chain_no_signal(self) -> None:
+        """(saveRecord(id)).then(() => {}) — then-chained via paren → must NOT fire."""
+        sf, _, _ = _build({"p.ts": _PAREN_THEN})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertEqual(signals, [], f"(f()).then() must be suppressed: {signals}")
+
+    def test_paren_assign_no_signal(self) -> None:
+        """const x = (saveRecord(id)) — assigned via paren → must NOT fire."""
+        sf, _, _ = _build({"p.ts": _PAREN_ASSIGN})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertEqual(signals, [], f"const x = (f()) must be suppressed: {signals}")
+
+    def test_double_paren_await_no_signal(self) -> None:
+        """await ((saveRecord(id))) — double-paren awaited → must NOT fire."""
+        sf, _, _ = _build({"p.ts": _DOUBLE_PAREN_AWAIT})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertEqual(signals, [], f"await ((f())) must be suppressed: {signals}")
+
+    def test_paren_bare_statement_fires(self) -> None:
+        """(saveRecord(id)); — parenthesized expression statement, genuinely unawaited → MUST fire."""
+        sf, _, _ = _build({"p.ts": _PAREN_BARE_STATEMENT})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+        self.assertGreater(len(signals), 0, "(f()); is genuinely unawaited; must fire")
+
+
+def _entities_from_build(files: dict[str, str]) -> list[dict]:
+    """Run build_kg and return all emitted entities."""
+    import json as _json
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        pkg = root / "pkg"
+        pkg.mkdir()
+        (pkg / "package.json").write_text(
+            _json.dumps({"name": "test-pkg", "version": "1.0.0"}), encoding="utf-8"
+        )
+        for name, text in files.items():
+            (pkg / name).write_text(text, encoding="utf-8")
+        out = root / "kg"
+        build_kg(pkg, out)
+        entities_path = out / "entities.jsonl"
+        return read_jsonl(entities_path) if entities_path.exists() else []
+
+
+@unittest.skipIf(not NODE_AVAILABLE, "node not available")
+class ClassMethodSymbolKindTest(unittest.TestCase):
+    """Root cause B: signal inside a class method → subject entity_id must align with main extractor."""
+
+    def test_class_method_signal_subject_matches_main_extractor(self) -> None:
+        """Signal inside a class method: subject entity_id must equal the main extraction's entity
+        for that class (kind='class'), OR no signal if main extraction has no such entity.
+        Conservatively: must NOT produce a CodeSymbol entity with symbol_kind='function' for 'Saver'
+        (the enclosing class); if a signal fires for 'Saver', its entity must have symbol_kind='class'
+        matching the main extractor's emission."""
+        sf, ev, _ = _build({"cls.ts": _CLASS_METHOD_UNAWAITED})
+        entities = _entities_from_build({"cls.ts": _CLASS_METHOD_UNAWAITED})
+        signals = [s for s in _risk_signals(sf) if s["qualifier"]["risk_family"] == "unawaited_async_call"]
+
+        # Build entity_id → identity map from emitted entities
+        entity_map = {e["entity_id"]: e for e in entities if e.get("kind") == "CodeSymbol"}
+
+        for sig in signals:
+            qualname = sig["qualifier"]["qualname"]
+            if qualname == "Saver":
+                subject_id = sig["subject_id"]
+                self.assertIn(
+                    subject_id, entity_map,
+                    f"Signal subject_id {subject_id!r} not found among emitted CodeSymbol entities",
+                )
+                actual_kind = entity_map[subject_id].get("identity", {}).get("symbol_kind")
+                self.assertEqual(
+                    actual_kind, "class",
+                    f"Enclosing class 'Saver' must have symbol_kind='class', got {actual_kind!r}",
+                )
+            # If no signals for 'Saver' the adapter conservatively skipped it — also valid
