@@ -25,6 +25,7 @@ from source.kg.product.mcp_tools import (
 )
 from source.kg.product.output_budget import (
     _clip_answer_packet_top_to_review_leads,
+    _evict_review_rows_to_fit,
     _finalize_review_hypothesis_budget,
     _protect_review_hypotheses_floor,
     enforce_review_context_budget,
@@ -1270,6 +1271,161 @@ class TestTandemClippingCapInvariant(unittest.TestCase):
         entry_size = len(canonical_json(packet))
         result = enforce_review_context_budget(packet, max_chars=cap)
         self._assert_invariants(result, cap, entry_size, "enforce_budget_7544")
+
+
+class TestAliasedTandemClipDoesNotDoubleEvict(unittest.TestCase):
+    """Regression: aliased packet (top-level and review_leads sharing the same list object,
+    as _sync_compact_review_leads produces) must lose exactly 1 row per eviction iteration,
+    not 2 (the double-pop bug).
+
+    Repro shape: ~1-row overage so a single pop should suffice. Before the identity-guard
+    fix, rows.pop() + rl_rows.pop() on the same object dropped TWO rows, wasting budget.
+
+    De-aliased tandem tests (TestTandemClippingCapInvariant) must stay green alongside this.
+    """
+
+    @staticmethod
+    def _make_aliased_packet(n_rows: int = 3, row_detail_len: int = 222) -> dict:
+        """Packet where result['changed_symbols'] IS result['review_leads']['changed_symbols']
+        (same list object), mirroring what _sync_compact_review_leads does at line 657.
+        Total size is calibrated so the last row creates ~1-row overage.
+        """
+        rows = []
+        for i in range(n_rows):
+            rows.append({
+                "lead_id": f"lead:changed_symbol:sym{i:02d}",
+                "lead_kind": "changed_symbol",
+                "qualname": f"module_a.func_{i}",
+                "name": f"func_{i}",
+                "path": f"src/module_a.py",
+                "repo": "repo-a",
+                "line_start": i * 10 + 1,
+                "line_end": i * 10 + 8,
+                "detail": "y" * row_detail_len,
+            })
+        review_leads = {
+            "changed_symbols": rows,  # same object as top-level below
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+        }
+        lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": n_rows,
+            "changed_symbol_count": n_rows,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 1,
+            "available": {"changed_symbol_count": n_rows, "direct_caller_count": 0,
+                          "direct_callee_count": 0, "transitive_caller_count": 0,
+                          "source_coordinate_count": 0},
+            "returned": {"changed_symbol_count": n_rows, "direct_caller_count": 0,
+                         "direct_callee_count": 0, "transitive_caller_count": 0,
+                         "source_coordinate_count": 0},
+        }
+        result: dict = {
+            "tool": "review_context",
+            "status": "ok",
+            "query": {"changed_files": ["src/module_a.py"]},
+            "summary": {"symbol_anchor_count": n_rows, "file_anchor_count": 1},
+            "snapshot_summary": {},
+            "snapshot_scope": {},
+            "review_leads": review_leads,
+            "review_lead_status": lead_status,
+            "review_hypotheses": [],
+            "review_answer_packet": {
+                "top_changed_symbols": list(rows[:2]),
+                "top_direct_callers": [],
+                "top_direct_callees": [],
+                "top_transitive_callers": [],
+                "top_review_hypotheses": [],
+                "review_lead_status": lead_status,
+            },
+            "changed_symbols": rows,  # alias: same list object as review_leads["changed_symbols"]
+            "output_budget": {
+                "truncated": False,
+                "measured_chars": 0,
+                "max_chars": 40_000,
+                "truncated_sections": [],
+            },
+        }
+        # Verify the alias is actually in place (test integrity check)
+        assert result["changed_symbols"] is result["review_leads"]["changed_symbols"]
+        return result
+
+    def test_aliased_packet_loses_exactly_one_row(self):
+        """With a 1-row overage, exactly 1 row is dropped (not 2 via double-pop)."""
+        from copy import deepcopy
+        packet = self._make_aliased_packet(n_rows=3, row_detail_len=222)
+        # Confirm alias is live before eviction
+        self.assertIs(
+            packet["changed_symbols"],
+            packet["review_leads"]["changed_symbols"],
+            "precondition: top-level and review_leads must share the same list object",
+        )
+        rows_before = len(packet["changed_symbols"])
+        full_size = len(canonical_json(packet))
+        # Set cap to just under the full size (force exactly 1 eviction worth of trimming)
+        # Each row is ~222 + overhead bytes; trim so that removing 1 row suffices.
+        row_size_approx = len(canonical_json(packet["changed_symbols"][-1]))
+        cap = full_size - row_size_approx // 2  # ~0.5-row overage
+        # Ensure this cap actually triggers at least one eviction
+        self.assertGreater(full_size, cap, "fixture must exceed cap before eviction")
+
+        evicted = _evict_review_rows_to_fit(packet, max_chars=cap)
+
+        rows_after = len(packet["changed_symbols"])
+        # INVERSION EVIDENCE: without the identity guard this assertion would fail
+        # (rows_before - rows_after == 2 because the same list was popped twice)
+        self.assertEqual(
+            rows_before - rows_after,
+            1,
+            f"expected exactly 1 row lost, got {rows_before - rows_after} "
+            f"(rows_before={rows_before}, rows_after={rows_after}); "
+            "double-pop bug may have returned",
+        )
+        # Cap must be honoured
+        self.assertLessEqual(
+            len(canonical_json(packet)),
+            cap,
+            "packet must not exceed cap after eviction",
+        )
+        # Label truthfulness: review_leads.changed_symbols must be in evicted set
+        self.assertIn(
+            "review_leads.changed_symbols",
+            evicted,
+            "evicted label must include review_leads.changed_symbols even on aliased path",
+        )
+
+    def test_dealiased_tandem_still_drops_both_rows(self):
+        """De-aliased packet (independent copies) still loses 1 row from each list per iteration."""
+        from copy import deepcopy
+        packet = self._make_aliased_packet(n_rows=4, row_detail_len=222)
+        # Break the alias so top-level and review_leads are independent copies
+        packet["changed_symbols"] = list(packet["changed_symbols"])
+        self.assertIsNot(
+            packet["changed_symbols"],
+            packet["review_leads"]["changed_symbols"],
+            "precondition: lists must be independent for this test",
+        )
+        top_before = len(packet["changed_symbols"])
+        rl_before = len(packet["review_leads"]["changed_symbols"])
+        full_size = len(canonical_json(packet))
+        row_size_approx = len(canonical_json(packet["changed_symbols"][-1]))
+        # Set cap to force 2 eviction iterations (one per list in tandem)
+        cap = full_size - int(row_size_approx * 1.5)
+        self.assertGreater(full_size, cap, "fixture must exceed cap before eviction")
+
+        _evict_review_rows_to_fit(packet, max_chars=cap)
+
+        top_after = len(packet["changed_symbols"])
+        rl_after = len(packet["review_leads"]["changed_symbols"])
+        # Both lists must have lost rows (tandem still works for de-aliased case)
+        self.assertLess(top_after, top_before, "top-level changed_symbols must shrink")
+        self.assertLess(rl_after, rl_before, "review_leads.changed_symbols must shrink")
 
 
 if __name__ == "__main__":

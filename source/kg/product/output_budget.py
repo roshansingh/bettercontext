@@ -3090,9 +3090,9 @@ def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]
             if isinstance(rl, dict):
                 rl_field = _TOPLEVEL_TO_REVIEW_LEADS[label]
                 rl_rows = rl.get(rl_field)
-                if isinstance(rl_rows, list) and rl_rows:
+                if isinstance(rl_rows, list) and rl_rows and rl_rows is not rows:
                     rl_rows.pop()
-                    evicted.add(f"review_leads.{rl_field}")
+                evicted.add(f"review_leads.{rl_field}")
             _sync_review_lead_status_from_packet(result)
         # N1 coherent drop: if we just evicted a review_leads row, sync the mirror
         # immediately so the top_* entry is also removed — never leave mirror showing
