@@ -3051,6 +3051,19 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
             changed_files=changed_files,
             review_hypotheses=review_hypotheses,
         )
+    abstract_contract_status: str | None = None
+    if base_snapshot_dir and base_checkout and head_checkout:
+        # Deterministic abstract-base reparenting detector. Runs before the LLM
+        # semantic splice so its deterministic_static rows front-rank ahead of
+        # inferred_llm rows (same trust-tier ordering as the contract-diff splice).
+        review_hypotheses, abstract_contract_status = _splice_abstract_contract_hypotheses(
+            base_snapshot_dir=base_snapshot_dir,
+            head_kg=kg,
+            base_checkout=base_checkout,
+            head_checkout=head_checkout,
+            changed_symbols=changed_symbols,
+            review_hypotheses=review_hypotheses,
+        )
     semantic_diff_status: str | None = None
     if base_snapshot_dir and base_checkout and head_checkout:
         review_hypotheses, semantic_diff_status = _splice_semantic_diff_hypotheses(
@@ -3083,6 +3096,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         contract_diff_note=contract_diff_note,
         base_diff_status=_base_diff_status,
         semantic_diff_status=semantic_diff_status,
+        abstract_contract_status=abstract_contract_status,
         changed_ranges=changed_ranges,
         changed_symbols=changed_symbols_in_scope,
     )
@@ -3176,6 +3190,7 @@ def _build_review_quality_status(
     contract_diff_note: str | None = None,
     base_diff_status: str | None = None,
     semantic_diff_status: str | None = None,
+    abstract_contract_status: str | None = None,
     changed_ranges: list[JsonObject] | None = None,
     changed_symbols: list[JsonObject] | None = None,
 ) -> JsonObject:
@@ -3269,6 +3284,8 @@ def _build_review_quality_status(
             status["suggested_setup"] = "build_base_snapshot_then_retry"
     if semantic_diff_status is not None:
         status["semantic_diff_status"] = semantic_diff_status
+    if abstract_contract_status is not None:
+        status["abstract_contract_status"] = abstract_contract_status
     if contract_diff_note is not None:
         status["contract_diff_note"] = contract_diff_note
 
@@ -3323,6 +3340,140 @@ _CONTRACT_DIFF_FAMILIES = frozenset(
 )
 # Maximum contract-diff hypotheses to splice per family (avoid packet explosion).
 _CONTRACT_DIFF_SPLICE_CAP = 3
+
+# Abstract-contract detector: deterministic_static family (reparent → abstract base
+# with unimplemented abstract members). Spliced alongside the other deterministic rows.
+_ABSTRACT_CONTRACT_SPLICE_CAP = 3
+
+
+def _resolve_changed_head_entities(
+    head_kg: KgSnapshot,
+    changed_symbols: list[JsonObject],
+) -> list[JsonObject]:
+    """Map changed-symbol rows to head-snapshot CodeSymbol entities.
+
+    Match by composite (normalized_path, qualname) when the changed row has a path;
+    fall back to qualname-only for changed rows that carry no path (e.g. compact rows).
+    Shared by the semantic-diff and abstract-contract splices so both resolve the same
+    entity set from the same changed_symbols input.
+    """
+    head_entities: list[JsonObject] = []
+    composite_keys: set[tuple[str, str]] = set()
+    qname_only_keys: set[str] = set()
+    for s in changed_symbols:
+        qname = str(s.get("qualname") or s.get("qualified_name") or "")
+        if not qname:
+            continue
+        path = str(s.get("path") or "")
+        if path:
+            composite_keys.add((_planning_context_normalize_path(path), qname))
+        else:
+            qname_only_keys.add(qname)
+
+    for entity in head_kg.entities:
+        if entity.get("kind") != "CodeSymbol":
+            continue
+        identity = entity.get("identity") or {}
+        qname = str(identity.get("qualname") or "")
+        if not qname:
+            continue
+        props = entity.get("properties") or {}
+        epath = _planning_context_normalize_path(str(props.get("path") or ""))
+        if epath and (epath, qname) in composite_keys:
+            head_entities.append(entity)
+        elif not epath and qname in qname_only_keys:
+            # Entity has no path in KG — fall back to qualname-only match.
+            head_entities.append(entity)
+        elif qname in qname_only_keys:
+            # Changed row had no path — qualname-only match (documented fallback).
+            head_entities.append(entity)
+    return head_entities
+
+
+def _splice_abstract_contract_hypotheses(
+    *,
+    base_snapshot_dir: str,
+    head_kg: KgSnapshot,
+    base_checkout: str,
+    head_checkout: str,
+    changed_symbols: list[JsonObject],
+    review_hypotheses: list[JsonObject],
+) -> tuple[list[JsonObject], str]:
+    """Run the deterministic abstract-base reparenting detector and splice rows.
+
+    Returns (merged_hypotheses, status). status values:
+      "active"                — detector ran (zero or more rows)
+      "unavailable:<detail>"  — import failure
+      "failed:invalid_base_checkout" / "failed:invalid_head_checkout"
+      "failed:<detail>"       — catch-all (never raises)
+
+    Spliced rows carry derivation="deterministic_static" and are inserted at the
+    FRONT of review_hypotheses (ahead of generic families), mirroring the
+    contract-diff splice — they rank in the same trust tier as the other
+    deterministic contract-diff families.
+    """
+    from pathlib import Path
+
+    try:
+        from source.kg.query.abstract_contract import abstract_contract_diff
+        from source.kg.query.snapshot import KgSnapshot as _KgSnap
+    except ImportError as exc:
+        return review_hypotheses, f"unavailable:{exc}"
+
+    head_entities = _resolve_changed_head_entities(head_kg, changed_symbols)
+    # Only class-kind entities are candidates; skip early when none present.
+    class_entities = [
+        e for e in head_entities
+        if str((e.get("identity") or {}).get("symbol_kind") or "") == "class"
+    ]
+    if not class_entities:
+        return review_hypotheses, "active"
+
+    base_checkout_path = Path(base_checkout)
+    head_checkout_path = Path(head_checkout)
+    if not base_checkout_path.is_dir():
+        return review_hypotheses, "failed:invalid_base_checkout"
+    if not head_checkout_path.is_dir():
+        return review_hypotheses, "failed:invalid_head_checkout"
+
+    try:
+        base_snap = _KgSnap(base_snapshot_dir)
+        raw_rows, _stats = abstract_contract_diff(
+            base_snapshot=base_snap,
+            head_snapshot=head_kg,
+            base_root=base_checkout_path,
+            head_root=head_checkout_path,
+            changed_symbols=class_entities,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return review_hypotheses, f"failed:{exc}"
+
+    if not raw_rows:
+        return review_hypotheses, "active"
+
+    spliced: list[JsonObject] = []
+    for row in raw_rows:
+        if len(spliced) >= _ABSTRACT_CONTRACT_SPLICE_CAP:
+            break
+        if not isinstance(row, dict):
+            continue
+        hypothesis_id = row.get("hypothesis_id")
+        if not hypothesis_id:
+            continue
+        spliced_row = dict(row)
+        spliced_row["label"] = hypothesis_label(str(row.get("risk_type") or ""), hypothesis_id)
+        spliced_row.setdefault("supporting_lead_ids", [])
+        spliced.append(spliced_row)
+
+    if not spliced:
+        return review_hypotheses, "active"
+
+    omitted_count = max(0, len(raw_rows) - _ABSTRACT_CONTRACT_SPLICE_CAP)
+    if omitted_count > 0:
+        spliced[-1] = dict(spliced[-1], omitted_abstract_contract_count=omitted_count)
+
+    # Front-splice: deterministic_static rows rank ahead of generic families.
+    return spliced + review_hypotheses, "active"
 
 
 def _splice_contract_diff_hypotheses(
@@ -3513,40 +3664,7 @@ def _splice_semantic_diff_hypotheses(
         return review_hypotheses, f"unavailable:{exc}"
 
     # Find head-snapshot CodeSymbol entities corresponding to changed symbols.
-    # Match by composite (normalized_path, qualname) when the changed row has a path;
-    # fall back to qualname-only for changed rows that carry no path (e.g. compact rows).
-    head_entities: list[JsonObject] = []
-
-    # Build separate key sets: composite keys (path+qualname) and qualname-only fallback.
-    composite_keys: set[tuple[str, str]] = set()
-    qname_only_keys: set[str] = set()
-    for s in changed_symbols:
-        qname = str(s.get("qualname") or s.get("qualified_name") or "")
-        if not qname:
-            continue
-        path = str(s.get("path") or "")
-        if path:
-            composite_keys.add((_planning_context_normalize_path(path), qname))
-        else:
-            qname_only_keys.add(qname)
-
-    for entity in head_kg.entities:
-        if entity.get("kind") != "CodeSymbol":
-            continue
-        identity = entity.get("identity") or {}
-        qname = str(identity.get("qualname") or "")
-        if not qname:
-            continue
-        props = entity.get("properties") or {}
-        epath = _planning_context_normalize_path(str(props.get("path") or ""))
-        if epath and (epath, qname) in composite_keys:
-            head_entities.append(entity)
-        elif not epath and qname in qname_only_keys:
-            # Entity has no path in KG — fall back to qualname-only match.
-            head_entities.append(entity)
-        elif qname in qname_only_keys:
-            # Changed row had no path — qualname-only match (documented fallback).
-            head_entities.append(entity)
+    head_entities = _resolve_changed_head_entities(head_kg, changed_symbols)
 
     if not head_entities:
         return review_hypotheses, "active"
