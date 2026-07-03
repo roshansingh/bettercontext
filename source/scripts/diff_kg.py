@@ -9,7 +9,7 @@ from source.kg.query.contract_diff import contract_diff_packet
 from source.kg.query.graph_diff import (
     call_edge_delta_for_paths,
     diff_snapshots,
-    removed_symbols_with_surviving_referrers,
+    removed_symbols_with_surviving_former_referrers,
     removed_test_references,
 )
 from source.kg.query.snapshot import KgSnapshot
@@ -24,7 +24,7 @@ def main() -> None:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("summary")
-    subparsers.add_parser("removed-still-referenced")
+    subparsers.add_parser("removed-formerly-referenced")
     subparsers.add_parser("removed-test-references")
 
     call_edge = subparsers.add_parser("call-edge-delta")
@@ -81,8 +81,8 @@ def main() -> None:
 
     if args.command == "summary":
         result = delta.summary()
-    elif args.command == "removed-still-referenced":
-        result = removed_symbols_with_surviving_referrers(delta, base, head)
+    elif args.command == "removed-formerly-referenced":
+        result = removed_symbols_with_surviving_former_referrers(delta, base, head)
     elif args.command == "removed-test-references":
         result = removed_test_references(delta, base, head)
     elif args.command == "call-edge-delta":

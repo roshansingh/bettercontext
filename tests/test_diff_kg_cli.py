@@ -113,8 +113,8 @@ class TestSummaryCommand(unittest.TestCase):
         self.assertEqual(result["added_facts"], 0)
 
 
-class TestRemovedStillReferencedCommand(unittest.TestCase):
-    def test_removed_still_referenced_returns_rows(self) -> None:
+class TestRemovedFormerlyReferencedCommand(unittest.TestCase):
+    def test_removed_formerly_referenced_returns_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             mod = _module("svc", "svc.core")
@@ -130,7 +130,7 @@ class TestRemovedStillReferencedCommand(unittest.TestCase):
                 "supercontext-diff-kg",
                 "--base-snapshot", str(base_dir),
                 "--head-snapshot", str(head_dir),
-                "removed-still-referenced",
+                "removed-formerly-referenced",
             ])
 
         result = json.loads(output)
@@ -139,11 +139,13 @@ class TestRemovedStillReferencedCommand(unittest.TestCase):
         row = result[0]
         # removed_symbol must be beta
         self.assertEqual(row["removed_symbol"]["urn"], fn_beta.urn)
-        # surviving referrer must be alpha
-        self.assertEqual(len(row["surviving_referrers"]), 1)
-        self.assertEqual(row["surviving_referrers"][0]["urn"], fn_alpha.urn)
+        # alpha is the former referrer — field is "former_referrers", not "surviving_referrers"
+        self.assertIn("former_referrers", row)
+        self.assertNotIn("surviving_referrers", row)
+        self.assertEqual(len(row["former_referrers"]), 1)
+        self.assertEqual(row["former_referrers"][0]["urn"], fn_alpha.urn)
 
-    def test_removed_still_referenced_empty_when_no_surviving_referrers(self) -> None:
+    def test_removed_formerly_referenced_empty_when_no_surviving_referrers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             mod = _module("svc", "svc.core")
@@ -159,7 +161,7 @@ class TestRemovedStillReferencedCommand(unittest.TestCase):
                 "supercontext-diff-kg",
                 "--base-snapshot", str(base_dir),
                 "--head-snapshot", str(head_dir),
-                "removed-still-referenced",
+                "removed-formerly-referenced",
             ])
 
         result = json.loads(output)
@@ -354,18 +356,28 @@ class TestBuildKgRoundTripE2E(unittest.TestCase):
         self.assertGreaterEqual(result["removed_entities"], 1)
         self.assertGreaterEqual(result["added_entities"], 1)
 
-    def test_removed_still_referenced_real_snapshots(self) -> None:
+    def test_removed_formerly_referenced_real_snapshots(self) -> None:
+        # Scenario: base alpha→beta; head removes beta, alpha→gamma.
+        # beta must appear with alpha as a FORMER referrer; no field claims current reference.
         output = _run_main([
             "supercontext-diff-kg",
             "--base-snapshot", str(self._base_dir),
             "--head-snapshot", str(self._head_dir),
-            "removed-still-referenced",
+            "removed-formerly-referenced",
         ])
         result = json.loads(output)
         self.assertIsInstance(result, list)
-        # alpha still exists in head and called beta → beta should appear
         removed_qualnames = {r["removed_symbol"]["qualname"] for r in result}
         self.assertIn("beta", removed_qualnames)
+
+        # Verify honest contract: field is "former_referrers", never "surviving_referrers".
+        for row in result:
+            self.assertIn("former_referrers", row)
+            self.assertNotIn("surviving_referrers", row)
+            # alpha updated to call gamma — referrer_likely_unchanged must be False for alpha.
+            alpha_rows = [r for r in row["former_referrers"] if r.get("qualname") == "alpha"]
+            for alpha_ref in alpha_rows:
+                self.assertIs(alpha_ref.get("referrer_likely_unchanged"), False)
 
     def test_call_edge_delta_real_snapshots(self) -> None:
         # core.py path in the real snapshot

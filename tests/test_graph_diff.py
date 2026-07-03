@@ -11,7 +11,7 @@ from source.kg.query.snapshot import KgSnapshot
 from source.kg.query.graph_diff import (
     GraphDelta,
     diff_snapshots,
-    removed_symbols_with_surviving_referrers,
+    removed_symbols_with_surviving_former_referrers,
     call_edge_delta_for_paths,
     removed_test_references,
 )
@@ -333,11 +333,13 @@ def _symbol_with_path(repo: str, module: str, qualname: str, path: str, kind: st
     )
 
 
-class TestRemovedSymbolsWithSurvivingReferrers(unittest.TestCase):
+class TestRemovedSymbolsWithSurvivingFormerReferrers(unittest.TestCase):
     """
-    Positive: fn_beta removed; fn_alpha (referrer via CALLS) survives → one row.
+    Positive: fn_beta removed; fn_alpha (base-side CALLS referrer) survives → one row.
     Negative: both beta AND alpha removed → no row.
     Negative: beta removed but no referrers at all → no row.
+    Regression: alpha→beta in base; head removes beta, alpha→gamma — alpha listed as
+      FORMER referrer only; referrer_likely_unchanged=False (alpha gained a new call).
     """
 
     def _build_base(self, tmpdir: Path, alpha: Entity, beta: Entity, call: Fact) -> KgSnapshot:
@@ -348,7 +350,7 @@ class TestRemovedSymbolsWithSurvivingReferrers(unittest.TestCase):
         mod = _module("svc", "svc.core")
         return _make_snapshot(tmpdir, "head", [mod, alpha], [])
 
-    def test_positive_surviving_referrer_produces_row(self) -> None:
+    def test_positive_former_referrer_produces_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             fn_alpha = _symbol_with_path("svc", "svc.core", "alpha", "svc/core.py")
@@ -358,16 +360,58 @@ class TestRemovedSymbolsWithSurvivingReferrers(unittest.TestCase):
             base = self._build_base(root, fn_alpha, fn_beta, call)
             head = self._build_head(root, fn_alpha)
             delta = diff_snapshots(base, head)
-            rows = removed_symbols_with_surviving_referrers(delta, base, head)
+            rows = removed_symbols_with_surviving_former_referrers(delta, base, head)
 
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(row["removed_symbol"]["urn"], fn_beta.urn)
-        self.assertEqual(len(row["surviving_referrers"]), 1)
-        self.assertEqual(row["surviving_referrers"][0]["urn"], fn_alpha.urn)
+        self.assertEqual(len(row["former_referrers"]), 1)
+        self.assertEqual(row["former_referrers"][0]["urn"], fn_alpha.urn)
         # Coordinates sourced from entity properties (not evidence).
         self.assertEqual(row["removed_symbol"]["coordinates"].get("path"), "svc/core.py")
-        self.assertEqual(row["surviving_referrers"][0]["coordinates"].get("path"), "svc/core.py")
+        self.assertEqual(row["former_referrers"][0]["coordinates"].get("path"), "svc/core.py")
+
+    def test_regression_referrer_updated_to_call_gamma_listed_as_former_not_current(self) -> None:
+        """alpha→beta in base; head removes beta, alpha→gamma.
+
+        alpha must appear as a FORMER referrer for beta — no field or key may
+        claim alpha currently references beta. referrer_likely_unchanged must be
+        False because alpha gained a new outgoing CALLS (to gamma).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fn_alpha = _symbol_with_path("svc", "svc.core", "alpha", "svc/core.py")
+            fn_beta = _symbol_with_path("svc", "svc.core", "beta", "svc/core.py")
+            fn_gamma = _symbol_with_path("svc", "svc.core", "gamma", "svc/core.py")
+            mod = _module("svc", "svc.core")
+
+            call_ab = _calls_fact(fn_alpha, fn_beta)
+            call_ag = _calls_fact(fn_alpha, fn_gamma)
+
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta], [call_ab])
+            # head: beta removed; alpha survives and now calls gamma
+            head = _make_snapshot(root, "head", [mod, fn_alpha, fn_gamma], [call_ag])
+            delta = diff_snapshots(base, head)
+            rows = removed_symbols_with_surviving_former_referrers(delta, base, head)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["removed_symbol"]["urn"], fn_beta.urn)
+
+        # Row key must be "former_referrers", not "surviving_referrers".
+        self.assertIn("former_referrers", row)
+        self.assertNotIn("surviving_referrers", row)
+
+        self.assertEqual(len(row["former_referrers"]), 1)
+        former = row["former_referrers"][0]
+        self.assertEqual(former["urn"], fn_alpha.urn)
+
+        # No field should claim alpha currently references beta.
+        self.assertNotIn("still_references", former)
+        self.assertNotIn("live_referrer", former)
+
+        # referrer_likely_unchanged=False: alpha gained a new CALLS (to gamma).
+        self.assertIs(former["referrer_likely_unchanged"], False)
 
     def test_negative_referrer_also_removed_produces_no_row(self) -> None:
         """Both beta and alpha removed — no surviving referrers."""
@@ -382,7 +426,7 @@ class TestRemovedSymbolsWithSurvivingReferrers(unittest.TestCase):
             # head has neither alpha nor beta
             head = _make_snapshot(root, "head", [mod], [])
             delta = diff_snapshots(base, head)
-            rows = removed_symbols_with_surviving_referrers(delta, base, head)
+            rows = removed_symbols_with_surviving_former_referrers(delta, base, head)
 
         self.assertEqual(rows, [])
 
@@ -397,7 +441,7 @@ class TestRemovedSymbolsWithSurvivingReferrers(unittest.TestCase):
             base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta], [])
             head = _make_snapshot(root, "head", [mod, fn_alpha], [])
             delta = diff_snapshots(base, head)
-            rows = removed_symbols_with_surviving_referrers(delta, base, head)
+            rows = removed_symbols_with_surviving_former_referrers(delta, base, head)
 
         self.assertEqual(rows, [])
 
@@ -408,7 +452,7 @@ class TestRemovedSymbolsWithSurvivingReferrers(unittest.TestCase):
             mod = _module("svc", "svc.core")
             snap = _make_snapshot(root, "snap", [mod, fn_alpha], [])
             delta = diff_snapshots(snap, snap)
-            rows = removed_symbols_with_surviving_referrers(delta, snap, snap)
+            rows = removed_symbols_with_surviving_former_referrers(delta, snap, snap)
 
         self.assertEqual(rows, [])
 
@@ -441,11 +485,11 @@ class TestRemovedSymbolsWithSurvivingReferrers(unittest.TestCase):
             base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta], [call], evidence=[ev_alpha, ev_beta])
             head = _make_snapshot(root, "head", [mod, fn_alpha], [])
             delta = diff_snapshots(base, head)
-            rows = removed_symbols_with_surviving_referrers(delta, base, head)
+            rows = removed_symbols_with_surviving_former_referrers(delta, base, head)
 
         self.assertEqual(len(rows), 1)
         removed_coords = rows[0]["removed_symbol"]["coordinates"]
-        referrer_coords = rows[0]["surviving_referrers"][0]["coordinates"]
+        referrer_coords = rows[0]["former_referrers"][0]["coordinates"]
         self.assertEqual(removed_coords, {"path": "svc/core.py", "line": 4, "end_line": 5})
         self.assertEqual(referrer_coords, {"path": "svc/core.py", "line": 1, "end_line": 2})
 

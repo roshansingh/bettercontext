@@ -237,20 +237,33 @@ def diff_snapshots(base: KgSnapshot, head: KgSnapshot) -> GraphDelta:
 # Review-relevant delta queries
 # ---------------------------------------------------------------------------
 
-def removed_symbols_with_surviving_referrers(
+def removed_symbols_with_surviving_former_referrers(
     delta: GraphDelta,
     base: KgSnapshot,
     head: KgSnapshot,
 ) -> list[JsonObject]:
-    """Symbols absent in head that still have live referrers in head.
+    """Symbols absent in head whose base-side referrers survive in head.
 
-    A *referrer* is the subject of a CALLS or IMPORTS fact in *base* whose
-    object is one of the removed symbols. "Surviving" means the referrer
-    entity (by URN) also exists in *head*.
+    A *former referrer* is the subject of a CALLS or IMPORTS fact in *base*
+    whose object is one of the removed symbols. "Surviving" means the referrer
+    entity (by URN) still exists in *head* — it does NOT mean the referrer
+    still calls the removed symbol (head-side facts to a removed symbol cannot
+    exist by construction).
 
-    Output rows (sorted by removed symbol URN, then referrer URN):
+    Contract: "symbol removed; these base-side referrers SURVIVE in head —
+    verify each was updated and no longer needs the removed symbol."
+
+    Output rows (sorted by removed symbol URN, then former-referrer URN):
       removed_symbol: {urn, entity_id, kind, qualname, repo, module, coordinates}
-      surviving_referrers: list of {urn, entity_id, kind, qualname, repo, module, coordinates}
+      former_referrers: list of {urn, entity_id, kind, qualname, repo, module,
+                                  coordinates, referrer_likely_unchanged}
+
+    referrer_likely_unchanged (bool): True when the referrer's base-side CALLS
+      fact to the removed symbol was NOT replaced by any added outgoing CALLS
+      fact in the delta (i.e. the referrer gained no new call), suggesting its
+      body may be unchanged. This is a deterministic hint derived from the delta,
+      not a verified claim — callers must confirm via source inspection.
+      Absent when the hint cannot be derived.
 
     Coordinates come from entity properties (path/line) first, then evidence
     bytes_ref. Unit-test synthetic entities built without properties return
@@ -271,7 +284,7 @@ def removed_symbols_with_surviving_referrers(
 
     # For each base CALLS/IMPORTS fact pointing at a removed entity,
     # check whether the subject (referrer) still exists in head.
-    referrers_by_removed: dict[str, set[str]] = {}  # removed entity_id → set of surviving referrer entity_ids
+    referrers_by_removed: dict[str, set[str]] = {}  # removed entity_id → set of former referrer entity_ids
     for fact in base.facts:
         if fact.get("predicate") not in {"CALLS", "IMPORTS"}:
             continue
@@ -281,7 +294,7 @@ def removed_symbols_with_surviving_referrers(
         referrer = base.entities_by_id.get(fact["subject_id"])
         if referrer is None:
             continue
-        # Referrer survives if its URN is present in head.
+        # Former referrer survives if its URN is present in head.
         if referrer["urn"] not in head_urns:
             continue
         referrers_by_removed.setdefault(obj_id, set()).add(referrer["entity_id"])
@@ -289,9 +302,20 @@ def removed_symbols_with_surviving_referrers(
     if not referrers_by_removed:
         return []
 
-    def _symbol_identity(entity: JsonObject, snap: KgSnapshot) -> JsonObject:
+    # Option-3 hint: referrer_likely_unchanged.
+    # A referrer is hinted as likely unchanged when it gained NO new outgoing
+    # CALLS fact in the delta — i.e. it had a call removed (to the removed symbol)
+    # but added nothing back.  Subject entity_ids with any added CALLS fact in
+    # the delta are considered "updated" and get referrer_likely_unchanged=False.
+    referrer_ids_with_new_call: set[str] = {
+        fact["subject_id"]
+        for fact in delta.added_facts
+        if fact.get("predicate") == "CALLS"
+    }
+
+    def _symbol_identity(entity: JsonObject, snap: KgSnapshot, referrer_likely_unchanged: bool | None = None) -> JsonObject:
         identity = entity.get("identity") or {}
-        return {
+        row: JsonObject = {
             "urn": entity["urn"],
             "entity_id": entity["entity_id"],
             "kind": entity["kind"],
@@ -300,19 +324,37 @@ def removed_symbols_with_surviving_referrers(
             "module": identity.get("module"),
             "coordinates": _entity_coordinates(entity, snap),
         }
+        if referrer_likely_unchanged is not None:
+            row["referrer_likely_unchanged"] = referrer_likely_unchanged
+        return row
+
+    # Map URN → head entity for base→head entity_id resolution (option-3 hint).
+    head_by_urn: dict[str, JsonObject] = {e["urn"]: e for e in head.entities}
 
     rows: list[JsonObject] = []
     for removed_id in sorted(referrers_by_removed):
         removed_entity = removed_by_id[removed_id]
-        surviving_referrer_ids = sorted(referrers_by_removed[removed_id])
-        referrers = [
-            _symbol_identity(base.entities_by_id[rid], base)
-            for rid in surviving_referrer_ids
-            if rid in base.entities_by_id
-        ]
+        former_referrer_ids = sorted(referrers_by_removed[removed_id])
+
+        former_referrers = []
+        for rid in former_referrer_ids:
+            base_ref = base.entities_by_id.get(rid)
+            if base_ref is None:
+                continue
+            head_ref = head_by_urn.get(base_ref["urn"])
+            # Hint: unchanged if no added CALLS from the head-side entity_id.
+            if head_ref is not None:
+                head_rid = head_ref["entity_id"]
+                likely_unchanged = head_rid not in referrer_ids_with_new_call
+            else:
+                likely_unchanged = None
+            former_referrers.append(
+                _symbol_identity(base_ref, base, referrer_likely_unchanged=likely_unchanged)
+            )
+
         rows.append({
             "removed_symbol": _symbol_identity(removed_entity, base),
-            "surviving_referrers": referrers,
+            "former_referrers": former_referrers,
         })
 
     rows.sort(key=lambda r: r["removed_symbol"]["urn"])
