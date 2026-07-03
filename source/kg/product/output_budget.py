@@ -993,6 +993,20 @@ _COMPACT_PROFILE_RESERVE = 2_200
 _COMPACT_EDGE_RESERVE = 1_200
 _COMPACT_EDGE_FIELDS = ("direct_callers", "direct_callees", "transitive_callers")
 
+# Risk types produced by diff-splice operations (contract_diff, semantic_diff,
+# abstract_contract). Budget truncation must keep at least one row per type when
+# rows of that type were generated, mirroring the reserved-slot guarantee in the
+# mcp_tools splice ordering.
+_DIFF_DERIVED_RISK_TYPES: frozenset[str] = frozenset(
+    {
+        "contract_semantic_diff",
+        "abstract_contract_unimplemented",
+        "guard_call_removed_drift",
+        "responsibility_moved_drift",
+        "test_reference_removed_drift",
+    }
+)
+
 
 def _lean_review_hypothesis(row: JsonObject) -> JsonObject:
     """Compact-profile hypothesis row: full adjudication fields, deduped coordinates.
@@ -1150,6 +1164,35 @@ def _hypothesis_first_compact_packet(
         if index > 0 and _current_chars(packet) > hypothesis_budget:
             hypotheses.pop()
             break
+
+    # Diff-derived pinning: if budget truncation dropped all rows for a diff-derived
+    # risk_type that was generated, swap in one row of that type — evicting the last
+    # non-diff-derived hypothesis if needed — so truncation never implies absence for
+    # an entire diff family. Mirrors the reserved-slot guarantee from the splice ordering.
+    kept_risk_types = {h.get("risk_type") for h in hypotheses if isinstance(h, dict)}
+    for orig_hyp in original_hypotheses:
+        if not isinstance(orig_hyp, dict):
+            continue
+        rt = orig_hyp.get("risk_type")
+        if rt not in _DIFF_DERIVED_RISK_TYPES or rt in kept_risk_types:
+            continue
+        lean_row = _lean_review_hypothesis(orig_hyp)
+        hypotheses.append(lean_row)
+        if _current_chars(packet) <= hypothesis_budget:
+            kept_risk_types.add(rt)
+            continue
+        # Over budget: try swapping out the last non-diff-derived row.
+        swap_idx = next(
+            (i for i in range(len(hypotheses) - 2, -1, -1)
+             if hypotheses[i].get("risk_type") not in _DIFF_DERIVED_RISK_TYPES),
+            None,
+        )
+        if swap_idx is not None:
+            hypotheses.pop(swap_idx)
+            if _current_chars(packet) <= hypothesis_budget:
+                kept_risk_types.add(rt)
+                continue
+        hypotheses.pop()
 
     # Tier 3: append the pre-computed anchors (budget guard for pathological fixtures
     # where even the anchor set alone exceeds the cap).
@@ -3661,10 +3704,14 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
       reason — "none_generated" | "budget" | "low_coverage" | null
       available_risk_types — sorted list of risk_type strings from the pre-budget generated set
         (not truncated by budget; bounded at 12 entries; empty when no hypotheses generated)
+      available_by_risk_type — counts over ALL generated hypotheses before budget truncation
+      returned_by_risk_type — counts over hypotheses present in the final packet
+      truncated_by_risk_type — available minus returned per type; zero entries omitted
     """
     _MAX_AVAILABLE_RISK_TYPES = 12
     available = len(original_hypotheses)
-    returned = len([h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)])
+    final_hyps = [h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)]
+    returned = len(final_hyps)
     answer_packet = result.get("review_answer_packet")
     if isinstance(answer_packet, dict):
         mirror_hyps = answer_packet.get("top_review_hypotheses")
@@ -3687,6 +3734,21 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
     available_risk_types = sorted(
         {str(h.get("risk_type") or "") for h in original_hypotheses if isinstance(h, dict) and h.get("risk_type")}
     )[:_MAX_AVAILABLE_RISK_TYPES]
+    available_by_risk_type: dict[str, int] = {}
+    for h in original_hypotheses:
+        if isinstance(h, dict) and h.get("risk_type"):
+            rt = str(h["risk_type"])
+            available_by_risk_type[rt] = available_by_risk_type.get(rt, 0) + 1
+    returned_by_risk_type: dict[str, int] = {}
+    for h in final_hyps:
+        if h.get("risk_type"):
+            rt = str(h["risk_type"])
+            returned_by_risk_type[rt] = returned_by_risk_type.get(rt, 0) + 1
+    truncated_by_risk_type = {
+        rt: available_by_risk_type[rt] - returned_by_risk_type.get(rt, 0)
+        for rt in available_by_risk_type
+        if available_by_risk_type[rt] - returned_by_risk_type.get(rt, 0) > 0
+    }
     result["review_hypothesis_status"] = {
         "available_count": available,
         "returned_count": returned,
@@ -3694,6 +3756,9 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
         "truncated_count": truncated_count,
         "reason": reason,
         "available_risk_types": available_risk_types,
+        "available_by_risk_type": available_by_risk_type,
+        "returned_by_risk_type": returned_by_risk_type,
+        "truncated_by_risk_type": truncated_by_risk_type,
     }
 
 
