@@ -874,6 +874,42 @@ class TestReviewContextContractDiffSplice(unittest.TestCase):
         rqs = result.get("review_quality_status") or {}
         self.assertIn("base_snapshot", rqs.get("reason", ""), "reason must carry the load-failure note")
 
+    def test_failure_note_survives_reason_rewrite_on_high_specificity_packet(self) -> None:
+        """Codex round-5 P2: the quality-status resync rewrote reason on the high/medium
+        branch, dropping the base_snapshot failure note. The note is packet contract —
+        it must survive on EVERY specificity branch."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            svc = root / "svc"
+            svc.mkdir()
+            (svc / "__init__.py").write_text("", encoding="utf-8")
+            # Bare-except-pass fires the swallowed_exception signal -> HIGH specificity family.
+            (svc / "core.py").write_text(
+                "def alpha(items):\n"
+                "    out = []\n"
+                "    for item in items:\n"
+                "        try:\n"
+                "            out.append(item.value)\n"
+                "        except Exception:\n"
+                "            pass\n"
+                "    return out\n",
+                encoding="utf-8",
+            )
+            out_head = root / "kg_head"
+            build_kg(svc, out_head, tenant_id=TENANT)
+            result = self._review_context(
+                out_head,
+                {
+                    "base_snapshot": str(root / "does-not-exist"),
+                    "changed_ranges": [{"path": "core.py", "start_line": 1, "end_line": 9}],
+                },
+            )
+
+        rqs = result.get("review_quality_status") or {}
+        self.assertIn(rqs.get("specificity"), ("high", "medium"), "fixture must yield a specific packet")
+        self.assertIn("base_snapshot", rqs.get("reason", ""),
+                      "failure note must survive the high/medium reason rewrite")
+
     def test_absent_base_snapshot_identical_to_today(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             _base, head = _build_two_commit_pair(Path(tmpdir))

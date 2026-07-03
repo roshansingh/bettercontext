@@ -4232,21 +4232,22 @@ def _sync_review_quality_status_from_packet(
     synced["specific_hypothesis_count"] = specific_count
     synced["generic_hypothesis_count"] = generic_count
     synced["specificity"] = max_spec
+    # Base-snapshot failure notes are part of the packet contract: they must survive
+    # the reason rewrite on EVERY specificity branch, not only the low path.
+    contract_note = status.get("contract_diff_note")
     if max_spec in ("high", "medium"):
         synced["recommended_action"] = "use_supercontext_packet"
-        synced["reason"] = (
+        base_reason = (
             f"Packet contains {specific_count} specific hypothesis/es (specificity={max_spec}) "
             "backed by signal or convention evidence."
         )
     else:
         synced["recommended_action"] = "use_live_followups_or_plain_review"
-        # Preserve contract_diff_note in reason if present
         base_reason = (
             "All generated hypotheses are generic (no signal/delta or convention-specific evidence); "
             "live source inspection will yield higher precision."
         )
-        contract_note = status.get("contract_diff_note")
-        synced["reason"] = f"{base_reason} {contract_note}" if contract_note else base_reason
+    synced["reason"] = f"{base_reason} {contract_note}" if contract_note else base_reason
     # Honesty: if truncation removed high-specificity rows that were generated, record the
     # pre-budget count so the caller can distinguish "none generated" from "truncated away".
     orig_specific = sum(
