@@ -189,7 +189,13 @@ class TestSemanticDiffEndToEnd(unittest.TestCase):
         return result
 
     def test_semantic_diff_hypothesis_in_result(self) -> None:
-        """contract_semantic_diff hypothesis present with derivation=inferred_llm."""
+        """contract_semantic_diff hypothesis present with derivation=inferred_llm.
+
+        Note: changed_ranges deliberately omitted here. Passing changed_ranges with no
+        matching symbols triggers the compact-unanchored path, which correctly excludes
+        semantic diff hypotheses (Problem E revert: only stylesheet gap rows survive that
+        path, since checkouts are incompatible with the zero-anchor trigger condition).
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
@@ -204,7 +210,8 @@ class TestSemanticDiffEndToEnd(unittest.TestCase):
                 result = call_tool(head_kg, "review_context", {
                     "repo": TENANT,
                     "changed_files": ["handler.py"],
-                    "changed_ranges": [{"path": "handler.py", "start_line": 1, "end_line": 5}],
+                    # No changed_ranges: avoids the zero-anchor compact-unanchored path
+                    # so review_hypotheses are retained in the full result.
                     "base_snapshot": str(out_base),
                     "base_checkout": str(base_checkout),
                     "head_checkout": str(head_checkout),
@@ -254,7 +261,12 @@ class TestSemanticDiffEndToEnd(unittest.TestCase):
             )
 
     def test_adjudication_fields_complete(self) -> None:
-        """All adjudication fields (cause, consequence, negative_checks) are present."""
+        """All adjudication fields (negative_checks, source_checks, confidence, why) are present.
+
+        Note: changed_ranges omitted to avoid compact-unanchored path stripping hypotheses.
+        cause/consequence are now conditional on cause_line being in-range (Problem C fix),
+        so only always-present adjudication fields are checked.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
@@ -269,7 +281,7 @@ class TestSemanticDiffEndToEnd(unittest.TestCase):
                 result = call_tool(head_kg, "review_context", {
                     "repo": TENANT,
                     "changed_files": ["handler.py"],
-                    "changed_ranges": [{"path": "handler.py", "start_line": 1, "end_line": 5}],
+                    # No changed_ranges: avoids compact-unanchored path.
                     "base_snapshot": str(out_base),
                     "base_checkout": str(base_checkout),
                     "head_checkout": str(head_checkout),
@@ -280,7 +292,8 @@ class TestSemanticDiffEndToEnd(unittest.TestCase):
             if not semantic_hyps:
                 self.skipTest("no semantic hyps generated — fixture may have no differing bodies")
             h = semantic_hyps[0]
-            for field in ("cause", "negative_checks", "source_checks", "confidence", "why"):
+            # cause/consequence are conditional on cause_line being in-range (Problem C fix).
+            for field in ("negative_checks", "source_checks", "confidence", "why"):
                 self.assertIn(field, h, f"field {field!r} must be present; keys={list(h.keys())}")
 
 
@@ -866,6 +879,172 @@ class TestSemanticDiffPrefilterBeforeCap(unittest.TestCase):
                 f"LLM must be called exactly 3 times (only for differing symbols); "
                 f"was called {counting_client.call_count} times",
             )
+
+
+# ---------------------------------------------------------------------------
+# 6. Problem C: cause_line upper clamp (FW2)
+# ---------------------------------------------------------------------------
+
+class TestCauseLineUpperClamp(unittest.TestCase):
+    """Problem C: body-derived upper bound for cause_line when end_line is None."""
+
+    def _make_single_symbol_snap_no_end_line(self, root: Path) -> tuple[KgSnapshot, Path, Path]:
+        """Symbol with line=5, end_line=None, body of 10 lines."""
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        e = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_clamp_ub",
+                "module": "mod.handler",
+                "qualname": "ub_func",
+                "symbol_kind": "function",
+            },
+            # end_line intentionally absent → None in KG
+            properties={"path": "handler.py", "line": 5},
+        )
+        snap_dir = root / "snap_clamp_ub"
+        JsonlKgStore(snap_dir).write(
+            entities=[e], facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": TENANT},
+        )
+        snap = KgSnapshot(snap_dir)
+
+        # Body: 10 lines starting at line 5 → valid range is [5, 14]
+        body_10_lines = "\n".join(f"    line_{i} = {i}" for i in range(10)) + "\n"
+        base_dir = root / "base_clamp_ub"
+        base_dir.mkdir()
+        (base_dir / "handler.py").write_text("# padding\n" * 4 + f"def ub_func():\n{body_10_lines}")
+        head_dir = root / "head_clamp_ub"
+        head_dir.mkdir()
+        (head_dir / "handler.py").write_text("# padding\n" * 4 + f"def ub_func():\n    return 0\n")
+
+        return snap, base_dir, head_dir
+
+    def test_cause_line_999999_clamped_to_body_span(self) -> None:
+        """LLM returns cause_line=999999 → cause dict has line_start <= symbol line + body line count."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap_no_end_line(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _FakeClient(response=[{
+                "claim": "Function contract changed.",
+                "cause_line": 999999,  # Out of range — must be clamped
+                "consequence": "Some consequence.",
+                "negative_check": "No check.",
+                "category": "guard_removal",
+            }])
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+            self.assertTrue(rows, "expected at least one row")
+            row = rows[0]
+            # With cause_line=999999 clamped to body span, cause dict should be absent
+            # (out of file range after clamping). Check source_spans still present.
+            self.assertIn("source_spans", row, "source_spans must be present regardless of clamp")
+            # If cause is present, its line_start must be within [5, 5 + 10 body lines]
+            if "cause" in row:
+                line_start = row["cause"].get("line_start", 0)
+                self.assertLessEqual(
+                    line_start, 15,
+                    f"cause.line_start must be <= 15 (line 5 + 10 body lines); got {line_start}",
+                )
+
+    def test_cause_line_in_range_produces_cause_dict(self) -> None:
+        """cause_line within symbol span → cause dict present."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap_no_end_line(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _FakeClient(response=[{
+                "claim": "Function contract changed.",
+                "cause_line": 7,  # Within range [5, 14]
+                "consequence": "Some consequence.",
+                "negative_check": "No check.",
+                "category": "guard_removal",
+            }])
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+            self.assertTrue(rows, "expected at least one row")
+            row = rows[0]
+            self.assertIn("cause", row, "cause dict must be present for in-range cause_line")
+            self.assertLessEqual(row["cause"]["line_start"], 14)
+
+
+# ---------------------------------------------------------------------------
+# 7. Problem B: derivation survives compaction (FW2)
+# ---------------------------------------------------------------------------
+
+class TestDerivationSurvivesCompact(unittest.TestCase):
+    """Problem B: derivation=inferred_llm must survive _compact_review_hypothesis and _slim_mirror_hypothesis."""
+
+    def test_compact_review_hypothesis_keeps_derivation(self) -> None:
+        """_compact_review_hypothesis preserves derivation=inferred_llm."""
+        from source.kg.product import output_budget as ob
+
+        row = {
+            "hypothesis_id": "hyp-001",
+            "label": "H001",
+            "risk_type": "contract_semantic_diff",
+            "specificity": "high",
+            "confidence": "medium",
+            "why": "test why",
+            "concrete_invariant": "test invariant",
+            "postable_claim": "test claim",
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/a.py", "line_start": 5},
+            "consequence": {"path": "src/a.py", "line_start": 5},
+            "evidence_refs": [],
+            "source_spans": [],
+            "source_checks": [],
+            "negative_checks": [],
+            "supporting_lead_ids": [],
+        }
+        compact = ob._compact_review_hypothesis(row)
+        self.assertEqual(
+            compact.get("derivation"), "inferred_llm",
+            f"derivation must survive _compact_review_hypothesis; got {compact.get('derivation')}",
+        )
+
+    def test_slim_mirror_hypothesis_keeps_derivation(self) -> None:
+        """_slim_mirror_hypothesis preserves derivation=inferred_llm."""
+        from source.kg.product import output_budget as ob
+
+        row = {
+            "hypothesis_id": "hyp-002",
+            "label": "H002",
+            "risk_type": "contract_semantic_diff",
+            "specificity": "high",
+            "confidence": "medium",
+            "postable_claim": "test claim",
+            "derivation": "inferred_llm",
+        }
+        slim = ob._slim_mirror_hypothesis(row)
+        self.assertEqual(
+            slim.get("derivation"), "inferred_llm",
+            f"derivation must survive _slim_mirror_hypothesis; got {slim.get('derivation')}",
+        )
 
 
 # ---------------------------------------------------------------------------

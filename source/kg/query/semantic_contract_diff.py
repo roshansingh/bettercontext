@@ -279,17 +279,39 @@ def semantic_contract_diff(
             except (TypeError, ValueError):
                 cause_line = int(head_line_start) if head_line_start is not None else 1
 
-            if head_line_start is not None and head_line_end is not None:
-                cause_line = max(int(head_line_start), min(cause_line, int(head_line_end)))
+            # Problem C fix: compute body-derived upper bound when end_line absent.
+            # head_body is available in scope (read during prefilter, stored in differing_by_urn).
+            if head_line_end is not None:
+                derived_end: int | None = int(head_line_end)
+            elif head_line_start is not None and head_body:
+                body_line_count = head_body.count("\n") + 1
+                derived_end = int(head_line_start) + body_line_count - 1
+            else:
+                derived_end = None
+
+            if head_line_start is not None and derived_end is not None:
+                cause_line = max(int(head_line_start), min(cause_line, derived_end))
             elif head_line_start is not None:
                 cause_line = max(int(head_line_start), cause_line)
 
-            cause: JsonObject = {"path": head_path, "line_start": cause_line}
-            if sym_span.get("repo"):
-                cause["repo"] = sym_span["repo"]
-            consequence: JsonObject = {"path": head_path, "line_start": cause_line}
-            if sym_span.get("repo"):
-                consequence["repo"] = sym_span["repo"]
+            # Drop cause/consequence coordinate dicts if cause_line is still out of file range.
+            # (This is a safety net: body-derived clamping above should prevent this normally.)
+            cause_in_range = True
+            if head_body:
+                file_line_count = head_body.count("\n") + 1
+                if head_line_start is not None and cause_line > (int(head_line_start) + file_line_count - 1):
+                    cause_in_range = False
+
+            # Build coordinate dicts only when cause_line is within file range.
+            cause: JsonObject | None = None
+            consequence: JsonObject | None = None
+            if cause_in_range:
+                cause = {"path": head_path, "line_start": cause_line}
+                if sym_span.get("repo"):
+                    cause["repo"] = sym_span["repo"]
+                consequence = {"path": head_path, "line_start": cause_line}
+                if sym_span.get("repo"):
+                    consequence["repo"] = sym_span["repo"]
 
             hyp_id = _hyp_id(claim, head_path, cause_line)
             source_spans = [sym_span] if sym_span else []
@@ -313,9 +335,7 @@ def semantic_contract_diff(
                     f"(category: {category}). This is a candidate hypothesis based on "
                     "body-text diff analysis — verify against head source before acting."
                 ),
-                "cause": cause,
                 "consequence_text": consequence_text,
-                "consequence": consequence,
                 "negative_checks": [negative_check],
                 "source_checks": [
                     f"Verify: {claim}",
@@ -329,6 +349,11 @@ def semantic_contract_diff(
                 "before_refs": [],
                 "after_refs": [sym_span] if sym_span else [],
             }
+            # Conditionally include coordinate dicts only when in-range.
+            if cause is not None:
+                row["cause"] = cause
+            if consequence is not None:
+                row["consequence"] = consequence
             rows.append(row)
             hyps_from_symbol += 1
 

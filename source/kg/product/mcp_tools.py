@@ -3552,7 +3552,18 @@ def _splice_semantic_diff_hypotheses(
     if not spliced:
         return review_hypotheses, inner_status
 
-    return spliced + review_hypotheses, inner_status
+    # Problem A fix: trust-tier ordering — deterministic_static rows before inferred_llm rows.
+    # Semantic rows are inferred_llm; insert them AFTER existing deterministic-static rows and
+    # BEFORE any existing inferred_llm rows, so the ADR-0006 tier order is preserved.
+    det_rows = [h for h in review_hypotheses if h.get("derivation") != "inferred_llm"]
+    llm_rows = [h for h in review_hypotheses if h.get("derivation") == "inferred_llm"]
+
+    # Record omitted count (mirrors omitted_contract_diff_family_count pattern in contract splice).
+    omitted_count = max(0, len(raw_rows) - _SEMANTIC_DIFF_SPLICE_CAP)
+    if omitted_count > 0 and spliced:
+        spliced[-1] = dict(spliced[-1], omitted_semantic_diff_count=omitted_count)
+
+    return det_rows + spliced + llm_rows, inner_status
 
 
 def _review_context_lead_packet(

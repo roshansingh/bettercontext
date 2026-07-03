@@ -1026,7 +1026,7 @@ def _tight_cluster_anchor(row: JsonObject) -> JsonObject:
     return {key: row[key] for key in _TIGHT_ANCHOR_KEYS if row.get(key) is not None}
 
 
-_SLIM_MIRROR_HYPOTHESIS_KEYS = ("hypothesis_id", "label", "risk_type", "specificity", "confidence", "postable_claim")
+_SLIM_MIRROR_HYPOTHESIS_KEYS = ("hypothesis_id", "label", "risk_type", "specificity", "confidence", "postable_claim", "derivation")
 
 
 def _slim_mirror_hypothesis(row: JsonObject) -> JsonObject:
@@ -3230,7 +3230,7 @@ def _compact_coordinate(row: JsonObject) -> JsonObject:
 def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
     compact: JsonObject = {}
     for key in ("hypothesis_id", "label", "risk_type", "confidence", "why", "concrete_invariant",
-                "specificity", "postable_claim", "cause", "consequence"):
+                "specificity", "postable_claim", "cause", "consequence", "derivation"):
         if key in row:
             compact[key] = row[key]
     evidence_refs = row.get("evidence_refs")

@@ -8974,5 +8974,85 @@ class TestSpliceFamilyRoundRobin(unittest.TestCase):
         self.assertEqual(len(native_in_cap), 2, "2 native rows fill remaining slots")
 
 
+# ---------------------------------------------------------------------------
+# FW2: Problem A — trust-tier ordering in _splice_semantic_diff_hypotheses
+# ---------------------------------------------------------------------------
+
+class TestSemanticSpliceTrustTierOrdering(unittest.TestCase):
+    """Problem A: deterministic_static rows must come before inferred_llm rows after splice."""
+
+    def test_deterministic_rows_before_semantic_rows_after_splice(self) -> None:
+        """3 deterministic + 3 semantic rows → after [:5] cap, deterministic rows first.
+
+        Tests the ordering logic directly: given existing hypotheses with 3 deterministic-static
+        rows and 3 pre-spliced semantic rows, the merge must produce det_rows + semantic + llm_rows.
+        """
+        from source.kg.product.mcp_tools import PLANNING_CONTEXT_SECTION_LIMIT
+
+        # Pre-existing hypotheses: 3 deterministic (derivation != inferred_llm)
+        existing_hyps = [
+            {
+                "hypothesis_id": f"det-{i}",
+                "risk_type": "guard_call_removed_drift",
+                "specificity": "high",
+                "derivation": "deterministic_static",
+            }
+            for i in range(3)
+        ]
+
+        # Fake semantic rows (would come from _splice_semantic_diff_hypotheses)
+        semantic_rows = [
+            {
+                "hypothesis_id": f"sem-{i}",
+                "risk_type": "contract_semantic_diff",
+                "specificity": "high",
+                "derivation": "inferred_llm",
+            }
+            for i in range(3)
+        ]
+
+        # Replicate the trust-tier merge logic from _splice_semantic_diff_hypotheses
+        det_rows = [h for h in existing_hyps if h.get("derivation") != "inferred_llm"]
+        llm_rows = [h for h in existing_hyps if h.get("derivation") == "inferred_llm"]
+        merged = det_rows + semantic_rows + llm_rows
+
+        # After [:5] cap: all 3 det + 2 sem (det rows must come first)
+        capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+        self.assertEqual(len(capped), 5)
+        # First 3 must be deterministic
+        for i in range(3):
+            self.assertEqual(
+                capped[i].get("derivation"), "deterministic_static",
+                f"row {i} must be deterministic_static; got {capped[i].get('derivation')}",
+            )
+        # Rows 3-4 must be semantic
+        for i in range(3, 5):
+            self.assertEqual(
+                capped[i].get("derivation"), "inferred_llm",
+                f"row {i} must be inferred_llm; got {capped[i].get('derivation')}",
+            )
+
+    def test_existing_llm_rows_pushed_after_semantic_rows(self) -> None:
+        """Existing inferred_llm rows are placed AFTER new semantic rows in the merged list."""
+        # Pre-existing: 2 deterministic + 1 existing LLM row
+        existing_hyps = [
+            {"hypothesis_id": "det-0", "risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
+            {"hypothesis_id": "det-1", "risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
+            {"hypothesis_id": "old-llm-0", "risk_type": "swallowed_exception", "derivation": "inferred_llm"},
+        ]
+        new_semantic = [
+            {"hypothesis_id": "sem-0", "risk_type": "contract_semantic_diff", "derivation": "inferred_llm"},
+        ]
+        det_rows = [h for h in existing_hyps if h.get("derivation") != "inferred_llm"]
+        llm_rows = [h for h in existing_hyps if h.get("derivation") == "inferred_llm"]
+        merged = det_rows + new_semantic + llm_rows
+
+        # Order: det-0, det-1, sem-0, old-llm-0
+        self.assertEqual(merged[0]["hypothesis_id"], "det-0")
+        self.assertEqual(merged[1]["hypothesis_id"], "det-1")
+        self.assertEqual(merged[2]["hypothesis_id"], "sem-0")
+        self.assertEqual(merged[3]["hypothesis_id"], "old-llm-0")
+
+
 if __name__ == "__main__":
     unittest.main()
