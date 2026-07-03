@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from source.kg.core.models import JsonObject
-from source.kg.product.review_attribution import hypothesis_stable_id
+from source.kg.product.review_attribution import hypothesis_label, hypothesis_stable_id
 
 
 def _normalize_path(path: str) -> str:
@@ -270,7 +270,9 @@ def _make_hypothesis(
     source_spans = _source_spans_from_evidence_refs(evidence_refs)
     if source_spans:
         row["source_spans"] = source_spans
-    row["hypothesis_id"] = hypothesis_stable_id(risk_type, supporting_lead_ids, evidence_refs)
+    hypothesis_id = hypothesis_stable_id(risk_type, supporting_lead_ids, evidence_refs)
+    row["hypothesis_id"] = hypothesis_id
+    row["label"] = hypothesis_label(risk_type, hypothesis_id)
     return row
 
 

@@ -1026,7 +1026,7 @@ def _tight_cluster_anchor(row: JsonObject) -> JsonObject:
     return {key: row[key] for key in _TIGHT_ANCHOR_KEYS if row.get(key) is not None}
 
 
-_SLIM_MIRROR_HYPOTHESIS_KEYS = ("hypothesis_id", "risk_type", "specificity", "confidence", "postable_claim")
+_SLIM_MIRROR_HYPOTHESIS_KEYS = ("hypothesis_id", "label", "risk_type", "specificity", "confidence", "postable_claim")
 
 
 def _slim_mirror_hypothesis(row: JsonObject) -> JsonObject:
@@ -3229,7 +3229,7 @@ def _compact_coordinate(row: JsonObject) -> JsonObject:
 
 def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
     compact: JsonObject = {}
-    for key in ("hypothesis_id", "risk_type", "confidence", "why", "concrete_invariant",
+    for key in ("hypothesis_id", "label", "risk_type", "confidence", "why", "concrete_invariant",
                 "specificity", "postable_claim", "cause", "consequence"):
         if key in row:
             compact[key] = row[key]
@@ -4247,7 +4247,17 @@ def _sync_review_quality_status_from_packet(
             "All generated hypotheses are generic (no signal/delta or convention-specific evidence); "
             "live source inspection will yield higher precision."
         )
+    base_diff_note = status.get("base_diff_status")
+    if base_diff_note == "missing":
+        base_reason = (
+            f"{base_reason} Head-only packet. Contract-diff families are disabled; "
+            "recall expected to be low for ownership/guard/provenance/type-shape changes."
+        )
     synced["reason"] = f"{base_reason} {contract_note}" if contract_note else base_reason
+    # Preserve S1 measurement-validity fields through the sync rewrite.
+    for _s1_key in ("base_diff_status", "suggested_setup", "review_readiness", "suggested_followups"):
+        if _s1_key in status:
+            synced[_s1_key] = status[_s1_key]
     # Honesty: if truncation removed high-specificity rows that were generated, record the
     # pre-budget count so the caller can distinguish "none generated" from "truncated away".
     orig_specific = sum(

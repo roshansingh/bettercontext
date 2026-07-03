@@ -25,6 +25,7 @@ from source.kg.product.output_budget import (
 from source.kg.product.edge_role import annotate_edge_roles, build_edge_role_index, rank_by_review_value
 from source.kg.product.review_attribution import (
     add_review_lead_ids,
+    hypothesis_label,
     review_available_counts,
     review_lead_counts,
 )
@@ -3038,10 +3039,19 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     # already correct; slicing here preserves that order while bounding the list.
     review_hypotheses = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
+    if base_snapshot_dir:
+        _base_diff_status = "active" if contract_diff_note is None else "failed"
+    elif changed_ranges:
+        _base_diff_status = "missing"
+    else:
+        _base_diff_status = None
     review_quality_status = _build_review_quality_status(
         review_hypotheses=review_hypotheses,
         coverage_status=review_lead_packet["review_lead_status"].get("coverage_status", ""),
         contract_diff_note=contract_diff_note,
+        base_diff_status=_base_diff_status,
+        changed_ranges=changed_ranges,
+        changed_symbols=changed_symbols_in_scope,
     )
     result = {
         "status": status,
@@ -3131,6 +3141,9 @@ def _build_review_quality_status(
     review_hypotheses: list[JsonObject],
     coverage_status: str,
     contract_diff_note: str | None = None,
+    base_diff_status: str | None = None,
+    changed_ranges: list[JsonObject] | None = None,
+    changed_symbols: list[JsonObject] | None = None,
 ) -> JsonObject:
     """Build the review_quality_status scalar object emitted alongside review_lead_status.
 
@@ -3142,6 +3155,9 @@ def _build_review_quality_status(
       recommended_action — "use_supercontext_packet" when high or medium, else "use_live_followups_or_plain_review"
       reason — short explanation
       contract_diff_note — present only when a base_snapshot was provided; carries load/tenant status
+      base_diff_status — "missing" | "active" | "failed"; present when changed_ranges supplied
+      review_readiness — routing field: packet_ready | needs_followup | plain_review_better | base_snapshot_required
+      suggested_followups — bounded list (<=3) of concrete follow-up suggestions; present on low-specificity packets
     """
     specific_count = 0
     generic_count = 0
@@ -3169,9 +3185,28 @@ def _build_review_quality_status(
             "All generated hypotheses are generic (no signal/delta or convention-specific evidence); "
             "live source inspection will yield higher precision."
         )
+    if base_diff_status == "missing":
+        reason = (
+            f"{reason} Head-only packet. Contract-diff families are disabled; "
+            "recall expected to be low for ownership/guard/provenance/type-shape changes."
+        )
     if contract_diff_note:
         # Coverage-honest: base_snapshot problems surface in the reason, never as errors.
         reason = f"{reason} {contract_diff_note}"
+
+    # review_readiness routing
+    has_changed_ranges = bool(changed_ranges)
+    if max_spec in ("high", "medium"):
+        review_readiness = "packet_ready"
+    elif base_diff_status == "missing" and has_changed_ranges:
+        review_readiness = "base_snapshot_required"
+    else:
+        suggested = _build_suggested_followups(
+            review_hypotheses=review_hypotheses,
+            changed_symbols=changed_symbols or [],
+        )
+        review_readiness = "needs_followup" if suggested else "plain_review_better"
+
     status: JsonObject = {
         "coverage_status": coverage_status,
         "specific_hypothesis_count": specific_count,
@@ -3179,10 +3214,64 @@ def _build_review_quality_status(
         "specificity": max_spec,
         "recommended_action": recommended_action,
         "reason": reason,
+        "review_readiness": review_readiness,
     }
+    if base_diff_status is not None:
+        status["base_diff_status"] = base_diff_status
+        if base_diff_status == "missing":
+            status["suggested_setup"] = "build_base_snapshot_then_retry"
     if contract_diff_note is not None:
         status["contract_diff_note"] = contract_diff_note
+
+    # suggested_followups: only on low-specificity packets
+    if max_spec not in ("high", "medium"):
+        followups = _build_suggested_followups(
+            review_hypotheses=review_hypotheses,
+            changed_symbols=changed_symbols or [],
+            include_base_build=(base_diff_status == "missing"),
+        )
+        if followups:
+            status["suggested_followups"] = followups
+
     return status
+
+
+def _build_suggested_followups(
+    *,
+    review_hypotheses: list[JsonObject],
+    changed_symbols: list[JsonObject],
+    include_base_build: bool = False,
+) -> list[JsonObject]:
+    """Build bounded (<=3) list of concrete follow-up suggestions for low-specificity packets.
+
+    Deterministic templates over real data — no fabrication.
+    """
+    followups: list[JsonObject] = []
+    if include_base_build:
+        followups.append({
+            "why": (
+                "Build a base_snapshot for the PR base SHA, then pass base_snapshot to review_context. "
+                "This activates contract-diff families (guard_call_removed_drift, responsibility_moved_drift, "
+                "test_reference_removed_drift) which detect ownership/guard/provenance changes."
+            ),
+            "action": "build_base_snapshot_then_retry",
+        })
+    # Emit find_callers followups for the top changed symbols that have a qualname.
+    seen: set[str] = set()
+    for sym in changed_symbols:
+        if len(followups) >= 3:
+            break
+        qualname = sym.get("qualname") or sym.get("qualified_name") or sym.get("display_name")
+        path = sym.get("path")
+        if not qualname or not path or qualname in seen:
+            continue
+        seen.add(qualname)
+        followups.append({
+            "tool": "find_callers",
+            "args": {"symbol": qualname},
+            "why": f"Enumerate callers of changed symbol {qualname!r} to find downstream impact.",
+        })
+    return followups[:3]
 
 
 # Contract-diff families treated as "high" specificity when spliced into review_hypotheses.
@@ -3285,6 +3374,7 @@ def _splice_contract_diff_hypotheses(
             ]
         spliced_row: JsonObject = {
             "hypothesis_id": hypothesis_id,
+            "label": hypothesis_label(risk_type, hypothesis_id),
             "risk_type": risk_type,
             "specificity": "high",
             "confidence": "medium",
@@ -7002,7 +7092,9 @@ _TOOLS: dict[str, McpTool] = {
             "Use it when you know the changed files and need deterministic static review context before drilling into narrower MCP tools. "
             "Large packets are bounded: when output_budget is present the detail rows were compacted to a coordinate-bearing head start, so inspect source coordinates or call narrower changed_ranges/exact tools for omitted detail. "
             "Does not infer deploy blockers unless explicitly requested, summarize diffs with an LLM, or invent cross-repo and runtime-only impact. "
-            "Read review_hypotheses as candidate source-inspection leads, not proven bugs. If using a hypothesis in a review finding, include its hypothesis_id and supporting lead_id values in the finding metadata when the review harness supports attribution."
+            "Read review_hypotheses as candidate source-inspection leads, not proven bugs. Every finding derived from a SuperContext hypothesis must state either: hypothesis_id=<id> and label=<label> (use the hypothesis.label field, e.g. 'async_side_effect_lifecycle_drift-5745'), or no_supercontext_hypothesis_used=true. This attribution is required for recall measurement; omitting it loses the causal link. "
+            "review_quality_status.review_readiness is the harness routing field: packet_ready means forced packet review is safe; needs_followup means call suggested_followups first; plain_review_better means do normal PR review; base_snapshot_required means build base snapshot and retry before spending model. "
+            "review_quality_status.base_diff_status is 'missing' when no base_snapshot was provided but changed_ranges are present (contract-diff families are disabled); 'active' when base_snapshot loaded successfully; 'failed' when it could not be loaded. Build and pass base_snapshot when base_diff_status is missing to enable ownership/guard/provenance change detection."
         ),
         input_schema=_object_schema(_review_context_properties(), required=["repo", "changed_files"]),
         handler=_review_context,
