@@ -1328,7 +1328,7 @@ class TestSemanticDiffLive(unittest.TestCase):
                 head_snapshot=snap,
                 base_root=base_dir,
                 head_root=head_dir,
-                changed_symbols=[e],
+                changed_symbols=[e.to_record()],
                 client=client,
             )
             # Shape-only assertions
