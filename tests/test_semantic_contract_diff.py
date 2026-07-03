@@ -1868,5 +1868,334 @@ class TestMixedAuthPartialPreservesRows(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# Fix wave: P1 — invalid checkout paths are reported as explicit failures
+# ---------------------------------------------------------------------------
+
+class TestInvalidCheckoutPaths(unittest.TestCase):
+    """P1 fix: nonexistent or non-directory checkout paths return explicit failure status."""
+
+    def _splice(self, base_checkout: str, head_checkout: str, base_snapshot_dir: str, head_kg: KgSnapshot, changed_symbols: list) -> str:
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+        _, status = _splice_semantic_diff_hypotheses(
+            base_snapshot_dir=base_snapshot_dir,
+            head_kg=head_kg,
+            base_checkout=base_checkout,
+            head_checkout=head_checkout,
+            changed_symbols=changed_symbols,
+            review_hypotheses=[],
+            _client=_FakeClient(),
+        )
+        return status
+
+    def test_nonexistent_base_checkout_returns_failed_invalid_base(self) -> None:
+        """Nonexistent base_checkout dir → status 'failed:invalid_base_checkout' (exact)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, _bc, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            status = self._splice(
+                base_checkout=str(root / "does_not_exist"),
+                head_checkout=str(head_checkout),
+                base_snapshot_dir=str(out_base),
+                head_kg=head_kg,
+                changed_symbols=[{"qualname": "process"}],
+            )
+            self.assertEqual(
+                status, "failed:invalid_base_checkout",
+                f"nonexistent base_checkout must yield 'failed:invalid_base_checkout'; got {status!r}",
+            )
+
+    def test_nonexistent_head_checkout_returns_failed_invalid_head(self) -> None:
+        """Nonexistent head_checkout dir → status 'failed:invalid_head_checkout' (exact)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, _hc = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            status = self._splice(
+                base_checkout=str(base_checkout),
+                head_checkout=str(root / "does_not_exist"),
+                base_snapshot_dir=str(out_base),
+                head_kg=head_kg,
+                changed_symbols=[{"qualname": "process"}],
+            )
+            self.assertEqual(
+                status, "failed:invalid_head_checkout",
+                f"nonexistent head_checkout must yield 'failed:invalid_head_checkout'; got {status!r}",
+            )
+
+    def test_file_instead_of_dir_base_returns_failed_invalid_base(self) -> None:
+        """File path used as base_checkout → 'failed:invalid_base_checkout' (exact)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, _bc, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            # Write a file where a dir is expected
+            file_path = root / "a_plain_file.txt"
+            file_path.write_text("not a directory", encoding="utf-8")
+
+            status = self._splice(
+                base_checkout=str(file_path),
+                head_checkout=str(head_checkout),
+                base_snapshot_dir=str(out_base),
+                head_kg=head_kg,
+                changed_symbols=[{"qualname": "process"}],
+            )
+            self.assertEqual(
+                status, "failed:invalid_base_checkout",
+                f"file-as-base_checkout must yield 'failed:invalid_base_checkout'; got {status!r}",
+            )
+
+    def test_file_instead_of_dir_head_returns_failed_invalid_head(self) -> None:
+        """File path used as head_checkout → 'failed:invalid_head_checkout' (exact)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, _hc = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            file_path = root / "a_plain_file.txt"
+            file_path.write_text("not a directory", encoding="utf-8")
+
+            status = self._splice(
+                base_checkout=str(base_checkout),
+                head_checkout=str(file_path),
+                base_snapshot_dir=str(out_base),
+                head_kg=head_kg,
+                changed_symbols=[{"qualname": "process"}],
+            )
+            self.assertEqual(
+                status, "failed:invalid_head_checkout",
+                f"file-as-head_checkout must yield 'failed:invalid_head_checkout'; got {status!r}",
+            )
+
+    def test_all_reads_fail_returns_failed_unreadable_sources(self) -> None:
+        """Valid dirs + all source files unreadable → 'failed:unreadable_sources' from semantic_contract_diff."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            e = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": TENANT,
+                    "repo": "repo_unreadable",
+                    "module": "mod.handler",
+                    "qualname": "unreadable_func",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "handler.py", "line": 1, "end_line": 3},
+            )
+            snap_dir = root / "snap_unreadable"
+            JsonlKgStore(snap_dir).write(
+                entities=[e], facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            # Valid dirs but the source file is ABSENT from both checkouts
+            base_dir = root / "base_unreadable"
+            base_dir.mkdir()
+            head_dir = root / "head_unreadable"
+            head_dir.mkdir()
+            # handler.py intentionally NOT written — every read returns ""
+
+            _, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=_FakeClient(),
+            )
+            self.assertEqual(
+                status, "failed:unreadable_sources",
+                f"all reads failing must yield 'failed:unreadable_sources'; got {status!r}",
+            )
+
+    def test_identical_bodies_still_returns_active(self) -> None:
+        """Legitimate identical-bodies case (not a read failure) still returns 'active'."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            e = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": TENANT,
+                    "repo": "repo_identical",
+                    "module": "mod.handler",
+                    "qualname": "same_func",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "handler.py", "line": 1, "end_line": 3},
+            )
+            snap_dir = root / "snap_identical"
+            JsonlKgStore(snap_dir).write(
+                entities=[e], facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            same_body = "def same_func():\n    return 42\n"
+            base_dir = root / "base_identical"
+            base_dir.mkdir()
+            (base_dir / "handler.py").write_text(same_body, encoding="utf-8")
+            head_dir = root / "head_identical"
+            head_dir.mkdir()
+            (head_dir / "handler.py").write_text(same_body, encoding="utf-8")
+
+            _, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=_FakeClient(),
+            )
+            self.assertEqual(
+                status, "active",
+                f"identical bodies (not a read failure) must yield 'active'; got {status!r}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Fix wave: P2 — malformed duplicate precedes valid duplicate (regression)
+# ---------------------------------------------------------------------------
+
+class TestDedupeValidationOrder(unittest.TestCase):
+    """P2 fix: validate before dedupe — malformed item with same claim must NOT suppress valid item."""
+
+    def _make_single_symbol_snap_p2(self, root: Path) -> tuple[KgSnapshot, Path, Path]:
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        e = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_p2_dedupe",
+                "module": "mod.handler",
+                "qualname": "p2_func",
+                "symbol_kind": "function",
+            },
+            properties={"path": "handler.py", "line": 1, "end_line": 4},
+        )
+        snap_dir = root / "snap_p2_dedupe"
+        JsonlKgStore(snap_dir).write(
+            entities=[e], facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": TENANT},
+        )
+        snap = KgSnapshot(snap_dir)
+        base_dir = root / "base_p2_dedupe"
+        base_dir.mkdir()
+        (base_dir / "handler.py").write_text("def p2_func():\n    if x: raise\n    return 42\n")
+        head_dir = root / "head_p2_dedupe"
+        head_dir.mkdir()
+        (head_dir / "handler.py").write_text("def p2_func():\n    return 42\n")
+        return snap, base_dir, head_dir
+
+    def test_malformed_then_valid_same_claim_valid_survives(self) -> None:
+        """[malformed {claim: X, garbage}, valid {claim: X, ...}] → valid item survives (1 row).
+
+        Regression: before the fix, malformed item claimed the dedupe slot and valid item was dropped.
+        After the fix (validate first, dedupe after), valid item is the first accepted entry.
+        """
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap_p2(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            shared_claim = "Guard removed from p2_func."
+            client = _FakeClient(response=[
+                # Malformed: missing required keys (cause_line, consequence, negative_check, category)
+                {"claim": shared_claim, "garbage_key": "ignored"},
+                # Valid: all required keys present, same claim string
+                {
+                    "claim": shared_claim,
+                    "cause_line": 2,
+                    "consequence": "Callers may pass None.",
+                    "negative_check": "No check.",
+                    "category": "guard_removal",
+                },
+            ])
+
+            rows, _status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+
+            # Hard assert: valid item must produce exactly 1 row
+            self.assertEqual(
+                len(rows), 1,
+                f"valid item after malformed duplicate must survive; got {len(rows)} rows",
+            )
+            self.assertEqual(
+                rows[0].get("postable_claim"), shared_claim[:300],
+                f"surviving row must carry the shared claim; got {rows[0].get('postable_claim')!r}",
+            )
+
+    def test_inversion_two_valid_same_claim_still_dedupes_to_one(self) -> None:
+        """Inversion: two VALID items with same claim → still deduped to 1 row (first wins)."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap_p2(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            shared_claim = "Guard removed from p2_func."
+            client = _FakeClient(response=[
+                {
+                    "claim": shared_claim,
+                    "cause_line": 2,
+                    "consequence": "Callers may pass None.",
+                    "negative_check": "No check.",
+                    "category": "guard_removal",   # first — must win
+                },
+                {
+                    "claim": shared_claim,
+                    "cause_line": 3,
+                    "consequence": "Data loss.",
+                    "negative_check": "Other check.",
+                    "category": "ownership_moved",  # second — must be dropped
+                },
+            ])
+
+            rows, _status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+
+            self.assertEqual(
+                len(rows), 1,
+                f"two valid items with same claim must dedupe to 1 row; got {len(rows)}",
+            )
+            self.assertEqual(
+                rows[0].get("category"), "guard_removal",
+                f"first valid item's category must win; got {rows[0].get('category')!r}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

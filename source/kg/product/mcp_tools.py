@@ -3550,14 +3550,24 @@ def _splice_semantic_diff_hypotheses(
     if not head_entities:
         return review_hypotheses, "active"
 
+    # P1 fix: validate checkout dirs before calling semantic_contract_diff.
+    # A non-directory path (typo, deleted dir, file-instead-of-dir) would silently
+    # read "" for every symbol and return "active" — surface explicit failure instead.
+    base_checkout_path = Path(base_checkout)
+    head_checkout_path = Path(head_checkout)
+    if not base_checkout_path.is_dir():
+        return review_hypotheses, "failed:invalid_base_checkout"
+    if not head_checkout_path.is_dir():
+        return review_hypotheses, "failed:invalid_head_checkout"
+
     try:
         base_snap = _KgSnap(base_snapshot_dir)
         client = _client if _client is not None else SemanticDiffLlmClient()
         raw_rows, inner_status = semantic_contract_diff(
             base_snapshot=base_snap,
             head_snapshot=head_kg,
-            base_root=Path(base_checkout),
-            head_root=Path(head_checkout),
+            base_root=base_checkout_path,
+            head_root=head_checkout_path,
             changed_symbols=head_entities,
             client=client,
         )

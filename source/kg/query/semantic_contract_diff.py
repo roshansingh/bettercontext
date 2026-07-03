@@ -173,6 +173,8 @@ def semantic_contract_diff(
 
     # Problem C fix: prefilter (read bodies, keep only differing) BEFORE cap
     differing: list[tuple[JsonObject, str, str]] = []  # (entity, base_body, head_body)
+    read_failures = 0  # P1 deeper fix: count symbols where body reads returned ""
+    calls_attempted_prefilter = 0  # symbols that had a valid path pair
     for head_entity in changed_symbols:
         urn = head_entity.get("urn", "")
         if not urn:
@@ -188,6 +190,7 @@ def semantic_contract_diff(
         if not head_path or not base_path:
             continue
 
+        calls_attempted_prefilter += 1
         head_line_start = head_props.get("line")
         head_line_end = head_props.get("end_line")
         base_line_start = base_props.get("line")
@@ -197,6 +200,7 @@ def semantic_contract_diff(
         base_body = _read_body(base_root, base_path, base_line_start, base_line_end)
 
         if not head_body or not base_body:
+            read_failures += 1
             continue
         if head_body == base_body:
             # Identical bodies — skip (cost-bound pre-filter).
@@ -204,7 +208,13 @@ def semantic_contract_diff(
 
         differing.append((head_entity, base_body, head_body))
 
+    # P1 deeper fix: distinguish "no differing bodies" from "all reads failed".
+    # When checkouts are valid dirs but every symbol's source read returned "" (e.g.
+    # missing files, permission errors), return failed:unreadable_sources rather than
+    # "active" — "active" would falsely imply semantic diff was performed.
     if not differing:
+        if calls_attempted_prefilter > 0 and read_failures == calls_attempted_prefilter:
+            return [], "failed:unreadable_sources"
         return [], "active"
 
     # Apply cap AFTER prefilter — only differing symbols count against the slot budget
@@ -275,21 +285,20 @@ def semantic_contract_diff(
             if repo:
                 sym_span["repo"] = repo
 
-        # Problem D fix: dedupe by claim text (first wins) before processing
+        # P2 fix: validate FIRST, then dedupe by claim text (first valid wins).
+        # Deduping before validation lets a malformed item with the same claim string
+        # claim the seen_claims slot, silently dropping a later valid item.
         seen_claims: set[str] = set()
-        deduped_items: list[Any] = []
-        for item in parsed:
-            claim_key = str(item.get("claim", "")) if isinstance(item, dict) else ""
-            if claim_key not in seen_claims:
-                seen_claims.add(claim_key)
-                deduped_items.append(item)
-
         hyps_from_symbol = 0
-        for item in deduped_items:
+        for item in parsed:
             if hyps_from_symbol >= _MAX_HYPS_PER_SYMBOL:
                 break
             if not _validate_item(item):
                 continue
+            claim_key = str(item.get("claim", ""))
+            if claim_key in seen_claims:
+                continue
+            seen_claims.add(claim_key)
 
             # Problem B fix: drop garbage-signal items (4x threshold)
             raw_claim = str(item["claim"])
