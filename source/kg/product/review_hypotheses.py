@@ -22,6 +22,9 @@ _CONFIDENCE_RANK = {"strong": 2, "medium": 1, "weak": 0}
 _FRAMEWORK_IMPACT_KEYS = ("changed_models", "model_fields", "model_relations", "serializers", "views", "tasks")
 _RUNTIME_SURFACE_KEYS = ("endpoints", "endpoint_consumers", "event_channels", "deploy_mappings")
 _ASYNC_LIFECYCLE_FAMILIES: frozenset[str] = frozenset({"async_callback_in_iteration", "unawaited_async_call"})
+_CALL_RESULT_IDENTITY_FAMILY: frozenset[str] = frozenset({"call_result_identity_comparison"})
+_DESTRUCTIVE_CALL_SUFFIXES: frozenset[str] = frozenset({".deletemany", ".delete", ".deleteone", ".destroy"})
+_DESTRUCTIVE_CALL_BARE: frozenset[str] = frozenset({"delete", "deletemany", "deleteone", "destroy"})
 
 # O2: Specific-class families. Post-1e74bf2 probe evidence (Grafana 106778, limit=25) showed
 # specific families generating on real repos but losing visible slots to generics because
@@ -32,7 +35,9 @@ _ASYNC_LIFECYCLE_FAMILIES: frozenset[str] = frozenset({"async_callback_in_iterat
 _SPECIFIC_CLASS_FAMILIES: frozenset[str] = frozenset(
     {
         "async_side_effect_lifecycle_drift",
+        "call_result_identity_comparison_semantics",
         "component_list_render_identity_drift",
+        "destructive_mutation_test_gap",
         "hook_gate_render_mismatch",
         "swallowed_exception_state_drift",
         "test_locks_in_regression",
@@ -138,6 +143,24 @@ def review_hypotheses_for_context(
         direct_callers=direct_callers,
         direct_callees=direct_callees,
         risk_signals=effective_risk_signals,
+        review_leads=review_leads,
+    )
+    if h:
+        hypotheses.append(h)
+    h = _call_result_identity_comparison_semantics(
+        changed_symbols=changed_symbols,
+        changed_files=changed_files,
+        risk_signals=effective_risk_signals,
+        review_leads=review_leads,
+        direct_callers=direct_callers,
+        direct_callees=direct_callees,
+    )
+    if h:
+        hypotheses.append(h)
+    h = _destructive_mutation_test_gap(
+        changed_symbols=changed_symbols,
+        changed_files=changed_files,
+        direct_callees=direct_callees,
         review_leads=review_leads,
     )
     if h:
@@ -1060,4 +1083,175 @@ def _swallowed_exception_state_drift(
             "a broad exception handler that discards an error must not mask a state transition "
             "the caller observes or relies on."
         ),
+    )
+
+
+def _call_result_identity_comparison_semantics(
+    *,
+    changed_symbols: list[JsonObject],
+    changed_files: list[str],
+    risk_signals: list[JsonObject],
+    review_leads: JsonObject,
+    direct_callers: list[JsonObject],
+    direct_callees: list[JsonObject],
+) -> JsonObject | None:
+    """Trigger: >=1 code_risk_signal with call_result_identity_comparison family on changed symbols/files."""
+    changed_entity_ids = _changed_symbol_entity_ids(changed_symbols)
+    changed_paths = _changed_context_paths(changed_symbols, changed_files)
+    matching = [
+        sig for sig in risk_signals
+        if sig.get("qualifier", {}).get("risk_family") in _CALL_RESULT_IDENTITY_FAMILY
+        and _signal_matches_changed_context(sig, changed_entity_ids, changed_paths)
+    ]
+    if not matching:
+        return None
+    evidence_refs = _evidence_refs_from_risk_signals(matching)
+    for ref, sig in zip(evidence_refs, matching):
+        q = sig.get("qualifier")
+        if isinstance(q, dict):
+            for key in ("callee_left", "callee_right"):
+                val = q.get(key)
+                if val:
+                    ref[key] = val
+    lead_ids = _lead_ids_for_signal_subjects(matching, review_leads)
+    count = len(matching)
+    count_str = f"{count} signal{'s' if count != 1 else ''}"
+    callees_left: list[str] = []
+    callees_right: list[str] = []
+    for sig in matching[:3]:
+        q = sig.get("qualifier")
+        if isinstance(q, dict):
+            cl = q.get("callee_left")
+            if isinstance(cl, str) and cl and cl not in callees_left:
+                callees_left.append(cl)
+            cr = q.get("callee_right")
+            if isinstance(cr, str) and cr and cr not in callees_right:
+                callees_right.append(cr)
+    if callees_left or callees_right:
+        sides = " vs ".join(filter(None, [", ".join(callees_left[:2]), ", ".join(callees_right[:2])]))
+        why = (
+            f"{count_str} ({sides}) in changed symbols compare call-expression results with "
+            f"=== or !==; object-returning calls compare by reference, not value."
+        )
+    else:
+        why = (
+            f"{count_str} in changed symbols compare call-expression results with "
+            f"=== or !==; object-returning calls compare by reference, not value."
+        )
+    source_checks = [
+        "Verify === or !== comparisons between call expressions use .isSame()/.equals()/.isEqual() when value equality is intended.",
+        "Check whether both call sides return objects or class instances that compare by reference rather than by value.",
+    ]
+    concrete_invariant = "Object-returning call expressions compared with === or !== test reference identity, not value equality; use the type's equality method instead."
+    confidence = "medium" if (lead_ids and (direct_callers or direct_callees)) else "weak"
+    return _make_hypothesis(
+        risk_type="call_result_identity_comparison_semantics",
+        confidence=confidence,
+        why=why,
+        evidence_refs=evidence_refs,
+        source_checks=source_checks,
+        supporting_lead_ids=lead_ids[:10],
+        concrete_invariant=concrete_invariant,
+    )
+
+
+def _destructive_mutation_test_gap(
+    *,
+    changed_symbols: list[JsonObject],
+    changed_files: list[str],
+    direct_callees: list[JsonObject],
+    review_leads: JsonObject,
+) -> JsonObject | None:
+    """Trigger: changed symbol calls a destructive operation with no test file in the changeset."""
+    if any(_is_test_file(f) for f in changed_files):
+        return None
+    changed_names: set[str] = set()
+    for sym in changed_symbols:
+        short = _short_name(sym)
+        if short:
+            changed_names.add(short)
+        for key in ("qualname", "qualified_name", "display_name"):
+            val = sym.get(key)
+            if val:
+                changed_names.add(str(val))
+    matching_callees: list[JsonObject] = []
+    for row in direct_callees:
+        qualifier = row.get("qualifier") or {}
+        call_str = qualifier.get("call") or ""
+        call_lower = call_str.lower()
+        is_destructive = (
+            any(call_lower.endswith(sfx) for sfx in _DESTRUCTIVE_CALL_SUFFIXES)
+            or (call_lower.rsplit(".", 1)[-1] if "." in call_lower else call_lower) in _DESTRUCTIVE_CALL_BARE
+        )
+        if not is_destructive:
+            continue
+        subj = str(row.get("subject") or "")
+        subj_seg = subj.rsplit(".", 1)[-1]
+        if subj in changed_names or subj_seg in changed_names:
+            matching_callees.append(row)
+    if not matching_callees:
+        return None
+    evidence_refs: list[JsonObject] = []
+    for row in matching_callees[:5]:
+        ref: JsonObject = {}
+        qualifier = row.get("qualifier") or {}
+        call_str = qualifier.get("call")
+        if call_str:
+            ref["call"] = call_str
+        subj = row.get("subject")
+        if subj:
+            ref["qualname"] = str(subj)
+        for ev in (row.get("evidence") or []):
+            if not isinstance(ev, dict):
+                continue
+            br = ev.get("bytes_ref")
+            if isinstance(br, dict):
+                for coord_key in ("repo", "path", "line_start", "line_end"):
+                    val = br.get(coord_key)
+                    if val is not None:
+                        ref[coord_key] = val
+                if "path" in ref:
+                    break
+        if ref:
+            evidence_refs.append(ref)
+    lead_ids: list[str] = []
+    callee_subjects: set[str] = set()
+    for row in matching_callees:
+        subj = str(row.get("subject") or "")
+        if subj:
+            callee_subjects.add(subj)
+        subj_seg = subj.rsplit(".", 1)[-1]
+        if subj_seg:
+            callee_subjects.add(subj_seg)
+    for row in review_leads.get("changed_symbols") or []:
+        if not isinstance(row, dict):
+            continue
+        lid = row.get("lead_id")
+        if not isinstance(lid, str) or not lid:
+            continue
+        row_qualname = str(row.get("qualname") or "")
+        row_path = str(row.get("path") or "")
+        if row_qualname in callee_subjects or (row_qualname.rsplit(".", 1)[-1] if "." in row_qualname else row_qualname) in callee_subjects:
+            lead_ids.append(lid)
+            continue
+        if any(row_path == (s.get("path") or "") for s in changed_symbols if any(
+            (str(s.get(k) or "").rsplit(".", 1)[-1] or str(s.get(k) or "")) in callee_subjects
+            for k in ("qualname", "qualified_name", "display_name", "name")
+        )):
+            lead_ids.append(lid)
+    why = "Changed symbol(s) perform destructive persistence operations (delete/destroy) with no test file in the changeset; ownership guard and delete path are untested."
+    source_checks = [
+        "Verify the authorization/ownership guard is tested for the failure path (access denied or not found).",
+        "Verify the delete/destroy operation is exercised by at least one test covering both success and no-match cases.",
+    ]
+    concrete_invariant = "A destructive persistence operation must have test coverage for both the happy path and the ownership-guard failure path before shipping."
+    confidence = "medium" if lead_ids else "weak"
+    return _make_hypothesis(
+        risk_type="destructive_mutation_test_gap",
+        confidence=confidence,
+        why=why,
+        evidence_refs=evidence_refs,
+        source_checks=source_checks,
+        supporting_lead_ids=lead_ids[:10],
+        concrete_invariant=concrete_invariant,
     )
