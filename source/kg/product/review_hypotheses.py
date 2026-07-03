@@ -45,6 +45,31 @@ _SPECIFIC_CLASS_FAMILIES: frozenset[str] = frozenset(
     }
 )
 
+# B2: Per-family specificity class. "high" = code_risk_signal-driven or A2 contract-diff;
+# "medium" = convention-triggered specific families; "low" = generic families.
+# test_locks_in_regression is "low" by default: it lacks a named runtime invariant in its
+# current form and must not outrank high-specificity families in top_review_hypotheses.
+# It becomes "medium" only if signal/delta-backed evidence attaches (not yet wired).
+_FAMILY_SPECIFICITY: dict[str, str] = {
+    # High: driven by code_risk_signal evidence or A2 contract-diff
+    "async_side_effect_lifecycle_drift": "high",
+    "swallowed_exception_state_drift": "high",
+    "call_result_identity_comparison_semantics": "high",
+    "destructive_mutation_test_gap": "high",
+    # Medium: convention-triggered specific families
+    "component_list_render_identity_drift": "medium",
+    "hook_gate_render_mismatch": "medium",
+    "low_coverage_stylesheet_gap": "medium",
+    # Low: test_locks lacks a named runtime invariant; treated low until signal-backed
+    "test_locks_in_regression": "low",
+    # Low: generic families
+    "direct_call_contract_drift": "low",
+    "framework_contract_drift": "low",
+    "runtime_endpoint_or_event_contract_drift": "low",
+    "application_surface_contract_drift": "low",
+    "test_or_config_masks_runtime_change": "low",
+}
+
 
 def review_hypotheses_for_context(
     *,
@@ -175,12 +200,15 @@ def review_hypotheses_for_context(
     )
     cap = 5
     selected = list(hypotheses[:cap])
-    # O2: Stable partition — specific-class families before generic-class. The 4-part
-    # comparator order is preserved within each class. Mirror slot selection takes the
-    # head of this order, so specific families appear in top_review_hypotheses before generics.
-    specifics = [h for h in selected if str(h.get("risk_type") or "") in _SPECIFIC_CLASS_FAMILIES]
-    generics = [h for h in selected if str(h.get("risk_type") or "") not in _SPECIFIC_CLASS_FAMILIES]
-    return specifics + generics
+    # O2/B2: Three-tier partition — high-specificity first, medium second, low (generic) last.
+    # Within each tier, the 4-part comparator order above is preserved. Mirror slot selection
+    # takes the head of this order, so signal-backed families always outrank generics and
+    # test_locks (low specificity) never outranks a high-specificity hypothesis.
+    _SPEC_RANK = {"high": 0, "medium": 1, "low": 2}
+    highs = [h for h in selected if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 0]
+    mediums = [h for h in selected if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 1]
+    lows = [h for h in selected if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 2]
+    return highs + mediums + lows
 
 
 def _has_framework_signal(framework_impact: JsonObject) -> bool:
@@ -208,6 +236,10 @@ def _make_hypothesis(
     source_checks: list[str],
     supporting_lead_ids: list[str],
     concrete_invariant: str | None = None,
+    postable_claim: str | None = None,
+    cause: JsonObject | None = None,
+    consequence: JsonObject | None = None,
+    negative_checks: list[str] | None = None,
 ) -> JsonObject:
     row: JsonObject = {
         "risk_type": risk_type,
@@ -216,9 +248,18 @@ def _make_hypothesis(
         "evidence_refs": evidence_refs,
         "source_checks": source_checks,
         "supporting_lead_ids": supporting_lead_ids,
+        "specificity": _FAMILY_SPECIFICITY.get(risk_type, "low"),
     }
     if concrete_invariant is not None:
         row["concrete_invariant"] = concrete_invariant
+    if postable_claim is not None:
+        row["postable_claim"] = postable_claim
+    if cause is not None:
+        row["cause"] = cause
+    if consequence is not None:
+        row["consequence"] = consequence
+    if negative_checks is not None:
+        row["negative_checks"] = negative_checks
     row["hypothesis_id"] = hypothesis_stable_id(risk_type, supporting_lead_ids, evidence_refs)
     return row
 
@@ -315,9 +356,24 @@ def _direct_call_contract_drift(
         return None
     confidence = "strong" if ((direct_callers or direct_callees) and has_surface_signal) else "medium"
     evidence_refs = _evidence_refs_from_leads(review_leads, ("direct_callers", "direct_callees"))
+    # Build postable_claim from first caller/callee lead if available
+    postable_claim: str | None = None
+    first_ref = evidence_refs[0] if evidence_refs else None
+    if first_ref:
+        caller_q = first_ref.get("caller_qualname") or first_ref.get("caller_qualified_name")
+        callee_q = first_ref.get("callee_qualname") or first_ref.get("callee_qualified_name")
+        subj = first_ref.get("subject")
+        obj_ = first_ref.get("object")
+        if caller_q and callee_q:
+            postable_claim = f"{caller_q} calls {callee_q}; verify the call contract holds after this change."
+        elif subj and obj_:
+            postable_claim = f"{subj} calls {obj_}; verify the call contract holds after this change."
     source_checks = [
         "Verify callers still satisfy the changed symbol's pre/post-conditions.",
         "Check direct callees for interface drift introduced by this change.",
+    ]
+    negative_checks = [
+        "If callers pass the same arguments and the changed symbol's return type and side effects are unchanged, contract drift is unlikely.",
     ]
     return _make_hypothesis(
         risk_type="direct_call_contract_drift",
@@ -326,6 +382,8 @@ def _direct_call_contract_drift(
         evidence_refs=evidence_refs,
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
+        postable_claim=postable_claim,
+        negative_checks=negative_checks,
     )
 
 
@@ -354,6 +412,9 @@ def _framework_contract_drift(
         "Inspect framework-generated schema migrations and serializer output for drift.",
         "Verify view/task handlers still align with updated model contracts.",
     ]
+    negative_checks = [
+        "If the changed code only adds new fields without altering existing fields or serializer output, framework contract drift is unlikely.",
+    ]
     lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="framework_contract_drift",
@@ -362,6 +423,7 @@ def _framework_contract_drift(
         evidence_refs=evidence_refs[:5],
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
+        negative_checks=negative_checks,
     )
 
 
@@ -389,6 +451,9 @@ def _runtime_endpoint_or_event_contract_drift(
         "Verify endpoint request/response contracts match caller expectations.",
         "Check event channel producers and consumers for schema compatibility.",
     ]
+    negative_checks = [
+        "If the changed code path is not reachable from any exposed endpoint or event channel, contract drift to other services is unlikely.",
+    ]
     lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="runtime_endpoint_or_event_contract_drift",
@@ -397,6 +462,7 @@ def _runtime_endpoint_or_event_contract_drift(
         evidence_refs=evidence_refs[:5],
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
+        negative_checks=negative_checks,
     )
 
 
@@ -436,6 +502,9 @@ def _application_surface_contract_drift(
         "Inspect same-repo application surfaces (APIs, models, workers) for exposure drift.",
         "Check runtime facts for contract assumptions that changed symbols may violate.",
     ]
+    negative_checks = [
+        "If the changed symbols are internal utilities with no direct exposure to application surfaces or runtime facts, drift is unlikely.",
+    ]
     lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="application_surface_contract_drift",
@@ -444,6 +513,7 @@ def _application_surface_contract_drift(
         evidence_refs=evidence_refs[:5],
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
+        negative_checks=negative_checks,
     )
 
 
@@ -498,6 +568,9 @@ def _test_or_config_masks_runtime_change(
         "Verify test or config changes do not mask a runtime behavioral change.",
         "Check whether changed config values alter runtime contracts.",
     ]
+    negative_checks = [
+        "If the test or config changes are purely additive (new tests, new config keys) with no modification of existing behavior, masking is unlikely.",
+    ]
     lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols",))
     return _make_hypothesis(
         risk_type="test_or_config_masks_runtime_change",
@@ -506,6 +579,7 @@ def _test_or_config_masks_runtime_change(
         evidence_refs=evidence_refs,
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
+        negative_checks=negative_checks,
     )
 
 
@@ -524,6 +598,9 @@ def _low_coverage_stylesheet_gap(
     source_checks = [
         "Inspect stylesheet changes manually; KG has limited coverage of CSS/styling contracts.",
     ]
+    negative_checks = [
+        "If the stylesheet changes are scoped to a single isolated component with no shared class names or variables, broader impact is unlikely.",
+    ]
     lead_ids = _lead_ids_for_fields(review_leads, ("changed_symbols", "source_coordinates"))
     return _make_hypothesis(
         risk_type="low_coverage_stylesheet_gap",
@@ -532,6 +609,7 @@ def _low_coverage_stylesheet_gap(
         evidence_refs=evidence_refs,
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
+        negative_checks=negative_checks,
     )
 
 
@@ -657,6 +735,17 @@ def _component_list_render_identity_drift(
         "Inspect changed component render paths for list keys and branch parity.",
         "Check computed values against rendered output to detect identity drift.",
     ]
+    negative_checks = [
+        "If the component renders a static list with stable keys and no memoization dependency changed, identity drift is unlikely.",
+    ]
+    # Build postable_claim from first component symbol
+    postable_claim: str | None = None
+    if component_syms:
+        first_comp = _short_name(component_syms[0])
+        if first_comp:
+            postable_claim = (
+                f"{first_comp} has changed; verify list keys and child rendering identity are stable."
+            )
     return _make_hypothesis(
         risk_type="component_list_render_identity_drift",
         confidence=confidence,
@@ -664,6 +753,8 @@ def _component_list_render_identity_drift(
         evidence_refs=evidence_refs,
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
+        negative_checks=negative_checks,
+        postable_claim=postable_claim,
     )
 
 
@@ -760,6 +851,17 @@ def _hook_gate_render_mismatch(
         "Compare hook return contract against each consuming call site's usage and render gate.",
         "Verify components consuming this hook handle all return states, including loading and error.",
     ]
+    negative_checks = [
+        "If the hook's return shape is unchanged and only its internal implementation changed, render gate mismatch is unlikely.",
+    ]
+    # postable_claim from first hook symbol
+    postable_claim: str | None = None
+    if hook_syms:
+        first_hook = _short_name(hook_syms[0])
+        if first_hook:
+            postable_claim = (
+                f"{first_hook} return contract may have shifted; components consuming it may render incorrectly."
+            )
     return _make_hypothesis(
         risk_type="hook_gate_render_mismatch",
         confidence=confidence,
@@ -767,6 +869,8 @@ def _hook_gate_render_mismatch(
         evidence_refs=evidence_refs,
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
+        negative_checks=negative_checks,
+        postable_claim=postable_claim,
     )
 
 
@@ -802,6 +906,9 @@ def _test_locks_in_regression(
         "Verify updated tests exercise behavior (interaction and outcome), not just presence or text.",
         "Check whether test assertions reflect new invariants or lock in a regression.",
     ]
+    negative_checks = [
+        "If test assertions verify the intended new behavior (not the old broken behavior) and cover both success and failure paths, locking in a regression is unlikely.",
+    ]
     # supporting_lead_ids: non-test symbol rows + edge rows touching a non-test symbol name.
     lead_ids = []
     for row in review_leads.get("changed_symbols") or []:
@@ -829,6 +936,7 @@ def _test_locks_in_regression(
         evidence_refs=evidence_refs,
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
+        negative_checks=negative_checks,
     )
 
 
@@ -1029,6 +1137,36 @@ def _async_side_effect_lifecycle_drift(
         "Trace each flagged call site; verify the async call is awaited or its result is reconciled with any paired persistent-state change.",
         "Check whether the mutation path that contains the async call has a compensating rollback or retry if the async work fails.",
     ]
+    negative_checks = [
+        "If the async call result is intentionally fire-and-forget and the mutation path documents this, the hypothesis does not apply.",
+    ]
+    # Build postable_claim from first signal's qualifier (no fabrication — null when data absent)
+    postable_claim: str | None = None
+    cause: JsonObject | None = None
+    consequence: JsonObject | None = None
+    first_sig = matching[0] if matching else None
+    if first_sig:
+        q = first_sig.get("qualifier") or {}
+        callee = q.get("callee")
+        qualname = q.get("qualname")
+        if callee and qualname:
+            postable_claim = (
+                f"{qualname} contains an async call to {callee} whose completion may not be "
+                "coupled to the changed mutation path."
+            )
+        elif qualname:
+            postable_claim = (
+                f"{qualname} contains an async side-effect call whose completion may not be "
+                "coupled to the changed mutation path."
+            )
+        evs = first_sig.get("_evidence") or []
+        if evs and isinstance(evs[0], dict):
+            br = evs[0].get("bytes_ref")
+            if isinstance(br, dict):
+                cause = {k: br[k] for k in ("repo", "path", "line_start", "line_end") if k in br}
+    if evidence_refs:
+        first_ref = evidence_refs[0]
+        consequence = {k: first_ref[k] for k in ("repo", "path", "line_start", "line_end", "qualname", "callee") if k in first_ref} or None
     return _make_hypothesis(
         risk_type="async_side_effect_lifecycle_drift",
         confidence=confidence,
@@ -1041,6 +1179,10 @@ def _async_side_effect_lifecycle_drift(
             "an async call in a mutation path must be awaited, returned, or reconciled "
             "before the mutation is considered complete."
         ),
+        postable_claim=postable_claim,
+        cause=cause or None,
+        consequence=consequence or None,
+        negative_checks=negative_checks,
     )
 
 
@@ -1071,6 +1213,28 @@ def _swallowed_exception_state_drift(
         "Trace each flagged broad-exception handler; verify it cannot mask a state transition the caller depends on.",
         "Check whether the handler's silent outcome (pass/continue/constant return) is documented as intentional in the changed code.",
     ]
+    negative_checks = [
+        "If the exception handler is intentional and documented (e.g. optional cleanup, non-fatal fallback), the hypothesis does not apply.",
+    ]
+    postable_claim: str | None = None
+    cause: JsonObject | None = None
+    consequence: JsonObject | None = None
+    first_sig = matching[0] if matching else None
+    if first_sig:
+        q = first_sig.get("qualifier") or {}
+        qualname = q.get("qualname")
+        if qualname:
+            postable_claim = (
+                f"{qualname} swallows a broad exception; the silent outcome may mask a state transition callers depend on."
+            )
+        evs = first_sig.get("_evidence") or []
+        if evs and isinstance(evs[0], dict):
+            br = evs[0].get("bytes_ref")
+            if isinstance(br, dict):
+                cause = {k: br[k] for k in ("repo", "path", "line_start", "line_end") if k in br}
+    if evidence_refs:
+        first_ref = evidence_refs[0]
+        consequence = {k: first_ref[k] for k in ("repo", "path", "line_start", "line_end", "qualname") if k in first_ref} or None
     return _make_hypothesis(
         risk_type="swallowed_exception_state_drift",
         confidence=confidence,
@@ -1083,6 +1247,10 @@ def _swallowed_exception_state_drift(
             "a broad exception handler that discards an error must not mask a state transition "
             "the caller observes or relies on."
         ),
+        postable_claim=postable_claim,
+        cause=cause or None,
+        consequence=consequence or None,
+        negative_checks=negative_checks,
     )
 
 
@@ -1142,8 +1310,38 @@ def _call_result_identity_comparison_semantics(
         "Verify === or !== comparisons between call expressions use .isSame()/.equals()/.isEqual() when value equality is intended.",
         "Check whether both call sides return objects or class instances that compare by reference rather than by value.",
     ]
+    negative_checks = [
+        "If both sides are known to return primitives (string, number, boolean), reference equality is correct and the hypothesis does not apply.",
+    ]
     concrete_invariant = "Object-returning call expressions compared with === or !== test reference identity, not value equality; use the type's equality method instead."
     confidence = "medium" if (lead_ids and (direct_callers or direct_callees)) else "weak"
+    # postable_claim from first signal qualifier (no fabrication)
+    postable_claim: str | None = None
+    cause: JsonObject | None = None
+    consequence: JsonObject | None = None
+    first_sig = matching[0] if matching else None
+    if first_sig:
+        q = first_sig.get("qualifier") or {}
+        cl = q.get("callee_left")
+        cr = q.get("callee_right")
+        qualname = q.get("qualname")
+        if cl and cr:
+            postable_claim = (
+                f"{qualname or 'Changed symbol'} compares {cl} === {cr}; "
+                "if either returns an object, this is reference equality, not value equality."
+            )
+        elif qualname:
+            postable_claim = (
+                f"{qualname} uses === or !== on call-expression results; object-returning calls compare by reference."
+            )
+        evs = first_sig.get("_evidence") or []
+        if evs and isinstance(evs[0], dict):
+            br = evs[0].get("bytes_ref")
+            if isinstance(br, dict):
+                cause = {k: br[k] for k in ("repo", "path", "line_start", "line_end") if k in br}
+    if evidence_refs:
+        first_ref = evidence_refs[0]
+        consequence = {k: first_ref[k] for k in ("repo", "path", "line_start", "line_end", "qualname", "callee") if k in first_ref} or None
     return _make_hypothesis(
         risk_type="call_result_identity_comparison_semantics",
         confidence=confidence,
@@ -1152,6 +1350,10 @@ def _call_result_identity_comparison_semantics(
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
         concrete_invariant=concrete_invariant,
+        postable_claim=postable_claim,
+        cause=cause or None,
+        consequence=consequence or None,
+        negative_checks=negative_checks,
     )
 
 
@@ -1259,8 +1461,38 @@ def _destructive_mutation_test_gap(
         "Verify the authorization/ownership guard is tested for the failure path (access denied or not found).",
         "Verify the delete/destroy operation is exercised by at least one test covering both success and no-match cases.",
     ]
+    negative_checks = [
+        "If a test file already exists elsewhere in the repo that covers the delete/destroy path and authorization guard, this hypothesis does not apply.",
+    ]
     concrete_invariant = "A destructive persistence operation must have test coverage for both the happy path and the ownership-guard failure path before shipping."
     confidence = "medium" if lead_ids else "weak"
+    # postable_claim from first matching callee (no fabrication)
+    postable_claim: str | None = None
+    cause: JsonObject | None = None
+    consequence: JsonObject | None = None
+    if matching_callees:
+        first_row = matching_callees[0]
+        qualifier = first_row.get("qualifier") or {}
+        call_str = qualifier.get("call")
+        subj = str(first_row.get("subject") or "")
+        if call_str and subj:
+            postable_claim = (
+                f"{subj} calls {call_str} with no test coverage for the ownership-guard failure path."
+            )
+        elif call_str:
+            postable_claim = (
+                f"A changed symbol calls {call_str} with no test coverage for the ownership-guard failure path."
+            )
+        for ev in (first_row.get("evidence") or []):
+            if isinstance(ev, dict):
+                br = ev.get("bytes_ref")
+                if isinstance(br, dict):
+                    cause = {k: br[k] for k in ("repo", "path", "line_start", "line_end") if k in br}
+                    if cause:
+                        break
+    if evidence_refs:
+        first_ref = evidence_refs[0]
+        consequence = {k: first_ref[k] for k in ("repo", "path", "line_start", "line_end", "qualname", "call") if k in first_ref} or None
     return _make_hypothesis(
         risk_type="destructive_mutation_test_gap",
         confidence=confidence,
@@ -1269,4 +1501,8 @@ def _destructive_mutation_test_gap(
         source_checks=source_checks,
         supporting_lead_ids=lead_ids[:10],
         concrete_invariant=concrete_invariant,
+        postable_claim=postable_claim,
+        cause=cause or None,
+        consequence=consequence or None,
+        negative_checks=negative_checks,
     )

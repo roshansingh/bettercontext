@@ -26,7 +26,10 @@ from source.kg.product.review_attribution import (
     review_available_counts,
     review_lead_counts,
 )
-from source.kg.product.review_hypotheses import review_hypotheses_for_context
+from source.kg.product.review_hypotheses import (
+    _FAMILY_SPECIFICITY,
+    review_hypotheses_for_context,
+)
 from source.kg.product.runtime_architecture import ENDPOINT_PATH_SHAPE_MATCH_BASIS, runtime_architecture_packet
 from source.kg.query.call_site import call_site_from_qualifier
 from source.kg.query.snapshot import KgSnapshot
@@ -2989,6 +2992,10 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         risk_signals=risk_signals,
     )
     review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
+    review_quality_status = _build_review_quality_status(
+        review_hypotheses=review_hypotheses,
+        coverage_status=review_lead_packet["review_lead_status"].get("coverage_status", ""),
+    )
     result = {
         "status": status,
         "repo": repo,
@@ -2997,6 +3004,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         "summary": summary,
         "review_answer_packet": review_answer_packet,
         "review_lead_status": review_lead_packet["review_lead_status"],
+        "review_quality_status": review_quality_status,
         "review_leads": review_lead_packet["review_leads"],
         "diff_anchors": diff_anchors,
         "changed_symbols": changed_symbols_in_scope,
@@ -3066,6 +3074,59 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     ):
         return _review_context_compact_unanchored_result(result)
     return result
+
+
+_SPECIFICITY_RANK: dict[str, int] = {"high": 2, "medium": 1, "low": 0}
+
+
+def _build_review_quality_status(
+    *,
+    review_hypotheses: list[JsonObject],
+    coverage_status: str,
+) -> JsonObject:
+    """Build the review_quality_status scalar object emitted alongside review_lead_status.
+
+    Fields:
+      coverage_status — copied from review_lead_status
+      specific_hypothesis_count — count of high+medium specificity hypotheses
+      generic_hypothesis_count — count of low specificity hypotheses
+      specificity — "high" | "medium" | "low" (max class present; "low" when none generated)
+      recommended_action — "use_supercontext_packet" when high or medium, else "use_live_followups_or_plain_review"
+      reason — short explanation
+    """
+    specific_count = 0
+    generic_count = 0
+    max_spec = "low"
+    for h in review_hypotheses:
+        if not isinstance(h, dict):
+            continue
+        spec = _FAMILY_SPECIFICITY.get(str(h.get("risk_type") or ""), "low")
+        if spec in ("high", "medium"):
+            specific_count += 1
+        else:
+            generic_count += 1
+        if _SPECIFICITY_RANK.get(spec, 0) > _SPECIFICITY_RANK.get(max_spec, 0):
+            max_spec = spec
+    if max_spec in ("high", "medium"):
+        recommended_action = "use_supercontext_packet"
+        reason = (
+            f"Packet contains {specific_count} specific hypothesis/es (specificity={max_spec}) "
+            "backed by signal or convention evidence."
+        )
+    else:
+        recommended_action = "use_live_followups_or_plain_review"
+        reason = (
+            "All generated hypotheses are generic (no signal/delta or convention-specific evidence); "
+            "live source inspection will yield higher precision."
+        )
+    return {
+        "coverage_status": coverage_status,
+        "specific_hypothesis_count": specific_count,
+        "generic_hypothesis_count": generic_count,
+        "specificity": max_spec,
+        "recommended_action": recommended_action,
+        "reason": reason,
+    }
 
 
 def _review_context_lead_packet(
@@ -3208,6 +3269,7 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
         "summary": summary,
         "review_answer_packet": compact_packet,
         "review_lead_status": review_lead_status,
+        "review_quality_status": result.get("review_quality_status", {}),
         "review_leads": review_leads,
         "diff_anchors": diff_anchors,
         "changed_symbols": [],

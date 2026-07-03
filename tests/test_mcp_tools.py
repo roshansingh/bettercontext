@@ -4719,7 +4719,7 @@ class McpToolsTest(unittest.TestCase):
         self.assertNotIn("framework_impact", result)
         self.assertEqual(result["omitted_context"]["counts"]["application_impact.cross_repo_name_leads"], 1)
         self.assertEqual(result["candidate_leads"]["status"], "empty")
-        self.assertLess(len(canonical_json(result)), 8_600)
+        self.assertLess(len(canonical_json(result)), 9_200)
         self.assertTrue(any("include_unlinked_leads=true" in action for action in result["next_actions"]))
 
     def test_review_context_file_anchor_only_can_opt_into_broad_unlinked_leads(self) -> None:
