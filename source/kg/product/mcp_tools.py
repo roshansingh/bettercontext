@@ -2364,6 +2364,21 @@ def _review_context_properties() -> JsonObject:
                 "Tenant mismatch or unloadable base snapshot is reported in review_quality_status.reason, never an error."
             ),
         },
+        "base_checkout": {
+            "type": "string",
+            "description": (
+                "Optional path to a base git checkout directory (the pre-PR source tree). "
+                "Required together with head_checkout and base_snapshot to activate semantic contract-diff (S2). "
+                "When all three are present, the LLM analyzes symbol body-text changes for semantic contract violations."
+            ),
+        },
+        "head_checkout": {
+            "type": "string",
+            "description": (
+                "Optional path to a head git checkout directory (the post-PR source tree). "
+                "Required together with base_checkout and base_snapshot to activate semantic contract-diff (S2)."
+            ),
+        },
     }
 
 
@@ -2731,6 +2746,8 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     include_deploy_blockers = _optional_bool(arguments, "include_deploy_blockers", default=False)
     include_unlinked_leads = _optional_bool(arguments, "include_unlinked_leads", default=False)
     base_snapshot_dir = _optional_string(arguments, "base_snapshot")
+    base_checkout = _optional_string(arguments, "base_checkout")
+    head_checkout = _optional_string(arguments, "head_checkout")
 
     changed_symbols: list[JsonObject] = []
     range_filters = _changed_ranges_by_path(changed_ranges)
@@ -3034,6 +3051,18 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
             changed_files=changed_files,
             review_hypotheses=review_hypotheses,
         )
+    semantic_diff_status: str | None = None
+    if base_snapshot_dir and base_checkout and head_checkout:
+        review_hypotheses, semantic_diff_status = _splice_semantic_diff_hypotheses(
+            base_snapshot_dir=base_snapshot_dir,
+            head_kg=kg,
+            base_checkout=base_checkout,
+            head_checkout=head_checkout,
+            changed_symbols=changed_symbols,
+            review_hypotheses=review_hypotheses,
+        )
+    elif base_snapshot_dir:
+        semantic_diff_status = "missing_checkouts"
     # Cap the top-level list to PLANNING_CONTEXT_SECTION_LIMIT (5). The splice
     # inserts high-specificity rows at the front so the specifics-first partition is
     # already correct; slicing here preserves that order while bounding the list.
@@ -3050,6 +3079,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         coverage_status=review_lead_packet["review_lead_status"].get("coverage_status", ""),
         contract_diff_note=contract_diff_note,
         base_diff_status=_base_diff_status,
+        semantic_diff_status=semantic_diff_status,
         changed_ranges=changed_ranges,
         changed_symbols=changed_symbols_in_scope,
     )
@@ -3142,6 +3172,7 @@ def _build_review_quality_status(
     coverage_status: str,
     contract_diff_note: str | None = None,
     base_diff_status: str | None = None,
+    semantic_diff_status: str | None = None,
     changed_ranges: list[JsonObject] | None = None,
     changed_symbols: list[JsonObject] | None = None,
 ) -> JsonObject:
@@ -3220,6 +3251,8 @@ def _build_review_quality_status(
         status["base_diff_status"] = base_diff_status
         if base_diff_status == "missing":
             status["suggested_setup"] = "build_base_snapshot_then_retry"
+    if semantic_diff_status is not None:
+        status["semantic_diff_status"] = semantic_diff_status
     if contract_diff_note is not None:
         status["contract_diff_note"] = contract_diff_note
 
@@ -3430,6 +3463,91 @@ def _splice_contract_diff_hypotheses(
     return spliced + review_hypotheses, None
 
 
+# S2: semantic contract-diff splice cap — mirrors contract-diff cap
+_SEMANTIC_DIFF_SPLICE_CAP = 3
+
+
+def _splice_semantic_diff_hypotheses(
+    *,
+    base_snapshot_dir: str,
+    head_kg: KgSnapshot,
+    base_checkout: str,
+    head_checkout: str,
+    changed_symbols: list[JsonObject],
+    review_hypotheses: list[JsonObject],
+) -> tuple[list[JsonObject], str]:
+    """Run semantic_contract_diff and splice inferred_llm hypothesis rows.
+
+    Returns (merged_hypotheses, semantic_diff_status).
+    semantic_diff_status: "active" | "unavailable" | "failed".
+    High-specificity rows are inserted at front of review_hypotheses.
+    Failure is honest: never raises, always returns a status string.
+    """
+    from pathlib import Path
+
+    try:
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.query.snapshot import KgSnapshot as _KgSnap
+        from source.kg.integrations.semantic_llm import SemanticDiffLlmClient
+    except ImportError as exc:
+        return review_hypotheses, f"unavailable:{exc}"
+
+    # Find head-snapshot CodeSymbol entities corresponding to changed symbols
+    # (by matching qualname/path from the symbol rows to entities in head_kg).
+    head_entities: list[JsonObject] = []
+    changed_qnames: set[str] = {
+        str(s.get("qualname") or s.get("qualified_name") or "")
+        for s in changed_symbols
+        if s.get("qualname") or s.get("qualified_name")
+    }
+    for entity in head_kg.entities:
+        if entity.get("kind") != "CodeSymbol":
+            continue
+        identity = entity.get("identity") or {}
+        qname = str(identity.get("qualname") or "")
+        if qname and qname in changed_qnames:
+            head_entities.append(entity)
+
+    if not head_entities:
+        return review_hypotheses, "active"
+
+    try:
+        base_snap = _KgSnap(base_snapshot_dir)
+        client = SemanticDiffLlmClient()
+        raw_rows = semantic_contract_diff(
+            base_snapshot=base_snap,
+            head_snapshot=head_kg,
+            base_root=Path(base_checkout),
+            head_root=Path(head_checkout),
+            changed_symbols=head_entities,
+            client=client,
+        )
+    except ImportError:
+        return review_hypotheses, "unavailable"
+    except Exception as exc:  # noqa: BLE001
+        return review_hypotheses, f"failed:{exc}"
+
+    if not raw_rows:
+        return review_hypotheses, "active"
+
+    # Cap and splice — mirror the contract-diff round-robin pattern (single family here)
+    spliced: list[JsonObject] = []
+    for row in raw_rows:
+        if len(spliced) >= _SEMANTIC_DIFF_SPLICE_CAP:
+            break
+        if not isinstance(row, dict):
+            continue
+        hypothesis_id = row.get("hypothesis_id")
+        if not hypothesis_id:
+            continue
+        spliced.append(row)
+
+    if not spliced:
+        return review_hypotheses, "active"
+
+    return spliced + review_hypotheses, "active"
+
+
 def _review_context_lead_packet(
     *,
     changed_files: list[str],
@@ -3591,7 +3709,10 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
         "source_coordinates": stamped_source_coordinates,
         "review_hypotheses": [
             h for h in (result.get("review_hypotheses") or [])
-            if isinstance(h, dict) and h.get("risk_type") == "low_coverage_stylesheet_gap"
+            if isinstance(h, dict) and h.get("risk_type") in {
+                "low_coverage_stylesheet_gap",
+                "contract_semantic_diff",
+            }
         ],
         "answerability": answerability,
         "coverage_warnings": result.get("coverage_warnings", []),
