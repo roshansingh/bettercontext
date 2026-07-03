@@ -132,6 +132,16 @@ def _extract_base_names_from_class_line(class_line: str) -> list[str]:
     Returns the last-segment names (e.g. ['A', 'B']) or [] if not a class line
     or no bases are listed.  Handles simple comma-separated bases only.
     """
+    return [last for _full, last in _extract_base_refs_from_class_line(class_line)]
+
+
+def _extract_base_refs_from_class_line(class_line: str) -> list[tuple[str, str]]:
+    """Extract base class references as (full_name, last_segment) pairs.
+
+    Returns pairs like [('module.Base', 'Base'), ('Other', 'Other')] or [] if
+    not a class line or no bases are listed.  Handles simple comma-separated
+    bases only; strips generic subscripts (e.g. Base[T] → Base).
+    """
     line = class_line.strip()
     if not line.startswith("class "):
         return []
@@ -160,7 +170,7 @@ def _extract_base_names_from_class_line(class_line: str) -> list[str]:
         else:
             current.append(ch)
     parts.append("".join(current))
-    result: list[str] = []
+    result: list[tuple[str, str]] = []
     for part in parts:
         part = part.strip()
         if not part:
@@ -175,10 +185,9 @@ def _extract_base_names_from_class_line(class_line: str) -> list[str]:
             part = part[:bracket].strip()
         if not part:
             continue
-        # Keep only the last segment (after the last dot) to match entity qualnames
         last = part.rsplit(".", 1)[-1]
         if last:
-            result.append(last)
+            result.append((part, last))
     return result
 
 
@@ -210,8 +219,8 @@ def _build_base_class_context(
     if head_first == base_first:
         return ""
 
-    base_names = _extract_base_names_from_class_line(head_first)
-    if not base_names:
+    base_refs = _extract_base_refs_from_class_line(head_first)
+    if not base_refs:
         return ""
 
     # Build a lookup: last qualname segment → list of CodeSymbol entities
@@ -233,14 +242,32 @@ def _build_base_class_context(
 
     sections: list[str] = []
     resolved_count = 0
-    for base_name in base_names:
+    for full_name, last_seg in base_refs:
         if resolved_count >= 2:
             break
-        matches = candidate_entities.get(base_name, [])
-        if not matches:
+        all_matches = candidate_entities.get(last_seg, [])
+        if not all_matches:
             continue
-        # Take the first match (deterministic; entities list order is stable within a build).
-        base_entity = matches[0]
+
+        is_dotted = "." in full_name
+        if is_dotted:
+            # Dotted base (e.g. module.Base): require exact qualified suffix match on qualname.
+            # A qualname like "pkg.module.Base" ends with "module.Base" — use str suffix check.
+            suffix = full_name
+            matches = [
+                e for e in all_matches
+                if str((e.get("identity") or {}).get("qualname") or "").endswith(suffix)
+            ]
+            if len(matches) != 1:
+                # 0 or 2+ qualified matches → skip enrichment for this base (conservative).
+                continue
+            base_entity = matches[0]
+        else:
+            # Bare name: enrich ONLY when exactly one candidate exists in the head snapshot.
+            # 2+ candidates → common name collision → skip to avoid wrong class body.
+            if len(all_matches) != 1:
+                continue
+            base_entity = all_matches[0]
         bprops = base_entity.get("properties") or {}
         bpath = str(bprops.get("path") or "")
         if not bpath:

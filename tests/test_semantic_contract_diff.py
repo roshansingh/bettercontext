@@ -2772,6 +2772,257 @@ class TestInheritanceContextEnrichment(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# P2 fix: ambiguous base-class enrichment disambiguation
+# ---------------------------------------------------------------------------
+
+class TestBaseClassEnrichmentDisambiguation(unittest.TestCase):
+    """P2 fix: _build_base_class_context must not attach the wrong class body.
+
+    Rules:
+      - Bare base name + 2+ same-last-seg candidates → NO enrichment (conservative skip).
+      - Dotted base (e.g. pkg.Base) → exact qualified suffix match → enriched when unique.
+      - Single candidate for a bare name → enriched (existing behaviour preserved).
+    """
+
+    def _make_snap_with_two_same_seg_classes(self, root: Path) -> tuple[KgSnapshot, Path, Path]:
+        """Two CodeSymbol entities share last qualname segment 'Base' in different modules."""
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        base_a = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_ambig",
+                "module": "mod_a",
+                "qualname": "mod_a.Base",
+                "symbol_kind": "class",
+            },
+            properties={"path": "mod_a/base.py", "line": 1, "end_line": 4},
+        )
+        base_b = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_ambig",
+                "module": "mod_b",
+                "qualname": "mod_b.Base",
+                "symbol_kind": "class",
+            },
+            properties={"path": "mod_b/base.py", "line": 1, "end_line": 4},
+        )
+        x_entity = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_ambig",
+                "module": "mod_x",
+                "qualname": "X",
+                "symbol_kind": "class",
+            },
+            properties={"path": "x.py", "line": 1, "end_line": 4},
+        )
+        snap_dir = root / "snap_ambig"
+        JsonlKgStore(snap_dir).write(
+            entities=[base_a, base_b, x_entity], facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": TENANT},
+        )
+        snap = KgSnapshot(snap_dir)
+
+        base_checkout = root / "base_ambig"
+        base_checkout.mkdir()
+        (base_checkout / "x.py").write_text("class X(OldBase):\n    pass\n")
+        head_checkout = root / "head_ambig"
+        head_checkout.mkdir()
+        # Bare base name 'Base' → 2 candidates in KG
+        (head_checkout / "x.py").write_text("class X(Base):\n    pass\n")
+        (head_checkout / "mod_a").mkdir()
+        (head_checkout / "mod_a" / "base.py").write_text("class Base:\n    def method_a(self): pass\n")
+        (head_checkout / "mod_b").mkdir()
+        (head_checkout / "mod_b" / "base.py").write_text("class Base:\n    def method_b(self): pass\n")
+
+        return snap, base_checkout, head_checkout
+
+    def test_two_same_seg_bare_name_no_enrichment(self) -> None:
+        """Two classes with same last segment + bare base name in class line → NO enrichment.
+
+        Hard assert: the prompt must not contain EITHER class body.
+        Regression: old code took matches[0] → wrong class attached.
+        """
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_checkout, head_checkout = self._make_snap_with_two_same_seg_classes(root)
+            x_dicts = [
+                d for d in snap.entities
+                if (d.get("identity") or {}).get("qualname") == "X"
+            ]
+            self.assertEqual(len(x_dicts), 1, "fixture must have exactly one X entity")
+
+            prompt_log: list[str] = []
+
+            class _SpyClient:
+                def complete_json(self, prompt: str) -> LlmResult:
+                    prompt_log.append(prompt)
+                    return LlmResult.parse_miss()
+
+            semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_checkout,
+                head_root=head_checkout,
+                changed_symbols=x_dicts,
+                client=_SpyClient(),
+            )
+
+            self.assertEqual(len(prompt_log), 1, "spy must be called exactly once")
+            prompt = prompt_log[0]
+            # Neither mod_a.Base nor mod_b.Base body should appear
+            self.assertNotIn(
+                "method_a", prompt,
+                "prompt must NOT contain mod_a.Base body when bare name is ambiguous",
+            )
+            self.assertNotIn(
+                "method_b", prompt,
+                "prompt must NOT contain mod_b.Base body when bare name is ambiguous",
+            )
+            self.assertNotIn(
+                "Referenced base class (for context)", prompt,
+                "no base class context section must appear when bare name is ambiguous",
+            )
+
+    def test_dotted_base_resolves_uniquely(self) -> None:
+        """Dotted base (mod_a.Base) → only mod_a.Base matches → enriched with its body."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_checkout, head_checkout = self._make_snap_with_two_same_seg_classes(root)
+            # Build a head checkout where X uses the DOTTED form
+            (head_checkout / "x.py").write_text("class X(mod_a.Base):\n    pass\n")
+            (base_checkout / "x.py").write_text("class X(OldBase):\n    pass\n")
+
+            x_dicts = [
+                d for d in snap.entities
+                if (d.get("identity") or {}).get("qualname") == "X"
+            ]
+
+            prompt_log: list[str] = []
+
+            class _SpyClient:
+                def complete_json(self, prompt: str) -> LlmResult:
+                    prompt_log.append(prompt)
+                    return LlmResult.parse_miss()
+
+            semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_checkout,
+                head_root=head_checkout,
+                changed_symbols=x_dicts,
+                client=_SpyClient(),
+            )
+
+            self.assertEqual(len(prompt_log), 1, "spy must be called exactly once")
+            prompt = prompt_log[0]
+            # mod_a.Base qualname ends with "mod_a.Base" → unique suffix match → enriched
+            self.assertIn(
+                "Referenced base class (for context)", prompt,
+                "dotted base resolved uniquely must enrich the prompt",
+            )
+            self.assertIn(
+                "method_a", prompt,
+                "prompt must contain mod_a.Base body (method_a) for dotted reference",
+            )
+            self.assertNotIn(
+                "method_b", prompt,
+                "prompt must NOT contain mod_b.Base body for mod_a.Base reference",
+            )
+
+    def test_single_candidate_bare_name_enriched(self) -> None:
+        """Single candidate for a bare name → enriched (existing behaviour preserved)."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # Only ONE entity with qualname ending in "UniqueBase"
+            unique_entity = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": TENANT,
+                    "repo": "repo_unique",
+                    "module": "mod_u",
+                    "qualname": "mod_u.UniqueBase",
+                    "symbol_kind": "class",
+                },
+                properties={"path": "ubase.py", "line": 1, "end_line": 4},
+            )
+            x_entity = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": TENANT,
+                    "repo": "repo_unique",
+                    "module": "mod_x",
+                    "qualname": "XUnique",
+                    "symbol_kind": "class",
+                },
+                properties={"path": "x.py", "line": 1, "end_line": 4},
+            )
+            snap_dir = root / "snap_unique"
+            JsonlKgStore(snap_dir).write(
+                entities=[unique_entity, x_entity], facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+
+            base_dir = root / "base_unique"
+            base_dir.mkdir()
+            (base_dir / "x.py").write_text("class XUnique(OldBase):\n    pass\n")
+            head_dir = root / "head_unique"
+            head_dir.mkdir()
+            (head_dir / "x.py").write_text("class XUnique(UniqueBase):\n    pass\n")
+            (head_dir / "ubase.py").write_text(
+                "class UniqueBase:\n    def unique_method(self): pass\n"
+            )
+
+            x_dicts = [
+                d for d in snap.entities
+                if (d.get("identity") or {}).get("qualname") == "XUnique"
+            ]
+
+            prompt_log: list[str] = []
+
+            class _SpyClient:
+                def complete_json(self, prompt: str) -> LlmResult:
+                    prompt_log.append(prompt)
+                    return LlmResult.parse_miss()
+
+            semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=x_dicts,
+                client=_SpyClient(),
+            )
+
+            self.assertEqual(len(prompt_log), 1, "spy must be called exactly once")
+            prompt = prompt_log[0]
+            self.assertIn(
+                "Referenced base class (for context)", prompt,
+                "single candidate bare name must be enriched",
+            )
+            self.assertIn(
+                "unique_method", prompt,
+                "prompt must contain UniqueBase body (unique_method)",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Field fix wave 2: subscripted base names, instruction-last with enrichment
 # ---------------------------------------------------------------------------
 

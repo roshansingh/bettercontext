@@ -4,6 +4,10 @@ import json
 import os
 from typing import Any
 
+# Owner decision (2026-07-03): default model is gpt-5.4-mini. Overridable via
+# SUPERCONTEXT_SEMANTIC_DIFF_MODEL env var. Environments lacking the alias or
+# API key fail honestly as llm_error / no_api_key — do not change without
+# owner sign-off.
 DEFAULT_SEMANTIC_DIFF_MODEL = "gpt-5.4-mini"
 
 _LITELLM_UNAVAILABLE: Exception | None = None
