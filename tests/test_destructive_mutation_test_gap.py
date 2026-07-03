@@ -201,6 +201,56 @@ class TestDestructiveMutationTestGap(unittest.TestCase):
         risk_types = [h["risk_type"] for h in hypotheses]
         self.assertIn("destructive_mutation_test_gap", risk_types)
 
+    def test_lead_matching_does_not_overmatch_shared_short_names(self):
+        """Regression: pr-7232 rank flip.
+
+        The callee subject's short segment ("handler") must only claim leads
+        anchored to the call-site path.  Changed symbols named "handler" in
+        unrelated files must not contribute supporting_lead_ids — bare
+        short-name matching inflated leads 1 -> 3 on pr-7232 and pushed this
+        family above async_side_effect_lifecycle_drift.
+        """
+        cancel_sym = {
+            "qualname": "handler",
+            "qualified_name": "features.bookings.handleCancelBooking.handler",
+            "kind": "function",
+            "path": "src/handleCancelBooking.ts",
+            "lead_id": "lead-cancel",
+        }
+        bookings_sym = {
+            "qualname": "handler",
+            "qualified_name": "trpc.viewer.bookings.handler",
+            "kind": "function",
+            "path": "src/bookings.tsx",
+            "lead_id": "lead-bookings",
+        }
+        workflows_sym = {
+            "qualname": "handler",
+            "qualified_name": "trpc.viewer.workflows.handler",
+            "kind": "function",
+            "path": "src/workflows.tsx",
+            "lead_id": "lead-workflows",
+        }
+        callee = _callee_row(
+            "features.bookings.handleCancelBooking.handler",
+            "prisma.attendee.deleteMany",
+            path="src/handleCancelBooking.ts",
+        )
+        hypotheses = self._call(
+            changed_files=["src/handleCancelBooking.ts", "src/bookings.tsx", "src/workflows.tsx"],
+            changed_symbols=[cancel_sym, bookings_sym, workflows_sym],
+            direct_callees=[callee],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-cancel", "qualname": "handler", "path": "src/handleCancelBooking.ts"},
+                    {"lead_id": "lead-bookings", "qualname": "handler", "path": "src/bookings.tsx"},
+                    {"lead_id": "lead-workflows", "qualname": "handler", "path": "src/workflows.tsx"},
+                ],
+            },
+        )
+        h = next(h for h in hypotheses if h["risk_type"] == "destructive_mutation_test_gap")
+        self.assertEqual(h["supporting_lead_ids"], ["lead-cancel"])
+
 
 if __name__ == "__main__":
     unittest.main()

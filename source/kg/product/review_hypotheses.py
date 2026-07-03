@@ -1214,30 +1214,45 @@ def _destructive_mutation_test_gap(
                     break
         if ref:
             evidence_refs.append(ref)
+    # Lead matching joins the callee-row subject (the calling symbol) to a
+    # changed-symbol lead by full qualified name, or by short name anchored to
+    # the call-site path.  A bare short-name match is too loose: a subject
+    # segment like "handler" would match every changed symbol named "handler"
+    # across unrelated files and inflate supporting_lead_ids.
     lead_ids: list[str] = []
-    callee_subjects: set[str] = set()
+    callee_full_names: set[str] = set()
+    callee_name_path_keys: set[tuple[str, str]] = set()
     for row in matching_callees:
         subj = str(row.get("subject") or "")
-        if subj:
-            callee_subjects.add(subj)
+        if not subj:
+            continue
+        callee_full_names.add(subj)
         subj_seg = subj.rsplit(".", 1)[-1]
-        if subj_seg:
-            callee_subjects.add(subj_seg)
+        for ev in row.get("evidence") or []:
+            if not isinstance(ev, dict):
+                continue
+            br = ev.get("bytes_ref")
+            if isinstance(br, dict):
+                p = br.get("path")
+                if isinstance(p, str) and p:
+                    callee_name_path_keys.add((subj_seg, _normalize_path(p)))
     for row in review_leads.get("changed_symbols") or []:
         if not isinstance(row, dict):
             continue
         lid = row.get("lead_id")
         if not isinstance(lid, str) or not lid:
             continue
+        row_qualified = str(row.get("qualified_name") or "")
         row_qualname = str(row.get("qualname") or "")
-        row_path = str(row.get("path") or "")
-        if row_qualname in callee_subjects or (row_qualname.rsplit(".", 1)[-1] if "." in row_qualname else row_qualname) in callee_subjects:
+        row_short = row_qualname.rsplit(".", 1)[-1] if row_qualname else ""
+        row_path = _normalize_path(str(row.get("path") or ""))
+        if row_qualified and row_qualified in callee_full_names:
             lead_ids.append(lid)
             continue
-        if any(row_path == (s.get("path") or "") for s in changed_symbols if any(
-            (str(s.get(k) or "").rsplit(".", 1)[-1] or str(s.get(k) or "")) in callee_subjects
-            for k in ("qualname", "qualified_name", "display_name", "name")
-        )):
+        if row_qualname and row_qualname in callee_full_names:
+            lead_ids.append(lid)
+            continue
+        if row_short and row_path and (row_short, row_path) in callee_name_path_keys:
             lead_ids.append(lid)
     why = "Changed symbol(s) perform destructive persistence operations (delete/destroy) with no test file in the changeset; ownership guard and delete path are untested."
     source_checks = [
