@@ -17,6 +17,7 @@ from source.kg.product.output_budget import (
     COMPACT_AUTHZ_INSPECTION_REF_LIMIT,
     PLANNING_CONTEXT_ANCHORED_MAX_CHARS,
     REVIEW_CONTEXT_BROAD_MAX_CHARS,
+    _DIFF_DERIVED_RISK_TYPES,
     enforce_planning_context_budget,
     enforce_review_context_budget,
     enforce_reverse_impact_budget,
@@ -3084,10 +3085,15 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     elif base_checkout or head_checkout:
         # Minor 11: checkouts provided without a base_snapshot — note the missing dependency.
         semantic_diff_status = "missing_base_snapshot"
-    # Cap the top-level list to PLANNING_CONTEXT_SECTION_LIMIT (5). The splice
-    # inserts high-specificity rows at the front so the specifics-first partition is
-    # already correct; slicing here preserves that order while bounding the list.
-    review_hypotheses = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
+    # Cap the top-level list to PLANNING_CONTEXT_SECTION_LIMIT (5). The splice inserts
+    # high-specificity rows at the front so the specifics-first partition is already
+    # correct; the reservation cap preserves that order while guaranteeing at least one
+    # row per generated diff-derived risk type survives the slice (deterministic families
+    # ranked above inferred_llm) — the cap-time twin of the budget-time survival rule, so
+    # a generated diff family is never dropped before by-risk-type truncation counts run.
+    review_hypotheses = _cap_review_hypotheses_reserving_diff_families(
+        review_hypotheses, PLANNING_CONTEXT_SECTION_LIMIT
+    )
     review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     if base_snapshot_dir:
         _base_diff_status = "active" if contract_diff_note is None else "failed"
@@ -3353,6 +3359,75 @@ _CONTRACT_DIFF_SPLICE_CAP = 3
 # Abstract-contract detector: deterministic_static family (reparent → abstract base
 # with unimplemented abstract members). Spliced alongside the other deterministic rows.
 _ABSTRACT_CONTRACT_SPLICE_CAP = 3
+
+
+def _cap_review_hypotheses_reserving_diff_families(
+    review_hypotheses: list[JsonObject],
+    limit: int,
+) -> list[JsonObject]:
+    """Cap the top-level hypothesis list to ``limit`` while guaranteeing at least one
+    row per GENERATED diff-derived risk type survives the slice.
+
+    A naive ``review_hypotheses[:limit]`` can evict an entire generated diff family
+    before budget pinning or the by-risk-type truncation counts ever run — the
+    pre-budget "generated" set fed to _attach_review_hypothesis_status is exactly this
+    already-capped list, so a family dropped here becomes invisible (no returned row,
+    no truncated_by_risk_type entry). This is the cap-time twin of the budget-time
+    survival rule in output_budget._hypothesis_first_compact_packet: both keep one row
+    per generated ``_DIFF_DERIVED_RISK_TYPES`` member, and both rank deterministic
+    families above inferred_llm rows (derivation tier deterministic_static >
+    inferred_llm) when slots are scarce.
+
+    Order: start from the prior ranking prefix ``review_hypotheses[:limit]``; for each
+    generated diff-derived risk type absent from that prefix, splice one row in by
+    evicting the last non-diff-derived row — and, when only diff-derived rows remain,
+    an already-pinned inferred_llm row before a deterministic_static one. When distinct
+    generated diff-derived types exceed ``limit``, the lowest-priority (inferred_llm)
+    types are the ones left out; their absence surfaces as nonzero
+    truncated_by_risk_type entries downstream, never as silent absence.
+    """
+    kept = review_hypotheses[:limit]
+    kept_ids = {id(row) for row in kept}
+    kept_types = {row.get("risk_type") for row in kept if isinstance(row, dict)}
+
+    # First occurrence of each generated diff-derived type, deterministic before inferred.
+    missing_det: list[JsonObject] = []
+    missing_inferred: list[JsonObject] = []
+    seen_types: set[str] = set(t for t in kept_types if t in _DIFF_DERIVED_RISK_TYPES)
+    for row in review_hypotheses:
+        if not isinstance(row, dict) or id(row) in kept_ids:
+            continue
+        rt = row.get("risk_type")
+        if rt not in _DIFF_DERIVED_RISK_TYPES or rt in seen_types:
+            continue
+        seen_types.add(rt)
+        if row.get("derivation") == "deterministic_static":
+            missing_det.append(row)
+        else:
+            missing_inferred.append(row)
+
+    for pin in missing_det + missing_inferred:
+        # Evict the lowest-priority evictable row: a non-diff-derived row first, else
+        # an already-pinned inferred_llm row so deterministic families win scarce slots.
+        evict_idx = next(
+            (i for i in range(len(kept) - 1, -1, -1)
+             if not isinstance(kept[i], dict) or kept[i].get("risk_type") not in _DIFF_DERIVED_RISK_TYPES),
+            None,
+        )
+        if evict_idx is None and pin.get("derivation") == "deterministic_static":
+            evict_idx = next(
+                (i for i in range(len(kept) - 1, -1, -1)
+                 if isinstance(kept[i], dict) and kept[i].get("derivation") != "deterministic_static"),
+                None,
+            )
+        if evict_idx is None:
+            # No lower-priority slot to yield — this pin cannot fit; its absence shows
+            # up as a nonzero truncated_by_risk_type entry, not silent absence.
+            continue
+        kept.pop(evict_idx)
+        kept.append(pin)
+
+    return kept
 
 
 def _resolve_changed_head_entities(

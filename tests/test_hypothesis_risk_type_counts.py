@@ -1,22 +1,37 @@
-"""Tests for by-risk-type hypothesis counts (Part A) and semantic row budget survival (Part B).
+"""Tests for by-risk-type hypothesis counts (Part A), semantic row budget survival
+(Part B), and the cap-time diff-family reservation (Part C).
 
 Part A: review_hypothesis_status carries available_by_risk_type, returned_by_risk_type,
         truncated_by_risk_type — all consistent with scalar counts.
 Part B: contract_semantic_diff (diff-derived) rows survive budget truncation even when
         placed at a low-priority position in the hypothesis list.
+Part C: the top-level PLANNING_CONTEXT_SECTION_LIMIT cap reserves at least one row per
+        GENERATED diff-derived risk type before slicing, so a generated diff family is
+        never dropped before by-risk-type truncation counts run (cap-time twin of B).
 """
 from __future__ import annotations
 
+import tempfile
 import unittest
 from copy import deepcopy
+from pathlib import Path
+from unittest import mock
 
+import source.kg.product.mcp_tools as mcp_tools_module
+from source.kg.build.pipeline import build_kg
 from source.kg.core.models import canonical_json
+from source.kg.product.mcp_tools import (
+    PLANNING_CONTEXT_SECTION_LIMIT,
+    _cap_review_hypotheses_reserving_diff_families,
+    call_tool,
+)
 from source.kg.product.output_budget import (
     REVIEW_CONTEXT_MAX_CHARS,
     enforce_review_context_budget,
     _DIFF_DERIVED_RISK_TYPES,
 )
 from source.kg.product.review_attribution import add_review_lead_ids, review_available_counts
+from source.kg.query.snapshot import KgSnapshot
 
 
 # ---------------------------------------------------------------------------
@@ -373,3 +388,255 @@ class TestSemanticRowBudgetSurvival(unittest.TestCase):
             self.assertIn(rt, returned_risk_types, f"diff-derived type {rt!r} was evicted")
         # Budget still respected.
         self.assertLessEqual(len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS)
+
+
+# ---------------------------------------------------------------------------
+# Part C: cap-time diff-family reservation (before PLANNING_CONTEXT_SECTION_LIMIT)
+# ---------------------------------------------------------------------------
+
+def _cap_hyp(risk_type: str, idx: int, derivation: str | None) -> dict:
+    h: dict = {
+        "hypothesis_id": f"hypothesis:{risk_type}:{idx:016x}",
+        "risk_type": risk_type,
+    }
+    if derivation is not None:
+        h["derivation"] = derivation
+    return h
+
+
+class TestCapTimeDiffFamilyReservation(unittest.TestCase):
+    """_cap_review_hypotheses_reserving_diff_families keeps >=1 row per generated
+    diff-derived family in the first PLANNING_CONTEXT_SECTION_LIMIT slots."""
+
+    def test_deterministic_and_semantic_families_survive_naive_slice(self):
+        """3 contract-diff + 1 abstract (deterministic) + 1 semantic + generic rows,
+        all generated, total > cap → every generated diff-derived family survives."""
+        # Generic rows occupy the front (as generic families rank last in the real list
+        # only after splices, but here we place them first to prove reservation evicts
+        # them rather than the diff families they would otherwise crowd out).
+        generic = [_cap_hyp("generic_drift", i, None) for i in range(5)]
+        det_diff = [
+            _cap_hyp("guard_call_removed_drift", 10, "deterministic_static"),
+            _cap_hyp("responsibility_moved_drift", 11, "deterministic_static"),
+            _cap_hyp("test_reference_removed_drift", 12, "deterministic_static"),
+            _cap_hyp("abstract_contract_unimplemented", 13, "deterministic_static"),
+        ]
+        semantic = [_cap_hyp("contract_semantic_diff", 20, "inferred_llm")]
+        # Deterministic front-ranked (mirrors the real splice), then semantic, then generic.
+        ordered = det_diff + semantic + generic
+        kept = _cap_review_hypotheses_reserving_diff_families(ordered, PLANNING_CONTEXT_SECTION_LIMIT)
+
+        self.assertEqual(len(kept), PLANNING_CONTEXT_SECTION_LIMIT)
+        kept_types = {h["risk_type"] for h in kept}
+        for rt in (
+            "guard_call_removed_drift",
+            "responsibility_moved_drift",
+            "test_reference_removed_drift",
+            "abstract_contract_unimplemented",
+        ):
+            self.assertIn(rt, kept_types, f"deterministic diff family {rt!r} dropped by cap")
+
+    def test_inversion_naive_slice_drops_a_family(self):
+        """Inversion: the naive [:cap] slice DOES drop a generated diff family the
+        reservation cap preserves — proves the reservation is load-bearing."""
+        det_diff = [
+            _cap_hyp("guard_call_removed_drift", 10, "deterministic_static"),
+            _cap_hyp("responsibility_moved_drift", 11, "deterministic_static"),
+        ]
+        semantic = [_cap_hyp("contract_semantic_diff", 20, "inferred_llm")]
+        generic = [_cap_hyp("generic_drift", i, None) for i in range(5)]
+        # Semantic sits at position 3, but generic rows crowd it past the cap in a naive slice.
+        ordered = det_diff + generic[:3] + semantic + generic[3:]
+        naive = {h["risk_type"] for h in ordered[:PLANNING_CONTEXT_SECTION_LIMIT]}
+        self.assertNotIn(
+            "contract_semantic_diff", naive,
+            "inversion precondition: naive slice must drop the semantic family",
+        )
+        kept = _cap_review_hypotheses_reserving_diff_families(ordered, PLANNING_CONTEXT_SECTION_LIMIT)
+        kept_types = {h["risk_type"] for h in kept}
+        self.assertIn(
+            "contract_semantic_diff", kept_types,
+            "reservation cap must retain the semantic family the naive slice dropped",
+        )
+
+    def test_deterministic_wins_scarce_slot_over_semantic(self):
+        """When distinct diff families exceed a tight cap, deterministic families are
+        kept and the inferred_llm family is the one dropped (derivation tier)."""
+        # 4 distinct deterministic diff families + 1 semantic = 5 distinct diff types,
+        # capped to 4 slots → the inferred_llm family must be the one left out.
+        det_diff = [
+            _cap_hyp("guard_call_removed_drift", 10, "deterministic_static"),
+            _cap_hyp("responsibility_moved_drift", 11, "deterministic_static"),
+            _cap_hyp("test_reference_removed_drift", 12, "deterministic_static"),
+            _cap_hyp("abstract_contract_unimplemented", 13, "deterministic_static"),
+        ]
+        semantic = [_cap_hyp("contract_semantic_diff", 20, "inferred_llm")]
+        ordered = det_diff + semantic
+        kept = _cap_review_hypotheses_reserving_diff_families(ordered, 4)
+        kept_types = {h["risk_type"] for h in kept}
+        self.assertEqual(len(kept), 4)
+        for rt in (
+            "guard_call_removed_drift",
+            "responsibility_moved_drift",
+            "test_reference_removed_drift",
+            "abstract_contract_unimplemented",
+        ):
+            self.assertIn(rt, kept_types, f"deterministic family {rt!r} must win scarce slot")
+        self.assertNotIn(
+            "contract_semantic_diff", kept_types,
+            "inferred_llm family must be the one dropped when slots are scarce",
+        )
+
+
+TENANT = "default"
+
+
+def _build_combined_pair(tmpdir: Path) -> tuple[Path, Path, Path, Path]:
+    """base + head where core.py has BOTH contract-diff churn (guard/moved/test-ref)
+    AND a class reparented onto an abstract base with unimplemented members.
+
+    Base and head live in SEPARATE checkout dirs (the abstract/semantic detectors diff
+    the two checkouts on disk, so an in-place overwrite would produce an empty diff).
+    Yields up to 4 generated diff-derived families (3 contract + 1 abstract) that all
+    exceed the top-level cap once generic caller hypotheses are added.
+    """
+    abstract_base = (
+        "import abc\n\n\n"
+        "class BaseThing(abc.ABC):\n"
+        "    @abc.abstractmethod\n"
+        "    def build_it(self, x):\n"
+        "        ...\n\n\n"
+        "class Concrete:\n"
+        "    def evaluate(self):\n"
+        "        return 1\n\n\n"
+    )
+    # Heavy churn: multiple guard-call removals + responsibility moves so guard/moved
+    # families each produce >1 row — enough total diff-derived rows that a naive [:cap]
+    # slice would drop entire later families (test-ref, abstract, semantic).
+    base_core = abstract_base + (
+        "def alpha():\n    beta()\n    gamma()\n\n"
+        "def beta():\n    delta()\n    gamma()\n\n"
+        "def gamma():\n    pass\n\n"
+        "def delta():\n    pass\n\n"
+        "def eps():\n    gamma()\n\n"
+        "class Widget(Concrete):\n"
+        "    def evaluate(self):\n"
+        "        return 2\n"
+    )
+    head_core = abstract_base + (
+        "def alpha():\n    beta()\n\n"
+        "def beta():\n    pass\n\n"
+        "def gamma():\n    pass\n\n"
+        "def delta():\n    gamma()\n\n"
+        "def eps():\n    pass\n\n"
+        "class Widget(BaseThing):\n"
+        "    pass\n"
+    )
+
+    def _write_repo(root: Path, core: str, test_body: str) -> None:
+        svc = root / "svc"
+        (svc / "tests").mkdir(parents=True)
+        (svc / "__init__.py").write_text("", encoding="utf-8")
+        (svc / "core.py").write_text(core, encoding="utf-8")
+        (svc / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (svc / "tests" / "test_core.py").write_text(test_body, encoding="utf-8")
+
+    base_ck = tmpdir / "base"
+    head_ck = tmpdir / "head"
+    _write_repo(base_ck, base_core, "from svc.core import alpha\n\ndef test_alpha():\n    alpha()\n")
+    _write_repo(head_ck, head_core, "def test_other():\n    pass\n")
+
+    out_base = tmpdir / "kg_base"
+    out_head = tmpdir / "kg_head"
+    build_kg(base_ck / "svc", out_base, tenant_id=TENANT)
+    build_kg(head_ck / "svc", out_head, tenant_id=TENANT)
+    return out_base, out_head, base_ck / "svc", head_ck / "svc"
+
+
+class TestCapReservationRealPipeline(unittest.TestCase):
+    """Real call_tool('review_context') pipeline: heavy contract-diff churn + abstract
+    reparent generate more diff-derived rows than the cap, spanning multiple distinct
+    risk types. The reservation cap keeps >=1 row per generated diff-derived type; a naive
+    slice would drop entire later families. Inversion is proved on the real pre-cap list."""
+
+    def _run_capturing_precap(self):
+        """Run the real pipeline; return (result, pre_cap_types, naive_types)."""
+        captured: dict = {}
+        original = mcp_tools_module._cap_review_hypotheses_reserving_diff_families
+
+        def _spy(rows, limit):
+            captured["pre"] = [r.get("risk_type") for r in rows if isinstance(r, dict)]
+            captured["naive"] = [
+                r.get("risk_type") for r in rows[:limit] if isinstance(r, dict)
+            ]
+            return original(rows, limit)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            out_base, out_head, base_ck, head_ck = _build_combined_pair(tmpdir)
+            head_kg = KgSnapshot(out_head)
+            with mock.patch.object(
+                mcp_tools_module,
+                "_cap_review_hypotheses_reserving_diff_families",
+                _spy,
+            ):
+                result = call_tool(
+                    head_kg,
+                    "review_context",
+                    {
+                        "repo": "svc",
+                        "changed_files": ["core.py"],
+                        "base_snapshot": str(out_base),
+                        "base_checkout": str(base_ck),
+                        "head_checkout": str(head_ck),
+                    },
+                )
+        return result, captured["pre"], captured["naive"]
+
+    def test_every_generated_diff_family_survives_the_cap(self):
+        result, pre_types, naive_types = self._run_capturing_precap()
+
+        # Hard precondition: the fixture must over-produce (more diff-derived rows than
+        # the cap) across multiple distinct types, or the test proves nothing.
+        pre_diff = [rt for rt in pre_types if rt in _DIFF_DERIVED_RISK_TYPES]
+        self.assertGreater(
+            len(pre_diff), PLANNING_CONTEXT_SECTION_LIMIT,
+            f"fixture must generate more diff-derived rows than the cap; pre={pre_types}",
+        )
+        pre_diff_type_set = set(pre_diff)
+        self.assertGreaterEqual(
+            len(pre_diff_type_set), 4,
+            f"fixture must span >=4 distinct diff-derived types; got {pre_diff_type_set}",
+        )
+
+        # Inversion precondition: the naive [:cap] slice DROPS at least one generated
+        # diff-derived type entirely — the exact regression this fix prevents.
+        naive_type_set = {rt for rt in naive_types if rt in _DIFF_DERIVED_RISK_TYPES}
+        dropped_by_naive = pre_diff_type_set - naive_type_set
+        self.assertTrue(
+            dropped_by_naive,
+            f"inversion precondition failed: naive slice kept all diff types "
+            f"(pre={pre_diff_type_set}, naive={naive_type_set})",
+        )
+
+        # The fix: every generated diff-derived type has a RETURNED row in the FINAL
+        # packet — none silently absent, including those the naive slice would drop.
+        returned_hyps = result.get("review_hypotheses") or []
+        returned_types = {
+            h.get("risk_type") for h in returned_hyps if isinstance(h, dict)
+        }
+        for rt in pre_diff_type_set:
+            self.assertIn(
+                rt, returned_types,
+                f"generated diff family {rt!r} silently dropped by the cap; "
+                f"returned={sorted(returned_types)}",
+            )
+
+        # by-risk-type status reflects the survival (no silent absence).
+        hs = result.get("review_hypothesis_status") or {}
+        returned_by = hs.get("returned_by_risk_type") or {}
+        for rt in pre_diff_type_set:
+            self.assertGreaterEqual(
+                returned_by.get(rt, 0), 1,
+                f"returned_by_risk_type[{rt!r}] must be >=1; got {returned_by}",
+            )

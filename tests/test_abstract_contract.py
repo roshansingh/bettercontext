@@ -455,6 +455,74 @@ class TestAbstractContractMro(unittest.TestCase):
         self.assertIn("build_it", claim, f"claim must name build_it; got {claim!r}")
 
 
+class TestSubclassAbstractRedeclaration(unittest.TestCase):
+    """A subclass that REDECLARES a required member with @abstractmethod stays abstract.
+
+    Concrete-only satisfaction (P2 fix): a def decorated @abc.abstractmethod does NOT
+    count as implementing the member, so Widget is still abstract and still raises at
+    construction. The detector must emit a row naming the redeclared member. Inversion:
+    dropping the decorator (a concrete override) flips the outcome to no row for it.
+    """
+
+    def _run(self, base_core: str, head_core: str) -> list[JsonObject]:
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            out_base, out_head, base_ck, head_ck = _build_pair(tmpdir, base_core, head_core)
+            result = _review_context(out_base, out_head, base_ck, head_ck)
+            return _abstract_rows(result)
+
+    def test_abstract_redeclaration_emits_row_for_member(self) -> None:
+        """Widget redeclares build_it as @abstractmethod; counter_names concretely set.
+
+        build_it stays abstract → row emitted naming build_it. counter_names is a
+        concrete assignment override → NOT named.
+        """
+        base_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(BaseThing):\n"
+            "    counter_names = ('a',)\n"
+            "    @abc.abstractmethod\n"
+            "    def build_it(self, x):\n"
+            "        ...\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(len(rows), 1, f"abstract redeclaration → exactly one row; got {rows}")
+        claim = str(rows[0].get("postable_claim") or "")
+        self.assertIn(
+            "build_it", claim,
+            f"redeclared-abstract member must be named unimplemented; got {claim!r}",
+        )
+        self.assertNotIn(
+            "counter_names", claim,
+            f"counter_names is a concrete override and must NOT be claimed; got {claim!r}",
+        )
+
+    def test_concrete_override_suppresses_row(self) -> None:
+        """Inversion: same fixture but build_it is a concrete def (no decorator) → no row.
+
+        The ONLY difference from test_abstract_redeclaration_emits_row_for_member is the
+        removed @abc.abstractmethod decorator; that flips build_it to concrete, satisfies
+        the contract, and suppresses the row.
+        """
+        base_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(BaseThing):\n"
+            "    counter_names = ('a',)\n"
+            "    def build_it(self, x):\n"
+            "        return x\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(rows, [], f"concrete override of build_it → no row; got {rows}")
+
+
 class TestClassDefLeafCollision(unittest.TestCase):
     """_class_def_in_source must disambiguate same-leaf nested classes (finding P2)."""
 

@@ -250,26 +250,6 @@ def _base_is_abstract_and_members(class_def: ast.ClassDef) -> tuple[bool, tuple[
     return is_abstract, tuple(dict.fromkeys(abstract_members))
 
 
-def _defined_member_names(class_def: ast.ClassDef) -> set[str]:
-    """Names defined directly in a subclass body: functions, methods, and assignments.
-
-    A member counts as "implemented" when the subclass binds the same name via a
-    def, async def, or an assignment target (covers ``counter_names = (...)`` style
-    property overrides).
-    """
-    names: set[str] = set()
-    for stmt in class_def.body:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            names.add(stmt.name)
-        elif isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
-                if isinstance(target, ast.Name):
-                    names.add(target.id)
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            names.add(stmt.target.id)
-    return names
-
-
 def _concrete_member_names(class_def: ast.ClassDef) -> set[str]:
     """Names CONCRETELY defined in a base body (def/assign NOT decorated abstractmethod).
 
@@ -538,7 +518,12 @@ def abstract_contract_diff(
             continue
 
         subclass_repo = str(identity.get("repo") or "")
-        defined = _defined_member_names(head_class)
+        # Concrete-only: a subclass that REDECLARES a required member with
+        # @abstractmethod stays abstract and still raises at construction, so it
+        # must not count as satisfying the member. Assignments still count as
+        # concrete overrides. Mirrors the MRO subtraction path, which already uses
+        # concrete-only collection via _concrete_members_from_entity below.
+        defined = _concrete_member_names(head_class)
         empty_body = _body_is_empty(head_class)
 
         for base_name in new_bases:
