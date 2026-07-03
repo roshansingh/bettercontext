@@ -279,7 +279,7 @@ def _build_base_class_context(
             continue
         body = body[:_BASE_BODY_CHAR_LIMIT]
         bidentity = base_entity.get("identity") or {}
-        bqualname = str(bidentity.get("qualname") or base_name)
+        bqualname = str(bidentity.get("qualname") or full_name)
         sections.append(f"Referenced base class (for context) — {bqualname}:\n{body}")
         resolved_count += 1
 
