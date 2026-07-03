@@ -62,9 +62,30 @@ def _entity_coordinates(entity: JsonObject, snap: KgSnapshot) -> JsonObject:
 # Natural fact key: (predicate, subject_id, object_id, canonical qualifier)
 # fact_id is stable (models.py:140 — hash of predicate + subject_id + object_id + qualifier),
 # but we key by natural tuple so the contract is explicit and immune to any future ID-scheme change.
+#
+# Identity is structural — presentation/coordinate fields that change on reformat (source_line,
+# source_excerpt) or on minor source movement (line, line_start, line_end, col, column) must not
+# affect identity. Stripping them here means diff_snapshots reports only genuine structural changes.
+#
+# KNOWN LIMITATION: two calls to the same callee from the same caller symbol produce the same
+# identity key once volatile keys are stripped (the only differentiator was their source coords).
+# Removing one of two duplicate calls is invisible to the set-diff. This is the accepted trade-off;
+# the alternative — false "removed+added" deltas on every reformat — is far worse.
+_VOLATILE_QUALIFIER_KEYS: frozenset[str] = frozenset({
+    "source_line",
+    "source_excerpt",
+    "line",
+    "line_start",
+    "line_end",
+    "col",
+    "column",
+})
+
+
 def _fact_natural_key(fact: JsonObject) -> tuple[str, str, str, str]:
     qualifier = fact.get("qualifier") or {}
-    canonical_q = canonical_json(qualifier)
+    structural_q = {k: v for k, v in qualifier.items() if k not in _VOLATILE_QUALIFIER_KEYS}
+    canonical_q = canonical_json(structural_q)
     return (
         str(fact.get("predicate", "")),
         str(fact.get("subject_id", "")),

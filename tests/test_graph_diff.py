@@ -707,5 +707,95 @@ class TestUninstrumentedScopes(unittest.TestCase):
         self.assertEqual(len(delta.uninstrumented_scopes), 1)
 
 
+def _calls_fact_with_qualifier(caller: Entity, callee: Entity, qualifier: dict) -> Fact:
+    return Fact("CALLS", caller.entity_id, callee.entity_id, qualifier=qualifier)
+
+
+class TestVolatileQualifierKeysDoNotCreateFalseDiffs(unittest.TestCase):
+    """Inversion evidence: source_line/source_excerpt churn must NOT produce a delta."""
+
+    def test_reformat_same_call_different_source_line_gives_empty_delta(self) -> None:
+        """Same CALLS edge, only source_line/source_excerpt differ → empty delta (inversion test)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            fn_alpha = _symbol("svc", "svc.core", "alpha")
+            fn_beta = _symbol("svc", "svc.core", "beta")
+
+            base_fact = _calls_fact_with_qualifier(
+                fn_alpha, fn_beta,
+                {"call": "beta", "source_line": "    beta()", "source_excerpt": "beta()"},
+            )
+            head_fact = _calls_fact_with_qualifier(
+                fn_alpha, fn_beta,
+                {"call": "beta", "source_line": "        beta()", "source_excerpt": "beta()  # reformatted"},
+            )
+
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta], [base_fact])
+            head = _make_snapshot(root, "head", [mod, fn_alpha, fn_beta], [head_fact])
+            delta = diff_snapshots(base, head)
+
+        # Hard assert: presentation churn must produce zero fact delta.
+        self.assertEqual(delta.added_facts, [], msg="Reformat must not add facts")
+        self.assertEqual(delta.removed_facts, [], msg="Reformat must not remove facts")
+
+    def test_genuine_call_removal_still_detected(self) -> None:
+        """Removing a CALLS edge (different callee) is still reported even with volatile stripping."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            fn_alpha = _symbol("svc", "svc.core", "alpha")
+            fn_beta = _symbol("svc", "svc.core", "beta")
+            fn_gamma = _symbol("svc", "svc.core", "gamma")
+
+            base_fact = _calls_fact_with_qualifier(
+                fn_alpha, fn_beta,
+                {"call": "beta", "source_line": "    beta()", "source_excerpt": "beta()"},
+            )
+            head_fact = _calls_fact_with_qualifier(
+                fn_alpha, fn_gamma,
+                {"call": "gamma", "source_line": "    gamma()", "source_excerpt": "gamma()"},
+            )
+
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta, fn_gamma], [base_fact])
+            head = _make_snapshot(root, "head", [mod, fn_alpha, fn_beta, fn_gamma], [head_fact])
+            delta = diff_snapshots(base, head)
+
+        removed_keys = {(f["predicate"], f["subject_id"], f["object_id"]) for f in delta.removed_facts}
+        added_keys = {(f["predicate"], f["subject_id"], f["object_id"]) for f in delta.added_facts}
+        self.assertIn(("CALLS", fn_alpha.entity_id, fn_beta.entity_id), removed_keys)
+        self.assertIn(("CALLS", fn_alpha.entity_id, fn_gamma.entity_id), added_keys)
+
+    def test_duplicate_call_collapse_is_pinned(self) -> None:
+        """Two calls to the same callee from the same caller collapse to one identity key.
+
+        Removing one of two duplicate calls is invisible to the set-diff — accepted behavior.
+        This test pins that behavior so any future change is deliberate.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            fn_alpha = _symbol("svc", "svc.core", "alpha")
+            fn_beta = _symbol("svc", "svc.core", "beta")
+
+            call1 = _calls_fact_with_qualifier(
+                fn_alpha, fn_beta,
+                {"call": "beta", "source_line": "    beta()  # first", "source_excerpt": "beta()"},
+            )
+            call2 = _calls_fact_with_qualifier(
+                fn_alpha, fn_beta,
+                {"call": "beta", "source_line": "    beta()  # second", "source_excerpt": "beta()"},
+            )
+
+            # base has both duplicate calls; head has only one
+            base = _make_snapshot(root, "base", [mod, fn_alpha, fn_beta], [call1, call2])
+            head = _make_snapshot(root, "head", [mod, fn_alpha, fn_beta], [call1])
+            delta = diff_snapshots(base, head)
+
+        # Accepted limitation: removing one of two identical-structure calls produces empty delta.
+        self.assertEqual(delta.added_facts, [], msg="Duplicate-call collapse: no added facts expected")
+        self.assertEqual(delta.removed_facts, [], msg="Duplicate-call collapse: no removed facts expected")
+
+
 if __name__ == "__main__":
     unittest.main()
