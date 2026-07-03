@@ -3233,9 +3233,9 @@ def _build_review_quality_status(
     # correct for the emission path. The first call was previously a boolean gate only
     # (no include_base_build). Compute the full version once and reuse for both gate
     # and emission.
-    # Safety: include_base_build=True only when base_diff_status=="missing" AND no
-    # has_changed_ranges (the elif branch handles the changed_ranges case above the else,
-    # so the else with base_diff_status=="missing" implies no changed_ranges).
+    # include_base_build=True when base_diff_status=="missing" (changed_ranges present
+    # but no base_snapshot supplied). The review_readiness branch below separately gates
+    # on has_changed_ranges to select "base_snapshot_required" vs "needs_followup".
     has_changed_ranges = bool(changed_ranges)
     if max_spec not in ("high", "medium"):
         # Compute once; reused for both gate and emission.

@@ -65,7 +65,7 @@ def hypothesis_stable_id(
 def hypothesis_label(risk_type: str, hypothesis_id: str) -> str:
     """Short stable label for attribution: '{risk_type}-{4hex}'.
 
-    Extracts the last 4 hex chars of the hypothesis_id digest (format:
+    Extracts the first 4 hex chars of the hypothesis_id digest (format:
     'hypothesis:{risk_type}:{16hex}') to form a compact, collision-resistant,
     human-readable tag. Stable across runs because hypothesis_id is stable.
     """

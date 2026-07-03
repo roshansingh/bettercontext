@@ -74,8 +74,8 @@ def _safe_resolve(root: Path, path: str) -> Path | None:
     Returns the resolved Path on success, None on:
       - absolute path (security: Path('/...') escapes root in pathlib)
       - traversal outside root after resolve()
-    Callers must treat None as "skip this symbol" and surface it via a counter,
-    not silently drop it — the caller logs skipped_unsafe_path counts.
+    Callers treat None as "skip this symbol". Skipped unsafe paths are not
+    counted separately; they fall into the generic read-failure accounting.
     """
     if Path(path).is_absolute():
         return None
@@ -319,10 +319,13 @@ def semantic_contract_diff(
     """Generate LLM-backed contract-diff hypothesis rows for changed symbols.
 
     Returns (rows, status) where status is one of:
-      "active"     — completed normally (zero or more rows)
-      "no_api_key" — auth/API-key error detected
-      "llm_error"  — all LLM calls failed (non-auth)
-      "partial"    — some calls succeeded, some failed
+      "active"                        — completed normally (zero or more rows)
+      "no_api_key"                    — auth/API-key error, zero usable rows
+      "llm_error"                     — all LLM calls failed (non-auth)
+      "partial"                       — some calls succeeded, some failed
+      "partial:auth"                  — partial rows returned but some calls hit auth errors
+      "failed:unreadable_sources"     — all source-body reads failed before any LLM call
+      "failed:all_responses_unparseable" — calls completed but no response parsed to a usable list
 
     Each row is a candidate-class hypothesis only — never stored as a canonical fact.
 
