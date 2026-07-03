@@ -2363,10 +2363,88 @@ class TestParseMissHonesty(unittest.TestCase):
                 self.skipTest("fixture produced <2 differing symbols — need >=2 for mixed test")
 
             self.assertGreater(len(rows), 0, "first-call success must produce >=1 row")
-            # Mixed: some parsed, some missed → must not be failed:all_responses_unparseable
+            # Mixed: some parsed, some missed → base status "active" with exact detail
+            # counts appended (quality note the caller logs).
+            self.assertEqual(
+                status, "active (1 of 2 responses unparseable)",
+                f"mixed parse_miss must carry exact detail counts; got {status!r}",
+            )
+            # Inversion: must not be the all-miss failure status.
             self.assertNotEqual(
                 status, "failed:all_responses_unparseable",
                 "mixed parse_miss must not be 'failed:all_responses_unparseable'",
+            )
+
+    def test_all_miss_with_call_failures_still_unparseable(self) -> None:
+        """parse_miss mixed with call failures, zero parsed → failed:all_responses_unparseable (exact).
+
+        The spec condition is calls_attempted > 0 AND parsed_ok == 0 AND parse_miss > 0 —
+        a concurrent call failure must not demote the status back to silent 'active'.
+        """
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            entities = []
+            for i in range(2):
+                entities.append(Entity(
+                    kind="CodeSymbol",
+                    identity={
+                        "tenant_id": TENANT,
+                        "repo": "repo_missfail",
+                        "module": f"mod.mf{i}",
+                        "qualname": f"missfail_func_{i}",
+                        "symbol_kind": "function",
+                    },
+                    properties={"path": f"f{i}.py", "line": 1, "end_line": 3},
+                ))
+            snap_dir = root / "snap_missfail"
+            JsonlKgStore(snap_dir).write(
+                entities=entities, facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            base_dir = root / "base_missfail"
+            base_dir.mkdir()
+            head_dir = root / "head_missfail"
+            head_dir.mkdir()
+            for i in range(2):
+                (base_dir / f"f{i}.py").write_text(f"def missfail_func_{i}():\n    if x: raise\n    return {i}\n")
+                (head_dir / f"f{i}.py").write_text(f"def missfail_func_{i}():\n    return {i}\n")
+
+            class _MissThenFailClient:
+                def __init__(self) -> None:
+                    self.call_count = 0
+
+                def complete_json(self, prompt: str) -> "LlmResult":
+                    self.call_count += 1
+                    if self.call_count == 1:
+                        return LlmResult.parse_miss()
+                    return LlmResult.call_failure("llm_error")
+
+            client = _MissThenFailClient()
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+
+            if client.call_count < 2:
+                self.skipTest("fixture produced <2 differing symbols — need >=2 for mixed test")
+
+            self.assertEqual(rows, [], "no parsed responses must produce zero rows")
+            self.assertEqual(
+                status, "failed:all_responses_unparseable",
+                f"zero parsed + parse_miss>0 must be all_responses_unparseable even with "
+                f"call failures; got {status!r}",
             )
 
 
@@ -2691,6 +2769,262 @@ class TestInheritanceContextEnrichment(unittest.TestCase):
                 "Referenced base class (for context)", prompt_log[0],
                 "unresolvable base must not produce a base class context section",
             )
+
+
+# ---------------------------------------------------------------------------
+# Field fix wave 2: subscripted base names, instruction-last with enrichment
+# ---------------------------------------------------------------------------
+
+class TestBaseNameExtraction(unittest.TestCase):
+    """_extract_base_names_from_class_line: exact values incl. generic subscripts."""
+
+    def test_subscripted_base_stripped(self) -> None:
+        """class X(Base[T]): → ['Base'] — subscript must not leak into the name."""
+        from source.kg.query.semantic_contract_diff import _extract_base_names_from_class_line
+
+        self.assertEqual(
+            _extract_base_names_from_class_line(
+                "class MetricAlertDetectorHandler(StatefulDetectorHandler[QuerySubscriptionUpdate]):"
+            ),
+            ["StatefulDetectorHandler"],
+        )
+
+    def test_dotted_subscripted_base(self) -> None:
+        """class X(pkg.mod.Base[T], Other): → ['Base', 'Other']."""
+        from source.kg.query.semantic_contract_diff import _extract_base_names_from_class_line
+
+        self.assertEqual(
+            _extract_base_names_from_class_line("class X(pkg.mod.Base[T], Other):"),
+            ["Base", "Other"],
+        )
+
+    def test_comma_inside_subscript_not_split(self) -> None:
+        """class X(Generic[T, U], Base): → ['Generic', 'Base'] — top-level split only."""
+        from source.kg.query.semantic_contract_diff import _extract_base_names_from_class_line
+
+        self.assertEqual(
+            _extract_base_names_from_class_line("class X(Generic[T, U], Base):"),
+            ["Generic", "Base"],
+        )
+
+    def test_keyword_argument_skipped(self) -> None:
+        """class X(Base, metaclass=ABCMeta): → ['Base'] — kwargs are not bases."""
+        from source.kg.query.semantic_contract_diff import _extract_base_names_from_class_line
+
+        self.assertEqual(
+            _extract_base_names_from_class_line("class X(Base, metaclass=ABCMeta):"),
+            ["Base"],
+        )
+
+    def test_inversion_non_class_line(self) -> None:
+        """Non-class line → [] (no false extraction)."""
+        from source.kg.query.semantic_contract_diff import _extract_base_names_from_class_line
+
+        self.assertEqual(_extract_base_names_from_class_line("def f(a, b):"), [])
+
+
+class TestSubscriptedBaseEnrichment(unittest.TestCase):
+    """Field litmus shape: reparented class with a GENERIC-SUBSCRIPTED base resolves.
+
+    class X(OldBase[T]) → class X(NewBase[T]) where NewBase is a KG entity —
+    the subscript must be stripped before qualname matching or enrichment
+    silently never fires on real generic handlers.
+    """
+
+    def test_subscripted_reparenting_enriches_and_instruction_stays_last(self) -> None:
+        from source.kg.query.semantic_contract_diff import (
+            semantic_contract_diff,
+            _PROMPT_FORMAT_INSTRUCTION,
+        )
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            x_entity = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": TENANT,
+                    "repo": "repo_subenrich",
+                    "module": "mod.x",
+                    "qualname": "X",
+                    "symbol_kind": "class",
+                },
+                properties={"path": "x.py", "line": 1, "end_line": 3},
+            )
+            newbase_entity = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": TENANT,
+                    "repo": "repo_subenrich",
+                    "module": "mod.newbase",
+                    "qualname": "NewBase",
+                    "symbol_kind": "class",
+                },
+                properties={"path": "newbase.py", "line": 1, "end_line": 4},
+            )
+            snap_dir = root / "snap_subenrich"
+            JsonlKgStore(snap_dir).write(
+                entities=[x_entity, newbase_entity], facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+
+            base_dir = root / "base_subenrich"
+            base_dir.mkdir()
+            (base_dir / "x.py").write_text("class X(OldBase[int]):\n    def method(self):\n        pass\n")
+            head_dir = root / "head_subenrich"
+            head_dir.mkdir()
+            (head_dir / "x.py").write_text("class X(NewBase[int]):\n    def method(self):\n        pass\n")
+            (head_dir / "newbase.py").write_text(
+                "class NewBase(Generic[T]):\n    def abstract_method(self):\n        raise NotImplementedError\n"
+            )
+
+            x_dicts = [d for d in snap.entities if (d.get("identity") or {}).get("qualname") == "X"]
+
+            prompt_log: list[str] = []
+
+            class _SpyClient:
+                def complete_json(self, prompt: str) -> LlmResult:
+                    prompt_log.append(prompt)
+                    return LlmResult.parse_miss()
+
+            semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=x_dicts,
+                client=_SpyClient(),
+            )
+
+            self.assertEqual(len(prompt_log), 1, "spy must be called exactly once")
+            prompt = prompt_log[0]
+            self.assertIn(
+                "Referenced base class (for context)", prompt,
+                "subscripted base must still resolve and enrich the prompt",
+            )
+            self.assertIn(
+                "abstract_method", prompt,
+                "prompt must contain NewBase's body text (abstract_method)",
+            )
+            # Fix 3 invariant survives enrichment: the format instruction is LAST.
+            self.assertTrue(
+                prompt.endswith(_PROMPT_FORMAT_INSTRUCTION),
+                f"format instruction must end the ENRICHED prompt; tail: {prompt[-200:]!r}",
+            )
+            # Inversion: enrichment section must appear BEFORE the instruction.
+            self.assertLess(
+                prompt.find("Referenced base class (for context)"),
+                prompt.rfind(_PROMPT_FORMAT_INSTRUCTION),
+                "base-class context must precede the final format instruction",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Field fix wave 2: reserved semantic slot in the splice ordering
+# ---------------------------------------------------------------------------
+
+class TestSemanticSpliceReservedSlot(unittest.TestCase):
+    """Semantic rows must survive the top-hypotheses cap and the budget floor (top 3).
+
+    With >=3 deterministic rows present, appending semantic rows after ALL of them
+    erases the entire semantic family at the prefix caps. The splice keeps the top 2
+    deterministic rows, then semantic rows, then the rest — exact-order test.
+    """
+
+    def _run_splice(self, existing_hyps: list) -> list:
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+        from source.kg.query.snapshot import KgSnapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            e = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "slot_repo",
+                    "module": "slot_mod",
+                    "qualname": "slot_func",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "slot.py", "line": 1, "end_line": 4},
+            )
+            snap_dir = root / "snap_slot"
+            JsonlKgStore(snap_dir).write(
+                entities=[e], facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": "default"},
+            )
+            head_kg = KgSnapshot(snap_dir)
+            base_dir = root / "base_slot"
+            base_dir.mkdir()
+            (base_dir / "slot.py").write_text("def slot_func():\n    if x: raise\n    return 1\n")
+            head_dir = root / "head_slot"
+            head_dir.mkdir()
+            (head_dir / "slot.py").write_text("def slot_func():\n    return 1\n")
+
+            class _OneClaimClient:
+                def complete_json(self, prompt: str) -> LlmResult:
+                    return LlmResult.parsed([{
+                        "claim": "Guard removed.",
+                        "cause_line": 2,
+                        "consequence": "Callers may pass None.",
+                        "negative_check": "No check.",
+                        "category": "guard_removal",
+                    }])
+
+            merged, _status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(snap_dir),
+                head_kg=head_kg,
+                base_checkout=str(base_dir),
+                head_checkout=str(head_dir),
+                changed_symbols=[{"qualname": "slot_func"}],
+                review_hypotheses=existing_hyps,
+                _client=_OneClaimClient(),
+            )
+            return merged
+
+    def test_semantic_row_at_index_2_with_many_det_rows(self) -> None:
+        """4 det + 1 generic existing → exact order: det0, det1, semantic, det2, det3, generic."""
+        existing = [
+            {"hypothesis_id": f"det-{i}", "risk_type": "guard_call_removed_drift",
+             "derivation": "deterministic_static"}
+            for i in range(4)
+        ] + [
+            {"hypothesis_id": "gen-0", "risk_type": "direct_call_contract_drift"},
+        ]
+        merged = self._run_splice(existing)
+        got = [
+            (h.get("hypothesis_id") if h.get("risk_type") != "contract_semantic_diff" else "SEM")
+            for h in merged
+        ]
+        self.assertEqual(
+            got, ["det-0", "det-1", "SEM", "det-2", "det-3", "gen-0"],
+            f"reserved-slot order violated; got {got}",
+        )
+        # Inversion: the semantic row must sit inside the budget floor window (top 3),
+        # or compaction to top-3 silently erases the semantic family.
+        sem_idx = got.index("SEM")
+        self.assertLess(sem_idx, 3, f"semantic row must survive top-3 floor; index {sem_idx}")
+
+    def test_semantic_row_before_generic_rows_when_no_det(self) -> None:
+        """Only generic rows (derivation None) → semantic row is first."""
+        existing = [
+            {"hypothesis_id": "gen-0", "risk_type": "direct_call_contract_drift"},
+            {"hypothesis_id": "gen-1", "risk_type": "application_surface_contract_drift"},
+        ]
+        merged = self._run_splice(existing)
+        self.assertEqual(
+            merged[0].get("risk_type"), "contract_semantic_diff",
+            f"semantic row must precede generic rows; got {[h.get('risk_type') for h in merged]}",
+        )
+        self.assertEqual(
+            [h.get("hypothesis_id") for h in merged[1:]], ["gen-0", "gen-1"],
+            "generic row order must be preserved after the semantic row",
+        )
 
 
 if __name__ == "__main__":

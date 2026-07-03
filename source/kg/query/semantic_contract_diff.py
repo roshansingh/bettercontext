@@ -35,14 +35,20 @@ _MAX_SYMBOLS = 12
 _MAX_HYPS_PER_SYMBOL = 2
 _BASE_BODY_CHAR_LIMIT = 2500  # per resolved base class body
 
-_PROMPT_TEMPLATE = (
+_PROMPT_FORMAT_INSTRUCTION = "Respond with ONLY a JSON array, no markdown fences, no prose."
+
+_PROMPT_BODY_TEMPLATE = (
     "Compare the before/after implementation of {qualname}.\n\n"
     "BEFORE:\n{before}\n\nAFTER:\n{after}\n\n"
     "State up to 2 behavioral contract changes as falsifiable claims. "
     'JSON array: [{{"claim": "...", "cause_line": <head line no. int>, '
     '"consequence": "one sentence", "negative_check": "...", "category": "..."}}]\n\n'
-    "Respond with ONLY a JSON array, no markdown fences, no prose."
 )
+
+# Full template (body + format instruction). The instruction must stay LAST in the
+# composed prompt even when a base-class context section is appended — composition
+# in semantic_contract_diff inserts base_context between body and instruction.
+_PROMPT_TEMPLATE = _PROMPT_BODY_TEMPLATE + _PROMPT_FORMAT_INSTRUCTION
 
 _REQUIRED_KEYS = {"claim", "cause_line", "consequence", "negative_check", "category"}
 
@@ -136,9 +142,37 @@ def _extract_base_names_from_class_line(class_line: str) -> list[str]:
     bases_str = line[paren_open + 1 : paren_close].strip()
     if not bases_str:
         return []
+    # Split on top-level commas only (bracket-depth aware, str ops) so generic
+    # subscripts like Generic[T, U] don't split into garbage parts.
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in bases_str:
+        if ch in "[(":
+            depth += 1
+            current.append(ch)
+        elif ch in "])":
+            depth -= 1
+            current.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
     result: list[str] = []
-    for part in bases_str.split(","):
+    for part in parts:
         part = part.strip()
+        if not part:
+            continue
+        # Skip keyword arguments (e.g. metaclass=ABCMeta) — not base classes.
+        if "=" in part:
+            continue
+        # Strip a generic subscript (StatefulDetectorHandler[T] → StatefulDetectorHandler)
+        # so the name matches entity qualnames.
+        bracket = part.find("[")
+        if bracket != -1:
+            part = part[:bracket].strip()
         if not part:
             continue
         # Keep only the last segment (after the last dot) to match entity qualnames
@@ -336,6 +370,7 @@ def semantic_contract_diff(
     calls_attempted = 0
     calls_failed = 0
     parse_miss_count = 0
+    parsed_ok_count = 0  # responses that parsed to a usable list (even if zero valid items)
     auth_error_seen = False
 
     for head_entity in ranked_differing:
@@ -359,11 +394,16 @@ def semantic_contract_diff(
             head_root=head_root,
             head_entity=head_entity,
         )
-        prompt = _PROMPT_TEMPLATE.format(
+        # Compose: body, then optional base-class context, then the format
+        # instruction LAST (Fix 3 requires the instruction to end the prompt).
+        prompt = _PROMPT_BODY_TEMPLATE.format(
             qualname=qualname,
             before=base_body,
             after=head_body,
-        ) + base_context
+        )
+        if base_context:
+            prompt += base_context.lstrip("\n") + "\n\n"
+        prompt += _PROMPT_FORMAT_INSTRUCTION
         calls_attempted += 1
         try:
             result = client.complete_json(prompt)
@@ -391,7 +431,11 @@ def semantic_contract_diff(
 
         parsed = result.value
         if not isinstance(parsed, list):
+            # Parsed to a non-list (unexpected shape) — unusable as claims; count as
+            # a parse miss so the honesty statuses below see it.
+            parse_miss_count += 1
             continue
+        parsed_ok_count += 1
 
         sym_span: JsonObject = {}
         if head_path:
@@ -528,27 +572,34 @@ def semantic_contract_diff(
     # reserved for zero usable rows; detail "partial:auth" is surfaced when the
     # partial was caused by an auth-class failure.
     #
-    # Parse-miss honesty: when all calls completed but none produced parseable JSON,
-    # surface "failed:all_responses_unparseable" rather than "active" (which would
-    # imply the mechanism ran cleanly).  Mixed (some rows produced, some parse-missed)
-    # stays "active" but the caller may surface the detail counts via quality-note.
-    parsed_ok = len(rows)  # rows accumulated only from successfully-parsed responses
+    # Parse-miss honesty: when calls were attempted and no response parsed while at
+    # least one parse-missed, surface "failed:all_responses_unparseable" rather than
+    # "active" (which would imply the mechanism ran cleanly). This holds even when
+    # some calls also failed outright — zero parsed responses plus parse-misses is
+    # never a clean run. Mixed (some parsed, some missed) stays "active"/"partial"
+    # with the detail counts appended so the caller logs them.
     all_parse_missed = (
         calls_attempted > 0
-        and parsed_ok == 0
-        and calls_failed == 0
-        and parse_miss_count == calls_attempted
+        and parsed_ok_count == 0
+        and parse_miss_count > 0
     )
 
     if rows and calls_failed > 0:
         status = "partial:auth" if auth_error_seen else "partial"
+    elif all_parse_missed:
+        status = "failed:all_responses_unparseable"
     elif auth_error_seen:
         status = "no_api_key"
     elif calls_attempted > 0 and calls_failed == calls_attempted:
         status = "llm_error"
-    elif all_parse_missed:
-        status = "failed:all_responses_unparseable"
     else:
         status = "active"
+
+    # Mixed-case quality note: some responses parsed, some parse-missed — append the
+    # counts to the status the caller logs. Only "active"/"partial" carry the note so
+    # the splice's exact-match handling of "partial:auth"/"no_api_key"/"llm_error"
+    # stays intact.
+    if parse_miss_count > 0 and parsed_ok_count > 0 and status in ("active", "partial"):
+        status = f"{status} ({parse_miss_count} of {calls_attempted} responses unparseable)"
 
     return rows, status

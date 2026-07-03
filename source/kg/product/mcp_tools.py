@@ -3611,17 +3611,27 @@ def _splice_semantic_diff_hypotheses(
         return review_hypotheses, inner_status
 
     # Problem A fix: trust-tier ordering — deterministic_static rows before inferred_llm rows.
-    # Semantic rows are inferred_llm; insert them AFTER existing deterministic-static rows and
-    # BEFORE any existing inferred_llm rows, so the ADR-0006 tier order is preserved.
-    det_rows = [h for h in review_hypotheses if h.get("derivation") != "inferred_llm"]
-    llm_rows = [h for h in review_hypotheses if h.get("derivation") == "inferred_llm"]
+    # Semantic rows are inferred_llm high-specificity evidence rows: they rank after
+    # spliced deterministic-static rows (higher tier, same specificity) and BEFORE
+    # generic family rows (derivation None, low-specificity boilerplate).
+    #
+    # Reserved-slot guarantee: the top-hypotheses cap (5) and the review-budget
+    # compaction floor (top 1-3) both keep list prefixes, so a semantic row placed
+    # after every deterministic row is silently erased whenever three or more
+    # deterministic rows exist — truncation would imply absence for the entire
+    # semantic family. Mirror the deterministic splice's family round-robin
+    # (every family gets a slot before any family gets seconds): keep the top 2
+    # deterministic rows first, then the semantic rows, then the remaining rows.
+    # The derivation stamps keep the trust tiers visible in the packet.
+    det_rows = [h for h in review_hypotheses if h.get("derivation") == "deterministic_static"]
+    rest_rows = [h for h in review_hypotheses if h.get("derivation") != "deterministic_static"]
 
     # Record omitted count (mirrors omitted_contract_diff_family_count pattern in contract splice).
     omitted_count = max(0, len(raw_rows) - _SEMANTIC_DIFF_SPLICE_CAP)
     if omitted_count > 0 and spliced:
         spliced[-1] = dict(spliced[-1], omitted_semantic_diff_count=omitted_count)
 
-    return det_rows + spliced + llm_rows, inner_status
+    return det_rows[:2] + spliced + det_rows[2:] + rest_rows, inner_status
 
 
 def _review_context_lead_packet(
