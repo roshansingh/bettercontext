@@ -3500,6 +3500,32 @@ function collectAsyncLifecycleSignals(sourceFile, symbols) {
   return applySignalCap(rawSignals);
 }
 
+function collectCallResultIdentityComparisonSignals(sourceFile, symbols) {
+  const rawSignals = [];
+
+  function visit(node) {
+    if (
+      ts.isBinaryExpression(node) &&
+      (node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken ||
+        node.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken) &&
+      ts.isCallExpression(node.left) &&
+      ts.isCallExpression(node.right)
+    ) {
+      const qualname = enclosingSymbolName(node, symbols);
+      if (qualname != null && qualname !== "<module>") {
+        const callee_left = callName(node.left.expression, sourceFile) ?? "";
+        const callee_right = callName(node.right.expression, sourceFile) ?? "";
+        const line = lineOf(sourceFile, node.getStart(sourceFile));
+        rawSignals.push({ signal: "call_result_identity_comparison", qualname, callee_left, callee_right, line });
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+
+  return applySignalCap(rawSignals);
+}
+
 const output = Object.create(null);
 for (const relativePath of files) {
   const absolutePath = path.join(repoRoot, relativePath);
@@ -3531,6 +3557,7 @@ for (const relativePath of files) {
       }))
     ),
     async_lifecycle_signals: collectAsyncLifecycleSignals(sourceFile, symbols),
+    call_result_identity_comparison_signals: collectCallResultIdentityComparisonSignals(sourceFile, symbols),
   };
 }
 
