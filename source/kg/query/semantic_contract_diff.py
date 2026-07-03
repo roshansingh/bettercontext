@@ -60,10 +60,33 @@ _DROP_CATEGORY = 200
 _AUTH_SUBSTRINGS = ("auth", "unauthorized", "401", "api_key", "apikey")
 
 
-def _read_body(root: Path, path: str, line_start: int | None, line_end: int | None) -> str:
-    """Read symbol body from checkout root. Returns empty string on any error."""
+def _safe_resolve(root: Path, path: str) -> Path | None:
+    """Resolve (root / path) and verify it stays under root.
+
+    Returns the resolved Path on success, None on:
+      - absolute path (security: Path('/...') escapes root in pathlib)
+      - traversal outside root after resolve()
+    Callers must treat None as "skip this symbol" and surface it via a counter,
+    not silently drop it — the caller logs skipped_unsafe_path counts.
+    """
+    if Path(path).is_absolute():
+        return None
+    resolved_root = root.resolve()
+    candidate = (root / path).resolve()
     try:
-        full = (root / path).read_text(encoding="utf-8", errors="replace")
+        candidate.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _read_body(root: Path, path: str, line_start: int | None, line_end: int | None) -> str:
+    """Read symbol body from checkout root. Returns empty string on any error or unsafe path."""
+    safe = _safe_resolve(root, path)
+    if safe is None:
+        return ""
+    try:
+        full = safe.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
     if line_start is None:
@@ -373,13 +396,16 @@ def semantic_contract_diff(
             rows.append(row)
             hyps_from_symbol += 1
 
-    # Compute status
-    if auth_error_seen:
+    # Compute status — partial (rows non-empty + any failure) takes precedence over
+    # the failure kind so successful rows are never discarded.  "no_api_key" is
+    # reserved for zero usable rows; detail "partial:auth" is surfaced when the
+    # partial was caused by an auth-class failure.
+    if rows and calls_failed > 0:
+        status = "partial:auth" if auth_error_seen else "partial"
+    elif auth_error_seen:
         status = "no_api_key"
     elif calls_attempted > 0 and calls_failed == calls_attempted:
         status = "llm_error"
-    elif calls_attempted > 0 and calls_failed > 0 and rows:
-        status = "partial"
     else:
         status = "active"
 

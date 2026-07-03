@@ -1722,5 +1722,151 @@ class TestSpliceDuplicateQualname(unittest.TestCase):
                           f"unexpected status {status!r}")
 
 
+# ---------------------------------------------------------------------------
+# Fix wave: P1 — path escape prevention (_safe_resolve)
+# ---------------------------------------------------------------------------
+
+class TestSafeResolve(unittest.TestCase):
+    """_safe_resolve rejects absolute paths, ../traversal, and symlinks escaping root."""
+
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.root = Path(self._td.name)
+
+    def tearDown(self) -> None:
+        self._td.cleanup()
+
+    def test_absolute_path_rejected(self) -> None:
+        """Absolute path (/tmp/evil) is rejected — returns None, no read."""
+        from source.kg.query.semantic_contract_diff import _safe_resolve
+
+        # Create a real file outside the root so we can distinguish "exists but rejected"
+        # from "does not exist".
+        outside = self.root.parent / "evil_absolute.txt"
+        outside.write_text("secret", encoding="utf-8")
+        try:
+            result = _safe_resolve(self.root, str(outside))
+            self.assertIsNone(result, f"absolute path must be rejected; got {result!r}")
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_dotdot_traversal_rejected(self) -> None:
+        """../escape relative path is rejected — returns None, no read."""
+        from source.kg.query.semantic_contract_diff import _safe_resolve
+
+        # ../escape would resolve to the parent of root
+        result = _safe_resolve(self.root, "../escape.txt")
+        self.assertIsNone(result, f"../traversal must be rejected; got {result!r}")
+
+    def test_symlink_outside_root_rejected(self) -> None:
+        """Symlink inside checkout pointing outside root is rejected by resolve()."""
+        from source.kg.query.semantic_contract_diff import _safe_resolve
+
+        outside = self.root.parent / "symlink_target.txt"
+        outside.write_text("secret", encoding="utf-8")
+        link = self.root / "evil_link.txt"
+        try:
+            link.symlink_to(outside)
+            result = _safe_resolve(self.root, "evil_link.txt")
+            self.assertIsNone(result, f"symlink escaping root must be rejected; got {result!r}")
+        finally:
+            link.unlink(missing_ok=True)
+            outside.unlink(missing_ok=True)
+
+    def test_safe_path_inside_root_accepted(self) -> None:
+        """Normal relative path inside root is accepted — returns a Path."""
+        from source.kg.query.semantic_contract_diff import _safe_resolve
+
+        (self.root / "safe.py").write_text("ok", encoding="utf-8")
+        result = _safe_resolve(self.root, "safe.py")
+        self.assertIsNotNone(result, "safe relative path must be accepted")
+
+    def test_read_body_does_not_read_absolute_path(self) -> None:
+        """_read_body with an absolute path returns '' and the LLM is never called.
+
+        Regression: a KG-supplied absolute path must not reach read_text.
+        """
+        from source.kg.query.semantic_contract_diff import _read_body
+
+        # Use a tempfile inside a DIFFERENT tmpdir (simulates /etc/hosts-style path)
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            f.write(b"super secret contents")
+            secret_path = f.name
+        try:
+            body = _read_body(self.root, secret_path, None, None)
+            self.assertEqual(body, "", f"_read_body must return '' for absolute path; got {body[:40]!r}")
+        finally:
+            Path(secret_path).unlink(missing_ok=True)
+
+    def test_read_body_does_not_read_dotdot_path(self) -> None:
+        """_read_body with a ../escape path returns ''."""
+        from source.kg.query.semantic_contract_diff import _read_body
+
+        body = _read_body(self.root, "../some_secret.txt", None, None)
+        self.assertEqual(body, "", f"_read_body must return '' for ../traversal; got {body[:40]!r}")
+
+
+# ---------------------------------------------------------------------------
+# Fix wave: P2 — mixed auth failure does not discard successful rows
+# ---------------------------------------------------------------------------
+
+class _MixedAuthClient:
+    """First call returns valid JSON; second call returns LlmResult.call_failure('no_api_key')."""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def complete_json(self, prompt: str) -> "LlmResult":
+        self.call_count += 1
+        if self.call_count == 1:
+            return LlmResult.parsed(_FAKE_RESPONSE)
+        return LlmResult.call_failure("no_api_key")
+
+
+class TestMixedAuthPartialPreservesRows(unittest.TestCase):
+    """P2 regression: first call valid JSON, second call_failure('no_api_key') → row IS spliced, status 'partial'."""
+
+    def test_valid_row_preserved_on_mixed_auth_failure(self) -> None:
+        """One success + later auth failure → the valid row is spliced; status is 'partial'."""
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_symbol_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            mixed_client = _MixedAuthClient()
+            changed_symbols = [{"qualname": "func_a"}, {"qualname": "func_b"}]
+
+            merged_rows, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(out_base),
+                head_kg=head_kg,
+                base_checkout=str(base_checkout),
+                head_checkout=str(head_checkout),
+                changed_symbols=changed_symbols,
+                review_hypotheses=[],
+                _client=mixed_client,
+            )
+
+            if mixed_client.call_count < 2:
+                self.skipTest(
+                    f"fixture produced only {mixed_client.call_count} differing symbols — need >=2"
+                )
+
+            # Hard assert: the successful row must be present in the merged output
+            semantic_rows = [h for h in merged_rows if h.get("risk_type") == "contract_semantic_diff"]
+            self.assertGreater(
+                len(semantic_rows), 0,
+                f"valid row from first call must survive mixed auth failure; "
+                f"got 0 semantic rows; status={status!r}",
+            )
+
+            # Status must be 'partial' (not 'no_api_key')
+            self.assertEqual(
+                status, "partial",
+                f"mixed auth+success must yield 'partial'; got {status!r}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

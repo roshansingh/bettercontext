@@ -3566,13 +3566,21 @@ def _splice_semantic_diff_hypotheses(
     except Exception as exc:  # noqa: BLE001
         return review_hypotheses, f"failed:{exc}"
 
-    # Map inner_status to outer status
-    if inner_status == "no_api_key":
+    # Map inner_status to outer status.
+    # "no_api_key" only drops rows when there are none to preserve; when rows
+    # exist the call was partially successful and we use the rows.
+    # "partial:auth" is emitted by semantic_contract_diff when rows were produced
+    # despite an auth failure — treat it as "partial" at this layer.
+    if inner_status == "no_api_key" and not raw_rows:
         return review_hypotheses, "no_api_key"
     if inner_status == "llm_error":
         return review_hypotheses, "llm_error"
 
-    # For "partial" or "active": splice available rows
+    # Normalize partial:auth → partial for the outer status reported to callers.
+    if inner_status == "partial:auth":
+        inner_status = "partial"
+
+    # For "partial", "no_api_key" (with rows), or "active": splice available rows
     if not raw_rows:
         return review_hypotheses, inner_status
 
