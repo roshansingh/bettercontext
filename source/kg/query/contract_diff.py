@@ -19,7 +19,7 @@ Boundary note:
 
 from typing import Any
 
-from source.kg.core.models import JsonObject, canonical_json
+from source.kg.core.models import JsonObject
 from source.kg.query.graph_diff import GraphDelta
 from source.kg.query.snapshot import KgSnapshot
 
@@ -341,7 +341,6 @@ def contract_diff_packet(
     uninstrumented_scopes passthrough: included verbatim (tripwire #3 — it's a
     list of scope dicts, not a count).
     """
-    from source.kg.core.models import canonical_json as _canonical_json
     from source.kg.query.graph_diff import (
         diff_snapshots,
         removed_test_references,

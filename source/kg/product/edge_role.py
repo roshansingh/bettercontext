@@ -31,8 +31,6 @@ utility edges before semantic ones.
 """
 from __future__ import annotations
 
-from collections import defaultdict
-
 from source.kg.core.models import JsonObject
 
 # Test-file classification: mirrors source/kg/product/review_hypotheses.py:520.

@@ -8,8 +8,9 @@ Two signal families:
   unawaited_async_call        — call to a same-file async fn whose result is
                                 not awaited, returned, chained, or assigned.
 
-Per-symbol cap of 3 signals (lowest line first) is enforced in the .mjs
-collector; the Python adapter trusts that invariant.
+A file-level cap of 20 signals (lowest line first) is enforced in the .mjs
+collector; the per-subject bound of 3 is applied downstream at review_context
+retrieval, ordered by changed-range relevance.
 
 Coverage rows (partially_instrumented) are emitted for any file whose
 async_lifecycle_signals key is absent or whose parse_diagnostics are non-empty,
