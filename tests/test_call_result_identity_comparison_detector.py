@@ -9,9 +9,18 @@ Tests:
 """
 from __future__ import annotations
 
+import json
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 
+from source.kg.build.pipeline import build_kg
+from source.kg.core.store import read_jsonl
 from source.kg.product.review_hypotheses import review_hypotheses_for_context
+
+
+NODE_AVAILABLE = shutil.which("node") is not None
 
 
 def _base_context(**overrides):
@@ -85,6 +94,131 @@ def _risk_signal_cri(
             }
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Extractor-level fixtures (ts_parser.mjs collector, end-to-end via build_kg)
+# ---------------------------------------------------------------------------
+
+# Positive: two call-expression results compared with === inside a function.
+# Callees are identifier-rooted property chains so callName resolves them.
+_TS_CALL_VS_CALL = """\
+import dayjs from "dayjs";
+
+export function overlaps(a: object, b: object): boolean {
+  return dayjs.utc(a) === dayjs.utc(b);
+}
+"""
+
+# Positive: chained-call bases (dayjs(a).add(...)) still fire; callName cannot
+# resolve a CallExpression base, so callee strings degrade to "" by design.
+_TS_CHAINED_CALL_VS_CALL = """\
+import dayjs from "dayjs";
+
+export function sameStart(a: string, b: string): boolean {
+  return dayjs(a).startOf("day") === dayjs(b).startOf("day");
+}
+"""
+
+# Positive: !== between call expressions also fires
+_TS_CALL_VS_CALL_NOT_EQUAL = """\
+export function drifted(a: string, b: string): boolean {
+  return normalize(a) !== normalize(b);
+}
+
+function normalize(v: string): object {
+  return { v };
+}
+"""
+
+# Negative: literal on one side — not a call-vs-call comparison
+_TS_CALL_VS_LITERAL = """\
+export function isFive(a: string): boolean {
+  return parseCount(a) === 5;
+}
+
+function parseCount(v: string): number {
+  return v.length;
+}
+"""
+
+# Negative: identifier-vs-identifier comparison — no call expressions
+_TS_IDENT_VS_IDENT = """\
+export function same(a: string, b: string): boolean {
+  return a === b;
+}
+"""
+
+
+def _build_support_facts(files: dict[str, str]) -> tuple[list[dict], list[dict]]:
+    """Write files to a tempdir, run build_kg, return (support_facts, evidence)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        pkg = root / "pkg"
+        pkg.mkdir()
+        (pkg / "package.json").write_text(
+            json.dumps({"name": "test-pkg", "version": "1.0.0"}), encoding="utf-8"
+        )
+        for name, text in files.items():
+            (pkg / name).write_text(text, encoding="utf-8")
+        out = root / "kg"
+        build_kg(pkg, out)
+        sf_path = out / "support_facts.jsonl"
+        support_facts = read_jsonl(sf_path) if sf_path.exists() else []
+        evidence = read_jsonl(out / "evidence.jsonl")
+    return support_facts, evidence
+
+
+def _identity_signals(support_facts: list[dict]) -> list[dict]:
+    return [
+        f
+        for f in support_facts
+        if f.get("predicate") == "code_risk_signal"
+        and (f.get("qualifier") or {}).get("risk_family") == "call_result_identity_comparison"
+    ]
+
+
+@unittest.skipIf(not NODE_AVAILABLE, "node not available")
+class CallResultIdentityComparisonExtractorTest(unittest.TestCase):
+    """Extractor: ts_parser.mjs collector + Python adapter, end-to-end."""
+
+    def test_call_vs_call_strict_equals_emits_signal(self):
+        sf, ev = _build_support_facts({"overlap.ts": _TS_CALL_VS_CALL})
+        signals = _identity_signals(sf)
+        self.assertEqual(len(signals), 1)
+        q = signals[0]["qualifier"]
+        self.assertEqual(q["qualname"], "overlaps")
+        self.assertEqual(q["callee_left"], "dayjs.utc")
+        self.assertEqual(q["callee_right"], "dayjs.utc")
+        # bytes_ref must be complete on the fact evidence
+        fact_ev = [e for e in ev if e.get("target_id") == signals[0]["fact_id"]]
+        self.assertTrue(fact_ev)
+        br = fact_ev[0].get("bytes_ref") or {}
+        for key in ("repo", "commit_sha", "path", "line_start", "line_end"):
+            self.assertIn(key, br)
+
+    def test_chained_call_bases_emit_signal_with_empty_callees(self):
+        sf, _ = _build_support_facts({"chain.ts": _TS_CHAINED_CALL_VS_CALL})
+        signals = _identity_signals(sf)
+        self.assertEqual(len(signals), 1)
+        q = signals[0]["qualifier"]
+        self.assertEqual(q["qualname"], "sameStart")
+        self.assertEqual(q["callee_left"], "")
+        self.assertEqual(q["callee_right"], "")
+
+    def test_call_vs_call_strict_not_equals_emits_signal(self):
+        sf, _ = _build_support_facts({"drift.ts": _TS_CALL_VS_CALL_NOT_EQUAL})
+        signals = _identity_signals(sf)
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["qualifier"]["qualname"], "drifted")
+
+    def test_call_vs_literal_emits_no_signal(self):
+        sf, _ = _build_support_facts({"five.ts": _TS_CALL_VS_LITERAL})
+        self.assertEqual(_identity_signals(sf), [])
+
+    def test_ident_vs_ident_emits_no_signal(self):
+        sf, _ = _build_support_facts({"same.ts": _TS_IDENT_VS_IDENT})
+        self.assertEqual(_identity_signals(sf), [])
 
 
 class TestCallResultIdentityComparisonSemantics(unittest.TestCase):
