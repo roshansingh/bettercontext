@@ -3065,7 +3065,9 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
             review_hypotheses=review_hypotheses,
         )
     semantic_diff_status: str | None = None
+    semantic_diff_stats: "JsonObject | None" = None
     if base_snapshot_dir and base_checkout and head_checkout:
+        _splice_stats: dict = {}
         review_hypotheses, semantic_diff_status = _splice_semantic_diff_hypotheses(
             base_snapshot_dir=base_snapshot_dir,
             head_kg=kg,
@@ -3073,7 +3075,10 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
             head_checkout=head_checkout,
             changed_symbols=changed_symbols,
             review_hypotheses=review_hypotheses,
+            _stats_out=_splice_stats,
         )
+        if _splice_stats:
+            semantic_diff_stats = _splice_stats
     elif base_snapshot_dir:
         semantic_diff_status = "missing_checkouts"
     elif base_checkout or head_checkout:
@@ -3096,6 +3101,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         contract_diff_note=contract_diff_note,
         base_diff_status=_base_diff_status,
         semantic_diff_status=semantic_diff_status,
+        semantic_diff_stats=semantic_diff_stats,
         abstract_contract_status=abstract_contract_status,
         changed_ranges=changed_ranges,
         changed_symbols=changed_symbols_in_scope,
@@ -3190,6 +3196,7 @@ def _build_review_quality_status(
     contract_diff_note: str | None = None,
     base_diff_status: str | None = None,
     semantic_diff_status: str | None = None,
+    semantic_diff_stats: "JsonObject | None" = None,
     abstract_contract_status: str | None = None,
     changed_ranges: list[JsonObject] | None = None,
     changed_symbols: list[JsonObject] | None = None,
@@ -3284,6 +3291,8 @@ def _build_review_quality_status(
             status["suggested_setup"] = "build_base_snapshot_then_retry"
     if semantic_diff_status is not None:
         status["semantic_diff_status"] = semantic_diff_status
+    if semantic_diff_stats is not None:
+        status["semantic_diff_stats"] = semantic_diff_stats
     if abstract_contract_status is not None:
         status["abstract_contract_status"] = abstract_contract_status
     if contract_diff_note is not None:
@@ -3638,6 +3647,7 @@ def _splice_semantic_diff_hypotheses(
     changed_symbols: list[JsonObject],
     review_hypotheses: list[JsonObject],
     _client: "SemanticDiffLlmClient | None" = None,  # injection seam for tests
+    _stats_out: "dict | None" = None,  # filled with SemanticDiffStats fields when provided
 ) -> tuple[list[JsonObject], str]:
     """Run semantic_contract_diff and splice inferred_llm hypothesis rows.
 
@@ -3689,6 +3699,7 @@ def _splice_semantic_diff_hypotheses(
             head_root=head_checkout_path,
             changed_symbols=head_entities,
             client=client,
+            _stats_out=_stats_out,
         )
     except ImportError:
         return review_hypotheses, "unavailable"

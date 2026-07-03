@@ -27,13 +27,21 @@ class LlmResult:
       "parse_miss"       — call succeeded but no parseable JSON in response
       "no_api_key"       — auth/API-key failure from the provider
       "llm_error"        — provider error (timeout, 5xx, non-auth)
+
+    Usage fields (all None when unavailable):
+      prompt_tokens     — int or None
+      completion_tokens — int or None
+      cost_usd          — float or None (never 0.0 as a default — that would silently undercount)
     """
 
-    __slots__ = ("kind", "_value")
+    __slots__ = ("kind", "_value", "prompt_tokens", "completion_tokens", "cost_usd")
 
     def __init__(self, kind: str, value: Any = _MISSING) -> None:
         self.kind = kind
         self._value = value
+        self.prompt_tokens: int | None = None
+        self.completion_tokens: int | None = None
+        self.cost_usd: float | None = None
 
     @classmethod
     def parsed(cls, value: Any) -> "LlmResult":
@@ -99,8 +107,23 @@ class SemanticDiffLlmClient:
 
         value = _extract_json(raw)
         if value is None:
-            return LlmResult.parse_miss()
-        return LlmResult.parsed(value)
+            result = LlmResult.parse_miss()
+        else:
+            result = LlmResult.parsed(value)
+
+        # Capture usage from the response (None when provider omits usage).
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            pt = getattr(usage, "prompt_tokens", None)
+            ct = getattr(usage, "completion_tokens", None)
+            result.prompt_tokens = int(pt) if pt is not None else None
+            result.completion_tokens = int(ct) if ct is not None else None
+        try:
+            result.cost_usd = litellm.completion_cost(completion_response=response)
+        except Exception:  # noqa: BLE001
+            result.cost_usd = None
+
+        return result
 
 
 def _strip_markdown_fence(text: str) -> str:

@@ -307,6 +307,21 @@ def _cluster_rank(
     return combined[:max_symbols]
 
 
+def _empty_diff_stats(client: "SemanticDiffLlmClient") -> dict:
+    """Return a zero-call stats dict (no LLM calls made)."""
+    return {
+        "model": getattr(client, "model", None),
+        "calls_attempted": 0,
+        "calls_succeeded": 0,
+        "calls_failed": 0,
+        "parse_misses": 0,
+        "rows_generated": 0,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "cost_usd": None,
+    }
+
+
 def semantic_contract_diff(
     base_snapshot: "KgSnapshot",
     head_snapshot: "KgSnapshot",
@@ -315,6 +330,7 @@ def semantic_contract_diff(
     changed_symbols: list[JsonObject],
     client: "SemanticDiffLlmClient",
     max_symbols: int = _MAX_SYMBOLS,
+    _stats_out: "dict | None" = None,
 ) -> tuple[list[JsonObject], str]:
     """Generate LLM-backed contract-diff hypothesis rows for changed symbols.
 
@@ -339,6 +355,8 @@ def semantic_contract_diff(
         max_symbols: Cost cap — at most this many symbols sent to the LLM.
     """
     if not changed_symbols:
+        if _stats_out is not None:
+            _stats_out.update(_empty_diff_stats(client))
         return [], "active"
 
     # Build URN → entity for both snapshots
@@ -387,7 +405,11 @@ def semantic_contract_diff(
     # "active" — "active" would falsely imply semantic diff was performed.
     if not differing:
         if calls_attempted_prefilter > 0 and read_failures == calls_attempted_prefilter:
+            if _stats_out is not None:
+                _stats_out.update(_empty_diff_stats(client))
             return [], "failed:unreadable_sources"
+        if _stats_out is not None:
+            _stats_out.update(_empty_diff_stats(client))
         return [], "active"
 
     # Apply cap AFTER prefilter — only differing symbols count against the slot budget
@@ -402,6 +424,9 @@ def semantic_contract_diff(
     parse_miss_count = 0
     parsed_ok_count = 0  # responses that parsed to a usable list (even if zero valid items)
     auth_error_seen = False
+    total_prompt_tokens: int | None = None
+    total_completion_tokens: int | None = None
+    total_cost_usd: float | None = None
 
     for head_entity in ranked_differing:
         urn = head_entity.get("urn", "")
@@ -445,6 +470,17 @@ def semantic_contract_diff(
                 auth_error_seen = True
             calls_failed += 1
             continue
+
+        # Accumulate per-call usage (None stays None until at least one call reports data).
+        pt = getattr(result, "prompt_tokens", None)
+        ct = getattr(result, "completion_tokens", None)
+        cu = getattr(result, "cost_usd", None)
+        if pt is not None:
+            total_prompt_tokens = (total_prompt_tokens or 0) + pt
+        if ct is not None:
+            total_completion_tokens = (total_completion_tokens or 0) + ct
+        if cu is not None:
+            total_cost_usd = (total_cost_usd or 0.0) + cu
 
         # Map typed result to status tracking
         if result.kind == "no_api_key":
@@ -631,5 +667,18 @@ def semantic_contract_diff(
     # stays intact.
     if parse_miss_count > 0 and parsed_ok_count > 0 and status in ("active", "partial"):
         status = f"{status} ({parse_miss_count} of {calls_attempted} responses unparseable)"
+
+    if _stats_out is not None:
+        _stats_out.update({
+            "model": getattr(client, "model", None),
+            "calls_attempted": calls_attempted,
+            "calls_succeeded": parsed_ok_count,
+            "calls_failed": calls_failed,
+            "parse_misses": parse_miss_count,
+            "rows_generated": len(rows),
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "cost_usd": total_cost_usd,
+        })
 
     return rows, status

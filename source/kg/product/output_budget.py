@@ -4321,7 +4321,13 @@ def _sync_review_quality_status_from_packet(
     synced["reason"] = f"{base_reason} {contract_note}" if contract_note else base_reason
     # Preserve S1 measurement-validity fields through the sync rewrite.
     # review_readiness is recomputed from FINAL max_spec (Minor 13 fix) — not blindly preserved.
-    for _s1_key in ("base_diff_status", "suggested_setup", "suggested_followups"):
+    for _s1_key in (
+        "base_diff_status",
+        "suggested_setup",
+        "suggested_followups",
+        "semantic_diff_status",
+        "semantic_diff_stats",
+    ):
         if _s1_key in status:
             synced[_s1_key] = status[_s1_key]
     # Minor 13: recompute review_readiness from the final (post-budget) max_spec and base_diff_status.

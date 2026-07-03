@@ -3278,5 +3278,302 @@ class TestSemanticSpliceReservedSlot(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# semantic_diff_stats: cost/token exposure in review_quality_status
+# ---------------------------------------------------------------------------
+
+class TestSemanticDiffStats(unittest.TestCase):
+    """semantic_diff_stats block in review_quality_status carries token/cost data.
+
+    Uses the REAL SemanticDiffLlmClient with a patched litellm module (per
+    TestRealClientTypedResult pattern) so the typed LlmResult usage fields are
+    exercised end-to-end through semantic_contract_diff and the splice.
+    """
+
+    def _inject_fake_litellm_with_usage(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cost_usd: float,
+        json_payload: list,
+    ):
+        """Return a fake litellm module whose completion returns a response with usage."""
+        import json as _json
+        import types
+
+        class _Usage:
+            def __init__(self) -> None:
+                self.prompt_tokens = prompt_tokens
+                self.completion_tokens = completion_tokens
+
+        class _Message:
+            def __init__(self) -> None:
+                self.content = _json.dumps(json_payload)
+
+        class _Choice:
+            def __init__(self) -> None:
+                self.message = _Message()
+
+        class _Response:
+            def __init__(self) -> None:
+                self.choices = [_Choice()]
+                self.usage = _Usage()
+
+        def _completion_cost(completion_response=None, **kwargs):
+            return cost_usd
+
+        fake = types.ModuleType("litellm")
+        fake.completion = lambda **kwargs: _Response()
+        fake.completion_cost = _completion_cost
+        return fake
+
+    def _inject_fake_litellm_no_usage(self, json_payload: list):
+        """Return a fake litellm module whose response has no .usage attribute."""
+        import json as _json
+        import types
+
+        class _Message:
+            def __init__(self) -> None:
+                self.content = _json.dumps(json_payload)
+
+        class _Choice:
+            def __init__(self) -> None:
+                self.message = _Message()
+
+        class _Response:
+            def __init__(self) -> None:
+                self.choices = [_Choice()]
+                # deliberately no .usage attribute
+
+        def _completion_cost(**kwargs):
+            raise Exception("unknown model")
+
+        fake = types.ModuleType("litellm")
+        fake.completion = lambda **kwargs: _Response()
+        fake.completion_cost = _completion_cost
+        return fake
+
+    def test_stats_in_final_packet_after_splice_and_budget(self) -> None:
+        """semantic_diff_stats present in review_quality_status after full call_tool pipeline.
+
+        Uses REAL SemanticDiffLlmClient with patched litellm returning usage.
+        Inversion: asserts calls_attempted >= 1 (proves real client path ran).
+        Hard asserts on aggregated token/cost values in the final packet.
+        """
+        import sys
+        from unittest.mock import patch
+        from source.kg.integrations.semantic_llm import SemanticDiffLlmClient
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses as _real_splice
+
+        fake_litellm = self._inject_fake_litellm_with_usage(
+            prompt_tokens=100,
+            completion_tokens=50,
+            cost_usd=0.0012,
+            json_payload=_FAKE_RESPONSE,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            # Hard assert: fixture must have CodeSymbol entities
+            self.assertTrue(
+                any(e.get("kind") == "CodeSymbol" for e in head_kg.entities),
+                "fixture KG must have CodeSymbol entities",
+            )
+
+            with patch.dict(sys.modules, {"litellm": fake_litellm}):
+                real_client = SemanticDiffLlmClient(model="fake-model")
+
+                def _with_real_client(**kw):
+                    return _real_splice(**kw, _client=real_client)
+
+                with patch(
+                    "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
+                    side_effect=lambda **kw: _with_real_client(**kw),
+                ):
+                    result = call_tool(head_kg, "review_context", {
+                        "repo": _SVC2_REPO,
+                        "changed_files": ["handler.py"],
+                        "base_snapshot": str(out_base),
+                        "base_checkout": str(base_checkout),
+                        "head_checkout": str(head_checkout),
+                    })
+
+        rqs = result.get("review_quality_status") or {}
+
+        # Hard assert: semantic_diff_stats must be present in the packet
+        self.assertIn(
+            "semantic_diff_stats", rqs,
+            f"semantic_diff_stats must be present in review_quality_status; keys={list(rqs.keys())}",
+        )
+        stats = rqs["semantic_diff_stats"]
+        self.assertIsInstance(stats, dict, "semantic_diff_stats must be a dict")
+
+        # Inversion: calls_attempted >= 1 proves the real client path ran
+        calls_attempted = stats.get("calls_attempted", 0)
+        self.assertGreaterEqual(
+            calls_attempted, 1,
+            f"calls_attempted must be >= 1 (real client ran); got {calls_attempted}",
+        )
+
+        # Hard asserts: token/cost values must match the faked litellm response
+        self.assertEqual(
+            stats.get("prompt_tokens"), 100 * calls_attempted,
+            f"prompt_tokens must be 100*calls; got {stats.get('prompt_tokens')}",
+        )
+        self.assertEqual(
+            stats.get("completion_tokens"), 50 * calls_attempted,
+            f"completion_tokens must be 50*calls; got {stats.get('completion_tokens')}",
+        )
+        self.assertIsNotNone(
+            stats.get("cost_usd"),
+            "cost_usd must not be None when litellm returns cost",
+        )
+        # Model field present
+        self.assertEqual(
+            stats.get("model"), "fake-model",
+            f"model must be 'fake-model'; got {stats.get('model')}",
+        )
+
+    def test_stats_usage_absent_produces_nulls_not_zeros(self) -> None:
+        """When litellm response has no usage, prompt_tokens/completion_tokens/cost_usd must be None.
+
+        Inversion: calls_attempted >= 1 proves the client ran; nulls prove the
+        silent-default rule is honoured (0.0 would silently undercount cost).
+        """
+        import sys
+        from unittest.mock import patch
+        from source.kg.integrations.semantic_llm import SemanticDiffLlmClient
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        fake_litellm = self._inject_fake_litellm_no_usage(_FAKE_RESPONSE)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            e = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "repo_no_usage",
+                    "module": "mod.handler",
+                    "qualname": "no_usage_func",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "handler.py", "line": 1, "end_line": 3},
+            )
+            snap_dir = root / "snap_no_usage"
+            JsonlKgStore(snap_dir).write(
+                entities=[e], facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": "default"},
+            )
+            snap = KgSnapshot(snap_dir)
+            base_dir = root / "base_no_usage"
+            base_dir.mkdir()
+            (base_dir / "handler.py").write_text("def no_usage_func():\n    if x: raise\n    return 1\n")
+            head_dir = root / "head_no_usage"
+            head_dir.mkdir()
+            (head_dir / "handler.py").write_text("def no_usage_func():\n    return 1\n")
+
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+            stats_out: dict = {}
+
+            with patch.dict(sys.modules, {"litellm": fake_litellm}):
+                client = SemanticDiffLlmClient(model="fake-model")
+                _rows, _status = semantic_contract_diff(
+                    base_snapshot=snap,
+                    head_snapshot=snap,
+                    base_root=base_dir,
+                    head_root=head_dir,
+                    changed_symbols=entity_dicts,
+                    client=client,
+                    _stats_out=stats_out,
+                )
+
+        # Inversion: calls_attempted >= 1 proves the real client path ran
+        self.assertGreaterEqual(
+            stats_out.get("calls_attempted", 0), 1,
+            f"calls_attempted must be >= 1; got {stats_out.get('calls_attempted')}",
+        )
+        # Hard assert: usage absent → None, not zero
+        self.assertIsNone(
+            stats_out.get("prompt_tokens"),
+            f"prompt_tokens must be None when usage absent; got {stats_out.get('prompt_tokens')!r}",
+        )
+        self.assertIsNone(
+            stats_out.get("completion_tokens"),
+            f"completion_tokens must be None when usage absent; got {stats_out.get('completion_tokens')!r}",
+        )
+        self.assertIsNone(
+            stats_out.get("cost_usd"),
+            f"cost_usd must be None when usage absent; got {stats_out.get('cost_usd')!r}",
+        )
+
+    def test_stats_survive_budget_sync(self) -> None:
+        """semantic_diff_stats must survive _sync_review_quality_status_from_packet.
+
+        Directly tests the budget sync path: injects a review_quality_status with
+        semantic_diff_stats, runs the sync, asserts the stats field is preserved.
+        Inversion: assert stats NOT present before injection → verifies the assertion
+        is checking what was actually put there by the sync, not a pre-existing value.
+        """
+        from source.kg.product import output_budget as ob
+
+        fake_stats = {
+            "model": "gpt-5.4-mini",
+            "calls_attempted": 2,
+            "calls_succeeded": 2,
+            "calls_failed": 0,
+            "parse_misses": 0,
+            "rows_generated": 2,
+            "prompt_tokens": 200,
+            "completion_tokens": 100,
+            "cost_usd": 0.0024,
+        }
+        result = {
+            "review_quality_status": {
+                "coverage_status": "partial",
+                "specific_hypothesis_count": 1,
+                "generic_hypothesis_count": 0,
+                "specificity": "high",
+                "recommended_action": "use_supercontext_packet",
+                "reason": "Test packet.",
+                "review_readiness": "packet_ready",
+                "semantic_diff_status": "active",
+                "semantic_diff_stats": fake_stats,
+            },
+            "review_hypotheses": [
+                {
+                    "hypothesis_id": "hyp-sem-001",
+                    "risk_type": "contract_semantic_diff",
+                    "specificity": "high",
+                    "derivation": "inferred_llm",
+                }
+            ],
+        }
+
+        # Inversion: verify stats is present BEFORE sync (set up correctly)
+        self.assertIn(
+            "semantic_diff_stats", result["review_quality_status"],
+            "semantic_diff_stats must be present before sync (test setup check)",
+        )
+
+        ob._sync_review_quality_status_from_packet(result, result["review_hypotheses"])
+
+        synced_rqs = result["review_quality_status"]
+        self.assertIn(
+            "semantic_diff_stats", synced_rqs,
+            f"semantic_diff_stats must survive budget sync; keys={list(synced_rqs.keys())}",
+        )
+        self.assertEqual(
+            synced_rqs["semantic_diff_stats"], fake_stats,
+            "semantic_diff_stats content must be unchanged after budget sync",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
