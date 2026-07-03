@@ -106,9 +106,11 @@ def _symbol_ref(entity: JsonObject, snap: KgSnapshot) -> JsonObject:
     }
 
 
-def _head_entity_for_base(base_entity: JsonObject, head: KgSnapshot) -> JsonObject | None:
+def _head_entity_for_base(
+    base_entity: JsonObject,
+    head_by_urn: dict[str, JsonObject],
+) -> JsonObject | None:
     """Look up the head-side entity matching a base-side entity by URN."""
-    head_by_urn = {e["urn"]: e for e in head.entities}
     return head_by_urn.get(base_entity["urn"])
 
 
@@ -295,10 +297,12 @@ def responsibility_moved(
                 if from_entity["urn"] == to_entity["urn"]:
                     continue
 
+                from_survives = from_entity["urn"] in head_by_urn
                 rows.append({
                     "shared_callee": _symbol_ref(callee_entity, callee_snap),
                     "moved_from": _symbol_ref(from_entity, base),
                     "moved_to": _symbol_ref(to_entity, head),
+                    "from_symbol_survives_in_head": from_survives,
                 })
 
     rows.sort(key=lambda r: (
@@ -352,41 +356,80 @@ def contract_diff_packet(
     base = KgSnapshot(base_snapshot_dir)
     head = KgSnapshot(head_snapshot_dir)
     delta = diff_snapshots(base, head)
+    head_by_urn: dict[str, JsonObject] = {e["urn"]: e for e in head.entities}
 
     paths = list(changed_paths or [])
 
-    # Family 1: guard_call_removed
+    _GUARD_CAP = 3
+    _LARGE_REFACTOR_THRESHOLD = 5
+
+    # Family 1: guard_call_removed (noise-bounded in packet builder; query stays complete)
     guard_rows = guard_call_removed(delta, base, head, paths)
-    guard_hypotheses: list[JsonObject] = []
+
+    # Count base-graph referrers per callee URN for ordering.
+    base_referrer_count: dict[str, int] = {}
+    for fact in base.facts:
+        if fact.get("predicate") == "CALLS":
+            obj_id = fact.get("object_id", "")
+            obj_ent = base.entities_by_id.get(obj_id)
+            if obj_ent:
+                urn = obj_ent.get("urn", "")
+                base_referrer_count[urn] = base_referrer_count.get(urn, 0) + 1
+
+    # Group rows by subject URN.
+    from collections import defaultdict as _defaultdict
+    rows_by_subject: dict[str, list[JsonObject]] = _defaultdict(list)
     for row in guard_rows:
-        subject = row["subject"]
-        callee = row["removed_callee"]
-        hyp_id = _hyp_id(
-            "guard_call_removed_drift",
-            subject.get("urn", ""),
-            callee.get("urn", ""),
-        )
-        guard_hypotheses.append({
-            "hypothesis_id": hyp_id,
-            "risk_type": "guard_call_removed_drift",
-            "concrete_invariant": (
-                f"{subject.get('qualname') or subject.get('urn')} "
-                f"no longer calls {callee.get('qualname') or callee.get('urn')}"
-            ),
-            "why": (
+        rows_by_subject[row["subject"].get("urn", "")].append(row)
+
+    guard_hypotheses: list[JsonObject] = []
+    for subj_urn in sorted(rows_by_subject):
+        subj_rows = rows_by_subject[subj_urn]
+        total = len(subj_rows)
+        # Order: most-referenced callee first, then callee URN asc.
+        subj_rows.sort(key=lambda r: (
+            -base_referrer_count.get(r["removed_callee"].get("urn", ""), 0),
+            r["removed_callee"].get("urn", ""),
+        ))
+        kept = subj_rows[:_GUARD_CAP]
+        omitted = total - len(kept)
+        large_refactor = total > _LARGE_REFACTOR_THRESHOLD
+
+        for idx, row in enumerate(kept):
+            subject = row["subject"]
+            callee = row["removed_callee"]
+            hyp_id = _hyp_id(
+                "guard_call_removed_drift",
+                subject.get("urn", ""),
+                callee.get("urn", ""),
+            )
+            why = (
                 "A CALLS edge from this symbol to the listed callee was present in base "
                 "and absent in head while the subject symbol survives. The removed call may "
                 "have been a guard, cleanup, or invariant the remaining code depends on."
-            ),
-            "source_checks": [
-                "Confirm whether the removed call was a precondition check or side-effect.",
-                "Verify the remaining code path still enforces the invariant by another means.",
-            ],
-            "before_refs": [callee["bytes_ref"]] if callee.get("bytes_ref") else [],
-            "after_refs": [subject["bytes_ref"]] if subject.get("bytes_ref") else [],
-            "subject": subject,
-            "removed_callee": callee,
-        })
+            )
+            if large_refactor:
+                why += f" (part of a larger removal: {total} calls removed from this symbol)"
+            hyp: JsonObject = {
+                "hypothesis_id": hyp_id,
+                "risk_type": "guard_call_removed_drift",
+                "concrete_invariant": (
+                    f"{subject.get('qualname') or subject.get('urn')} "
+                    f"no longer calls {callee.get('qualname') or callee.get('urn')}"
+                ),
+                "why": why,
+                "source_checks": [
+                    "Confirm whether the removed call was a precondition check or side-effect.",
+                    "Verify the remaining code path still enforces the invariant by another means.",
+                ],
+                "before_refs": [callee["bytes_ref"]] if callee.get("bytes_ref") else [],
+                "after_refs": [subject["bytes_ref"]] if subject.get("bytes_ref") else [],
+                "subject": subject,
+                "removed_callee": callee,
+            }
+            if omitted > 0 and idx == len(kept) - 1:
+                hyp["omitted_removed_call_count"] = omitted
+            guard_hypotheses.append(hyp)
 
     # Family 2: responsibility_moved
     moved_rows = responsibility_moved(delta, base, head)
@@ -395,12 +438,32 @@ def contract_diff_packet(
         from_sym = row["moved_from"]
         to_sym = row["moved_to"]
         callee = row["shared_callee"]
+        survives = row["from_symbol_survives_in_head"]
         hyp_id = _hyp_id(
             "responsibility_moved_drift",
             from_sym.get("urn", ""),
             to_sym.get("urn", ""),
             callee.get("urn", ""),
         )
+        why = (
+            "A CALLS edge (X→Z) was removed and (Y→Z) was added for the same callee Z "
+            "within the same repo. The callee's invocation responsibility moved from "
+            "one symbol to another — review whether the context, arguments, or invariants "
+            "enforced around the call are preserved."
+        )
+        source_checks = [
+            "Confirm whether the caller context (auth, scope, preconditions) is equivalent.",
+            "Verify the arguments and error-handling at the new call site match the old.",
+        ]
+        if not survives:
+            why += (
+                " The from-symbol no longer exists in head — this may be a rename rather "
+                "than an ownership transfer; verify before treating as a dropped responsibility."
+            )
+            source_checks.append(
+                "Check whether the from-symbol was renamed: look for a new symbol with "
+                "equivalent behaviour before treating this as a dropped responsibility."
+            )
         moved_hypotheses.append({
             "hypothesis_id": hyp_id,
             "risk_type": "responsibility_moved_drift",
@@ -409,21 +472,14 @@ def contract_diff_packet(
                 f"moved from {from_sym.get('qualname') or from_sym.get('urn')} "
                 f"to {to_sym.get('qualname') or to_sym.get('urn')}"
             ),
-            "why": (
-                "A CALLS edge (X→Z) was removed and (Y→Z) was added for the same callee Z "
-                "within the same repo. The callee's invocation responsibility moved from "
-                "one symbol to another — review whether the context, arguments, or invariants "
-                "enforced around the call are preserved."
-            ),
-            "source_checks": [
-                "Confirm whether the caller context (auth, scope, preconditions) is equivalent.",
-                "Verify the arguments and error-handling at the new call site match the old.",
-            ],
+            "why": why,
+            "source_checks": source_checks,
             "before_refs": [from_sym["bytes_ref"]] if from_sym.get("bytes_ref") else [],
             "after_refs": [to_sym["bytes_ref"]] if to_sym.get("bytes_ref") else [],
             "moved_from": from_sym,
             "moved_to": to_sym,
             "shared_callee": callee,
+            "from_symbol_survives_in_head": survives,
         })
 
     # Family 3: test_reference_removed (reuses Phase-1 query unchanged)
@@ -439,10 +495,8 @@ def contract_diff_packet(
         )
         # Build bytes_refs from the row's subject path + base entity evidence.
         base_subj_entity = base.entities_by_id.get(subj.get("entity_id", ""))
-        base_obj_entity = base.entities_by_id.get(obj.get("entity_id", ""))
         before_ref = _bytes_ref(base, base_subj_entity) if base_subj_entity else {}
-        # Object survives in head; get its head-side entity for after_ref.
-        head_by_urn = {e["urn"]: e for e in head.entities}
+        # Object survives in head; reuse already-built head_by_urn.
         head_obj = head_by_urn.get(obj.get("urn", ""))
         after_ref = _bytes_ref(head, head_obj) if head_obj else {}
 

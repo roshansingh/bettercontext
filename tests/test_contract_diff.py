@@ -442,7 +442,7 @@ class TestContractDiffPacket(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             out_base, out_head = self._build_pair_from_source(root)
-            packet = contract_diff_packet(str(out_base), str(out_head), changed_paths=["svc/core.py"])
+            packet = contract_diff_packet(str(out_base), str(out_head), changed_paths=["core.py"])
 
         top = packet["contract_diff_packet"]
         self.assertIn("delta_summary", top)
@@ -469,24 +469,26 @@ class TestContractDiffPacket(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             out_base, out_head = self._build_pair_from_source(root)
-            packet = contract_diff_packet(str(out_base), str(out_head), changed_paths=["svc/core.py"])
+            # build_kg is invoked with `svc/` as repo root, so entity paths are relative to
+            # that root (e.g. "core.py", not "svc/core.py").
+            packet = contract_diff_packet(str(out_base), str(out_head), changed_paths=["core.py"])
 
         guard_hyps = [
             h for h in packet["contract_diff_packet"]["hypotheses"]
             if h["risk_type"] == "guard_call_removed_drift"
         ]
-        if guard_hyps:
-            h = guard_hyps[0]
-            self.assertIn("hypothesis_id", h)
-            self.assertIn("concrete_invariant", h)
-            self.assertIn("why", h)
-            self.assertIn("source_checks", h)
-            self.assertIn("before_refs", h)
-            self.assertIn("after_refs", h)
-            self.assertIsInstance(h["source_checks"], list)
+        self.assertGreaterEqual(len(guard_hyps), 1, "fixture must produce at least one guard hypothesis")
+        h = guard_hyps[0]
+        self.assertIn("hypothesis_id", h)
+        self.assertIn("concrete_invariant", h)
+        self.assertIn("why", h)
+        self.assertIn("source_checks", h)
+        self.assertIn("before_refs", h)
+        self.assertIn("after_refs", h)
+        self.assertIsInstance(h["source_checks"], list)
 
     def test_responsibility_moved_hypothesis_shape(self) -> None:
-        """Moved hypotheses carry moved_from/moved_to/shared_callee."""
+        """Moved hypotheses carry moved_from/moved_to/shared_callee/from_symbol_survives_in_head."""
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             out_base, out_head = self._build_pair_from_source(root)
@@ -496,18 +498,19 @@ class TestContractDiffPacket(unittest.TestCase):
             h for h in packet["contract_diff_packet"]["hypotheses"]
             if h["risk_type"] == "responsibility_moved_drift"
         ]
-        if moved_hyps:
-            h = moved_hyps[0]
-            self.assertIn("moved_from", h)
-            self.assertIn("moved_to", h)
-            self.assertIn("shared_callee", h)
+        self.assertGreaterEqual(len(moved_hyps), 1, "fixture must produce at least one moved hypothesis")
+        h = moved_hyps[0]
+        self.assertIn("moved_from", h)
+        self.assertIn("moved_to", h)
+        self.assertIn("shared_callee", h)
+        self.assertIn("from_symbol_survives_in_head", h)
 
     def test_hypothesis_ids_are_unique(self) -> None:
         """Every hypothesis in the packet has a unique hypothesis_id."""
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             out_base, out_head = self._build_pair_from_source(root)
-            packet = contract_diff_packet(str(out_base), str(out_head), changed_paths=["svc/core.py"])
+            packet = contract_diff_packet(str(out_base), str(out_head), changed_paths=["core.py"])
 
         hyps = packet["contract_diff_packet"]["hypotheses"]
         ids = [h["hypothesis_id"] for h in hyps]
@@ -612,6 +615,158 @@ class TestResponsibilityMovedSynthetic(unittest.TestCase):
             return (r["shared_callee"]["urn"], r["moved_from"]["urn"], r["moved_to"]["urn"])
 
         self.assertEqual([key(r) for r in rows1], [key(r) for r in rows2])
+
+
+class TestResponsibilityMovedRenameDisclosure(unittest.TestCase):
+    """from_symbol_survives_in_head field and rename-ambiguity disclosure."""
+
+    def test_rename_shaped_fixture_survives_false_and_disclosure(self) -> None:
+        """X removed + Y added, both calling Z — X absent from head → False + disclosure text."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            alpha = _symbol("svc", "svc.core", "alpha", "svc/core.py", 1)
+            alpha_prime = _symbol("svc", "svc.core", "alpha_prime", "svc/core.py", 1)
+            gamma = _symbol("svc", "svc.core", "gamma", "svc/core.py", 20)
+
+            # alpha (X) removed from head, alpha_prime (Y) added, both call gamma (Z).
+            base = _make_snapshot(root, "base", [mod, alpha, gamma], [_calls(alpha, gamma)])
+            head = _make_snapshot(root, "head", [mod, alpha_prime, gamma], [_calls(alpha_prime, gamma)])
+            delta = diff_snapshots(base, head)
+            rows = responsibility_moved(delta, base, head)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertFalse(row["from_symbol_survives_in_head"])
+
+    def test_rename_shaped_packet_has_disclosure_text(self) -> None:
+        """When from_symbol_survives_in_head is False, packet why discloses rename risk."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            alpha = _symbol("svc", "svc.core", "alpha", "svc/core.py", 1)
+            alpha_prime = _symbol("svc", "svc.core", "alpha_prime", "svc/core.py", 1)
+            gamma = _symbol("svc", "svc.core", "gamma", "svc/core.py", 20)
+
+            base_snap = _make_snapshot(root, "base", [mod, alpha, gamma], [_calls(alpha, gamma)])
+            head_snap = _make_snapshot(root, "head", [mod, alpha_prime, gamma], [_calls(alpha_prime, gamma)])
+
+            packet = contract_diff_packet(str(base_snap.root), str(head_snap.root))
+
+        moved_hyps = [
+            h for h in packet["contract_diff_packet"]["hypotheses"]
+            if h["risk_type"] == "responsibility_moved_drift"
+        ]
+        self.assertGreaterEqual(len(moved_hyps), 1)
+        h = moved_hyps[0]
+        self.assertFalse(h["from_symbol_survives_in_head"])
+        self.assertIn("rename", h["why"])
+
+    def test_genuine_move_survives_true(self) -> None:
+        """X survives in head after moving call to Y → from_symbol_survives_in_head True."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            alpha = _symbol("svc", "svc.core", "alpha", "svc/core.py", 1)
+            beta = _symbol("svc", "svc.core", "beta", "svc/core.py", 10)
+            gamma = _symbol("svc", "svc.core", "gamma", "svc/core.py", 20)
+
+            base = _make_snapshot(root, "base", [mod, alpha, beta, gamma], [_calls(alpha, gamma)])
+            # alpha survives in head (both alpha and beta present), beta gains the call.
+            head = _make_snapshot(root, "head", [mod, alpha, beta, gamma], [_calls(beta, gamma)])
+            delta = diff_snapshots(base, head)
+            rows = responsibility_moved(delta, base, head)
+
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["from_symbol_survives_in_head"])
+
+
+class TestGuardCallRemovedNoiseBound(unittest.TestCase):
+    """Packet builder caps guard rows at 3 per subject; query returns all."""
+
+    def _make_many_removed_calls(self, root: Path, count: int):
+        """alpha calls `count` callees in base; head: alpha survives but calls none."""
+        mod = _module("svc", "svc.core")
+        alpha = _symbol("svc", "svc.core", "alpha", "svc/core.py", 1)
+        callees = [
+            _symbol("svc", "svc.core", f"callee_{i}", "svc/util.py", i * 10)
+            for i in range(count)
+        ]
+        base_facts = [_calls(alpha, c) for c in callees]
+        base = _make_snapshot(root, "base", [mod, alpha] + callees, base_facts)
+        head = _make_snapshot(root, "head", [mod, alpha] + callees, [])
+        return base, head, alpha, callees
+
+    def test_query_returns_all_six(self) -> None:
+        """guard_call_removed (query layer) returns all 6 rows untruncated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base, head, _, _ = self._make_many_removed_calls(root, 6)
+            delta = diff_snapshots(base, head)
+            rows = guard_call_removed(delta, base, head, ["svc/core.py"])
+
+        self.assertEqual(len(rows), 6)
+
+    def test_packet_caps_at_three_per_subject(self) -> None:
+        """Packet builder emits at most 3 guard hypotheses per subject."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base, head, _, _ = self._make_many_removed_calls(root, 6)
+            packet = contract_diff_packet(str(base.root), str(head.root), changed_paths=["svc/core.py"])
+
+        guard_hyps = [
+            h for h in packet["contract_diff_packet"]["hypotheses"]
+            if h["risk_type"] == "guard_call_removed_drift"
+        ]
+        self.assertEqual(len(guard_hyps), 3)
+
+    def test_omitted_count_on_last_kept(self) -> None:
+        """The last kept hypothesis for a subject carries omitted_removed_call_count=3."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base, head, _, _ = self._make_many_removed_calls(root, 6)
+            packet = contract_diff_packet(str(base.root), str(head.root), changed_paths=["svc/core.py"])
+
+        guard_hyps = [
+            h for h in packet["contract_diff_packet"]["hypotheses"]
+            if h["risk_type"] == "guard_call_removed_drift"
+        ]
+        self.assertEqual(len(guard_hyps), 3)
+        last = guard_hyps[-1]
+        self.assertEqual(last.get("omitted_removed_call_count"), 3)
+
+    def test_large_refactor_why_note(self) -> None:
+        """When >5 removed calls from one symbol, kept hypotheses' why mentions count."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            base, head, _, _ = self._make_many_removed_calls(root, 6)
+            packet = contract_diff_packet(str(base.root), str(head.root), changed_paths=["svc/core.py"])
+
+        guard_hyps = [
+            h for h in packet["contract_diff_packet"]["hypotheses"]
+            if h["risk_type"] == "guard_call_removed_drift"
+        ]
+        for h in guard_hyps:
+            self.assertIn("6 calls removed from this symbol", h["why"])
+
+    def test_inversion_no_guard_hyps_when_no_removed_calls(self) -> None:
+        """No removed calls → zero guard hypotheses (inversion for finding #3)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            alpha = _symbol("svc", "svc.core", "alpha", "svc/core.py", 1)
+            gamma = _symbol("svc", "svc.core", "gamma", "svc/core.py", 10)
+
+            # base: no calls; head: alpha ADDS a call (not removed)
+            base = _make_snapshot(root, "base", [mod, alpha, gamma], [])
+            head = _make_snapshot(root, "head", [mod, alpha, gamma], [_calls(alpha, gamma)])
+            packet = contract_diff_packet(str(base.root), str(head.root), changed_paths=["svc/core.py"])
+
+        guard_hyps = [
+            h for h in packet["contract_diff_packet"]["hypotheses"]
+            if h["risk_type"] == "guard_call_removed_drift"
+        ]
+        self.assertEqual(len(guard_hyps), 0)
 
 
 if __name__ == "__main__":
