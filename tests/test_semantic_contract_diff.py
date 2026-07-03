@@ -375,9 +375,14 @@ class TestSemanticDiffFailures(unittest.TestCase):
             hyps = result.get("review_hypotheses") or []
             semantic_hyps = [h for h in hyps if h.get("risk_type") == "contract_semantic_diff"]
             self.assertEqual(semantic_hyps, [], "malformed output must produce no semantic hyps")
-            # Status should be active or absent (not "failed")
+            # Status must be a recognized non-"active" status reflecting the parse miss.
+            # With Fix 1, all-parse_miss → "failed:all_responses_unparseable" (not silent "active").
             rqs = result.get("review_quality_status") or {}
-            self.assertIn(rqs.get("semantic_diff_status"), (None, "active"))
+            self.assertIn(
+                rqs.get("semantic_diff_status"),
+                (None, "active", "failed:all_responses_unparseable"),
+                f"malformed status must be a recognized value; got {rqs.get('semantic_diff_status')!r}",
+            )
 
     def test_missing_checkouts_gives_missing_checkouts_status(self) -> None:
         """No base_checkout/head_checkout → semantic_diff_status=missing_checkouts."""
@@ -2194,6 +2199,497 @@ class TestDedupeValidationOrder(unittest.TestCase):
             self.assertEqual(
                 rows[0].get("category"), "guard_removal",
                 f"first valid item's category must win; got {rows[0].get('category')!r}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Fix wave: parse-miss honesty (Fix 1)
+# ---------------------------------------------------------------------------
+
+class _AllParseMissClient:
+    """Client that always returns parse_miss (call completes, no parseable JSON)."""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def complete_json(self, prompt: str) -> "LlmResult":
+        self.call_count += 1
+        return LlmResult.parse_miss()
+
+
+class _MixedParseMissClient:
+    """First call returns valid JSON; second call returns parse_miss."""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def complete_json(self, prompt: str) -> "LlmResult":
+        self.call_count += 1
+        if self.call_count == 1:
+            return LlmResult.parsed(_FAKE_RESPONSE)
+        return LlmResult.parse_miss()
+
+
+class TestParseMissHonesty(unittest.TestCase):
+    """Fix 1: parse_miss tracked separately; all-miss → failed:all_responses_unparseable."""
+
+    def _make_single_symbol_snap(self, root: Path) -> tuple[KgSnapshot, Path, Path]:
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        e = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_parsemiss",
+                "module": "mod.handler",
+                "qualname": "pm_func",
+                "symbol_kind": "function",
+            },
+            properties={"path": "handler.py", "line": 1, "end_line": 3},
+        )
+        snap_dir = root / "snap_parsemiss"
+        JsonlKgStore(snap_dir).write(
+            entities=[e], facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": TENANT},
+        )
+        snap = KgSnapshot(snap_dir)
+        base_dir = root / "base_parsemiss"
+        base_dir.mkdir()
+        (base_dir / "handler.py").write_text("def pm_func():\n    if x: raise\n    return 1\n")
+        head_dir = root / "head_parsemiss"
+        head_dir.mkdir()
+        (head_dir / "handler.py").write_text("def pm_func():\n    return 1\n")
+        return snap, base_dir, head_dir
+
+    def test_all_parse_miss_produces_failed_status(self) -> None:
+        """All calls returning parse_miss → status == 'failed:all_responses_unparseable' (exact)."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _AllParseMissClient()
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+            self.assertGreaterEqual(client.call_count, 1, "client must be called at least once")
+            self.assertEqual(rows, [], "all parse_miss must produce no rows")
+            self.assertEqual(
+                status, "failed:all_responses_unparseable",
+                f"all parse_miss must yield 'failed:all_responses_unparseable'; got {status!r}",
+            )
+
+    def test_inversion_all_parse_miss_not_active(self) -> None:
+        """Inversion: all parse_miss must NOT produce 'active' (the silent-nothing gap)."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _AllParseMissClient()
+            _, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+            self.assertNotEqual(
+                status, "active",
+                "all parse_miss must NOT be 'active' — that hides the silent-nothing gap",
+            )
+
+    def test_mixed_parse_miss_stays_active_with_rows(self) -> None:
+        """First call succeeds, second parse_miss → status 'active', rows from first call present."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # Two differing symbols so two calls happen
+            entities = []
+            for i in range(2):
+                entities.append(Entity(
+                    kind="CodeSymbol",
+                    identity={
+                        "tenant_id": TENANT,
+                        "repo": "repo_mixedpm",
+                        "module": f"mod.m{i}",
+                        "qualname": f"mixed_func_{i}",
+                        "symbol_kind": "function",
+                    },
+                    properties={"path": f"f{i}.py", "line": 1, "end_line": 3},
+                ))
+            snap_dir = root / "snap_mixedpm"
+            JsonlKgStore(snap_dir).write(
+                entities=entities, facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            base_dir = root / "base_mixedpm"
+            base_dir.mkdir()
+            head_dir = root / "head_mixedpm"
+            head_dir.mkdir()
+            for i in range(2):
+                (base_dir / f"f{i}.py").write_text(f"def mixed_func_{i}():\n    if x: raise\n    return {i}\n")
+                (head_dir / f"f{i}.py").write_text(f"def mixed_func_{i}():\n    return {i}\n")
+
+            client = _MixedParseMissClient()
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+
+            if client.call_count < 2:
+                self.skipTest("fixture produced <2 differing symbols — need >=2 for mixed test")
+
+            self.assertGreater(len(rows), 0, "first-call success must produce >=1 row")
+            # Mixed: some parsed, some missed → must not be failed:all_responses_unparseable
+            self.assertNotEqual(
+                status, "failed:all_responses_unparseable",
+                "mixed parse_miss must not be 'failed:all_responses_unparseable'",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Fix wave: response-format robustness (Fix 2)
+# ---------------------------------------------------------------------------
+
+class TestExtractJsonRobustness(unittest.TestCase):
+    """Fix 2: _extract_json handles markdown fences and single-key object wrappers."""
+
+    def test_json_fenced_json(self) -> None:
+        """```json ... ``` fence stripped and array parsed."""
+        from source.kg.integrations.semantic_llm import _extract_json
+
+        text = '```json\n[{"claim": "x", "cause_line": 1}]\n```'
+        result = _extract_json(text)
+        self.assertIsInstance(result, list)
+        self.assertEqual(result[0]["claim"], "x")
+
+    def test_bare_fence(self) -> None:
+        """Bare ``` ... ``` fence stripped and array parsed."""
+        from source.kg.integrations.semantic_llm import _extract_json
+
+        text = '```\n[{"claim": "y", "cause_line": 2}]\n```'
+        result = _extract_json(text)
+        self.assertIsInstance(result, list)
+        self.assertEqual(result[0]["claim"], "y")
+
+    def test_single_key_object_unwrapped(self) -> None:
+        """{"changes": [...]} wrapper unwrapped to return the list."""
+        from source.kg.integrations.semantic_llm import _extract_json
+
+        text = '{"changes": [{"claim": "z", "cause_line": 3}]}'
+        result = _extract_json(text)
+        self.assertIsInstance(result, list)
+        self.assertEqual(result[0]["claim"], "z")
+
+    def test_leading_trailing_prose_with_array(self) -> None:
+        """Array embedded in prose (no fence) is extracted correctly."""
+        from source.kg.integrations.semantic_llm import _extract_json
+
+        text = 'Here is my analysis:\n[{"claim": "a", "cause_line": 1}]\nDone.'
+        result = _extract_json(text)
+        self.assertIsInstance(result, list)
+        self.assertEqual(result[0]["claim"], "a")
+
+    def test_inversion_plain_prose_returns_none(self) -> None:
+        """Pure prose (no JSON structure) returns None."""
+        from source.kg.integrations.semantic_llm import _extract_json
+
+        result = _extract_json("Sorry, I cannot analyze this code.")
+        self.assertIsNone(result)
+
+    def test_multi_key_object_inner_array_wins_bracket_scan(self) -> None:
+        """Object with multiple keys: bracket-scan finds inner array first, returns the list."""
+        from source.kg.integrations.semantic_llm import _extract_json
+
+        # The bracket-scan finds '[' (inner array) before '{' (outer object),
+        # so [1, 2] is returned — the outer multi-key dict is NOT unwrapped via
+        # _unwrap_single_key_object (which requires exactly one key).
+        text = '{"changes": [1, 2], "other": "value"}'
+        result = _extract_json(text)
+        # Inner array [1, 2] is found first
+        self.assertIsInstance(result, list)
+        self.assertEqual(result, [1, 2])
+
+    def test_nested_brackets_in_string_values(self) -> None:
+        """Bracket chars inside string values don't confuse the bracket scanner."""
+        from source.kg.integrations.semantic_llm import _extract_json
+
+        text = '[{"claim": "returns [] instead of raising", "cause_line": 5}]'
+        result = _extract_json(text)
+        self.assertIsInstance(result, list)
+        self.assertIn("[]", result[0]["claim"])
+
+
+# ---------------------------------------------------------------------------
+# Fix wave: prompt strictness (Fix 3)
+# ---------------------------------------------------------------------------
+
+class TestPromptStrictness(unittest.TestCase):
+    """Fix 3: prompt ends with explicit format instruction."""
+
+    def test_prompt_template_ends_with_format_instruction(self) -> None:
+        """_PROMPT_TEMPLATE must end with 'Respond with ONLY a JSON array, no markdown fences, no prose.'"""
+        from source.kg.query.semantic_contract_diff import _PROMPT_TEMPLATE
+
+        sentinel = "Respond with ONLY a JSON array, no markdown fences, no prose."
+        # The template is a format string; format it to get the actual text
+        rendered = _PROMPT_TEMPLATE.format(qualname="X", before="A", after="B")
+        self.assertIn(
+            sentinel, rendered,
+            f"prompt must contain format instruction; template tail: {rendered[-200:]!r}",
+        )
+        self.assertTrue(
+            rendered.endswith(sentinel),
+            f"format instruction must be at the end of the prompt; tail: {rendered[-200:]!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix wave: inheritance-context enrichment (Fix 4)
+# ---------------------------------------------------------------------------
+
+class TestInheritanceContextEnrichment(unittest.TestCase):
+    """Fix 4: base class body appended to prompt for reparented class symbols."""
+
+    def _make_reparenting_snap(
+        self,
+        root: Path,
+        base_class_body: str,
+    ) -> tuple[KgSnapshot, Path, Path, list]:
+        """Build snap with class X (base) and class NewBase; return snap + checkouts + entities."""
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        # X: the changed symbol (class X(OldBase) → class X(NewBase))
+        x_entity = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_enrich",
+                "module": "mod.x",
+                "qualname": "X",
+                "symbol_kind": "class",
+            },
+            properties={"path": "x.py", "line": 1, "end_line": 5},
+        )
+        # NewBase: the resolved base entity
+        newbase_entity = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_enrich",
+                "module": "mod.newbase",
+                "qualname": "NewBase",
+                "symbol_kind": "class",
+            },
+            properties={"path": "newbase.py", "line": 1, "end_line": 8},
+        )
+
+        snap_dir = root / "snap_enrich"
+        JsonlKgStore(snap_dir).write(
+            entities=[x_entity, newbase_entity], facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": TENANT},
+        )
+        snap = KgSnapshot(snap_dir)
+
+        base_dir = root / "base_enrich"
+        base_dir.mkdir()
+        (base_dir / "x.py").write_text("class X(OldBase):\n    def method(self):\n        pass\n")
+
+        head_dir = root / "head_enrich"
+        head_dir.mkdir()
+        (head_dir / "x.py").write_text("class X(NewBase):\n    def method(self):\n        pass\n")
+        (head_dir / "newbase.py").write_text(base_class_body)
+
+        entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+        return snap, base_dir, head_dir, entity_dicts
+
+    def test_reparenting_prompt_contains_new_base_body(self) -> None:
+        """class X(OldBase) → class X(NewBase): prompt contains NewBase's body text."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        newbase_body = "class NewBase:\n    def abstract_method(self):\n        raise NotImplementedError\n"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir, entity_dicts = self._make_reparenting_snap(
+                root, newbase_body
+            )
+            # Only the X entity
+            x_entities = [d for d in entity_dicts if (d.get("identity") or {}).get("qualname") == "X"]
+
+            prompt_log: list[str] = []
+
+            class _SpyClient:
+                def complete_json(self, prompt: str) -> LlmResult:
+                    prompt_log.append(prompt)
+                    return LlmResult.parse_miss()
+
+            semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=x_entities,
+                client=_SpyClient(),
+            )
+
+            self.assertEqual(len(prompt_log), 1, "spy must be called exactly once")
+            self.assertIn(
+                "NewBase", prompt_log[0],
+                "prompt must contain NewBase's qualname in the base class context section",
+            )
+            self.assertIn(
+                "abstract_method", prompt_log[0],
+                "prompt must contain NewBase's body text (abstract_method)",
+            )
+            self.assertIn(
+                "Referenced base class (for context)", prompt_log[0],
+                "prompt must contain the 'Referenced base class (for context)' section header",
+            )
+
+    def test_non_class_symbol_no_enrichment(self) -> None:
+        """Non-class symbol (function): no base class section appended."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            e = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": TENANT,
+                    "repo": "repo_noenrich",
+                    "module": "mod.f",
+                    "qualname": "plain_func",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "f.py", "line": 1, "end_line": 3},
+            )
+            snap_dir = root / "snap_noenrich"
+            JsonlKgStore(snap_dir).write(
+                entities=[e], facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            base_dir = root / "base_noenrich"
+            base_dir.mkdir()
+            (base_dir / "f.py").write_text("def plain_func():\n    if x: raise\n    return 1\n")
+            head_dir = root / "head_noenrich"
+            head_dir.mkdir()
+            (head_dir / "f.py").write_text("def plain_func():\n    return 1\n")
+
+            prompt_log: list[str] = []
+
+            class _SpyClient:
+                def complete_json(self, prompt: str) -> LlmResult:
+                    prompt_log.append(prompt)
+                    return LlmResult.parse_miss()
+
+            semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=_SpyClient(),
+            )
+
+            self.assertEqual(len(prompt_log), 1, "spy must be called exactly once")
+            self.assertNotIn(
+                "Referenced base class (for context)", prompt_log[0],
+                "non-class symbol must not have base class context section",
+            )
+
+    def test_unresolvable_base_no_enrichment_no_error(self) -> None:
+        """class X(Unknown) → prompt has no base context section, no exception raised."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # X references Unknown which is NOT in the snapshot entities
+            e = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": TENANT,
+                    "repo": "repo_unresolvable",
+                    "module": "mod.x",
+                    "qualname": "X",
+                    "symbol_kind": "class",
+                },
+                properties={"path": "x.py", "line": 1, "end_line": 4},
+            )
+            snap_dir = root / "snap_unresolvable"
+            JsonlKgStore(snap_dir).write(
+                entities=[e], facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            base_dir = root / "base_unresolvable"
+            base_dir.mkdir()
+            (base_dir / "x.py").write_text("class X(OldBase):\n    pass\n")
+            head_dir = root / "head_unresolvable"
+            head_dir.mkdir()
+            # Head references Unknown (not in snap)
+            (head_dir / "x.py").write_text("class X(Unknown):\n    pass\n")
+
+            prompt_log: list[str] = []
+            raised: list[Exception] = []
+
+            class _SpyClient:
+                def complete_json(self, prompt: str) -> LlmResult:
+                    prompt_log.append(prompt)
+                    return LlmResult.parse_miss()
+
+            try:
+                semantic_contract_diff(
+                    base_snapshot=snap,
+                    head_snapshot=snap,
+                    base_root=base_dir,
+                    head_root=head_dir,
+                    changed_symbols=entity_dicts,
+                    client=_SpyClient(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                raised.append(exc)
+
+            self.assertEqual(raised, [], "unresolvable base must not raise any exception")
+            self.assertEqual(len(prompt_log), 1, "spy must be called exactly once")
+            self.assertNotIn(
+                "Referenced base class (for context)", prompt_log[0],
+                "unresolvable base must not produce a base class context section",
             )
 
 

@@ -3421,6 +3421,7 @@ def _splice_contract_diff_hypotheses(
             "risk_type": risk_type,
             "specificity": "high",
             "confidence": "medium",
+            "derivation": "deterministic_static",
             "concrete_invariant": h.get("concrete_invariant", ""),
             "why": h.get("why", ""),
             "source_checks": (h.get("source_checks") or [])[:2],

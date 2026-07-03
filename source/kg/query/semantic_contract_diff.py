@@ -33,13 +33,15 @@ if TYPE_CHECKING:
 _BODY_CHAR_LIMIT = 6000
 _MAX_SYMBOLS = 12
 _MAX_HYPS_PER_SYMBOL = 2
+_BASE_BODY_CHAR_LIMIT = 2500  # per resolved base class body
 
 _PROMPT_TEMPLATE = (
     "Compare the before/after implementation of {qualname}.\n\n"
     "BEFORE:\n{before}\n\nAFTER:\n{after}\n\n"
     "State up to 2 behavioral contract changes as falsifiable claims. "
     'JSON array: [{{"claim": "...", "cause_line": <head line no. int>, '
-    '"consequence": "one sentence", "negative_check": "...", "category": "..."}}]'
+    '"consequence": "one sentence", "negative_check": "...", "category": "..."}}]\n\n'
+    "Respond with ONLY a JSON array, no markdown fences, no prose."
 )
 
 _REQUIRED_KEYS = {"claim", "cause_line", "consequence", "negative_check", "category"}
@@ -116,6 +118,113 @@ def _is_auth_error(exc: Exception) -> bool:
     """Return True if the exception looks like an auth/API-key error."""
     msg = str(exc).lower()
     return any(sub in msg for sub in _AUTH_SUBSTRINGS)
+
+
+def _extract_base_names_from_class_line(class_line: str) -> list[str]:
+    """Extract base class names from a 'class X(A, B):' line using str ops.
+
+    Returns the last-segment names (e.g. ['A', 'B']) or [] if not a class line
+    or no bases are listed.  Handles simple comma-separated bases only.
+    """
+    line = class_line.strip()
+    if not line.startswith("class "):
+        return []
+    paren_open = line.find("(")
+    paren_close = line.rfind(")")
+    if paren_open == -1 or paren_close <= paren_open:
+        return []
+    bases_str = line[paren_open + 1 : paren_close].strip()
+    if not bases_str:
+        return []
+    result: list[str] = []
+    for part in bases_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        # Keep only the last segment (after the last dot) to match entity qualnames
+        last = part.rsplit(".", 1)[-1]
+        if last:
+            result.append(last)
+    return result
+
+
+def _build_base_class_context(
+    head_body: str,
+    base_body: str,
+    head_snapshot: "KgSnapshot",
+    head_root: Path,
+    head_entity: "JsonObject",
+) -> str:
+    """Return a prompt section with up to 2 resolved base class bodies.
+
+    Cheap check: first line of head_body and base_body both start with "class "
+    and differ → reparenting candidate.  Resolves bases from the head class line
+    against head_snapshot CodeSymbol entities (kind=class, qualname last-segment).
+    Reads each resolved base's body via _safe_resolve-guarded _read_body.
+    One hop, no recursion.  Returns "" when no enrichment is applicable.
+    """
+    head_lines = head_body.splitlines()
+    base_lines = base_body.splitlines()
+    if not head_lines or not base_lines:
+        return ""
+
+    head_first = head_lines[0].strip()
+    base_first = base_lines[0].strip()
+
+    if not head_first.startswith("class ") or not base_first.startswith("class "):
+        return ""
+    if head_first == base_first:
+        return ""
+
+    base_names = _extract_base_names_from_class_line(head_first)
+    if not base_names:
+        return ""
+
+    # Build a lookup: last qualname segment → list of CodeSymbol entities
+    # Restrict to same repo as the changed symbol.
+    identity = head_entity.get("identity") or {}
+    head_repo = str(identity.get("repo") or "")
+    candidate_entities: dict[str, list[JsonObject]] = {}
+    for entity in head_snapshot.entities:
+        if entity.get("kind") != "CodeSymbol":
+            continue
+        eid = entity.get("identity") or {}
+        if head_repo and str(eid.get("repo") or "") != head_repo:
+            continue
+        qname = str(eid.get("qualname") or "")
+        if not qname:
+            continue
+        last_seg = qname.rsplit(".", 1)[-1]
+        candidate_entities.setdefault(last_seg, []).append(entity)
+
+    sections: list[str] = []
+    resolved_count = 0
+    for base_name in base_names:
+        if resolved_count >= 2:
+            break
+        matches = candidate_entities.get(base_name, [])
+        if not matches:
+            continue
+        # Take the first match (deterministic; entities list order is stable within a build).
+        base_entity = matches[0]
+        bprops = base_entity.get("properties") or {}
+        bpath = str(bprops.get("path") or "")
+        if not bpath:
+            continue
+        bline_start = bprops.get("line")
+        bline_end = bprops.get("end_line")
+        body = _read_body(head_root, bpath, bline_start, bline_end)
+        if not body:
+            continue
+        body = body[:_BASE_BODY_CHAR_LIMIT]
+        bidentity = base_entity.get("identity") or {}
+        bqualname = str(bidentity.get("qualname") or base_name)
+        sections.append(f"Referenced base class (for context) — {bqualname}:\n{body}")
+        resolved_count += 1
+
+    if not sections:
+        return ""
+    return "\n\n" + "\n\n".join(sections)
 
 
 def _cluster_rank(
@@ -226,6 +335,7 @@ def semantic_contract_diff(
     rows: list[JsonObject] = []
     calls_attempted = 0
     calls_failed = 0
+    parse_miss_count = 0
     auth_error_seen = False
 
     for head_entity in ranked_differing:
@@ -242,11 +352,18 @@ def semantic_contract_diff(
         head_line_start = head_props.get("line")
         head_line_end = head_props.get("end_line")
 
+        base_context = _build_base_class_context(
+            head_body=head_body,
+            base_body=base_body,
+            head_snapshot=head_snapshot,
+            head_root=head_root,
+            head_entity=head_entity,
+        )
         prompt = _PROMPT_TEMPLATE.format(
             qualname=qualname,
             before=base_body,
             after=head_body,
-        )
+        ) + base_context
         calls_attempted += 1
         try:
             result = client.complete_json(prompt)
@@ -269,6 +386,7 @@ def semantic_contract_diff(
             continue
         # parse_miss: call completed but no valid JSON → not a failure, just no rows
         if result.kind == "parse_miss":
+            parse_miss_count += 1
             continue
 
         parsed = result.value
@@ -409,12 +527,27 @@ def semantic_contract_diff(
     # the failure kind so successful rows are never discarded.  "no_api_key" is
     # reserved for zero usable rows; detail "partial:auth" is surfaced when the
     # partial was caused by an auth-class failure.
+    #
+    # Parse-miss honesty: when all calls completed but none produced parseable JSON,
+    # surface "failed:all_responses_unparseable" rather than "active" (which would
+    # imply the mechanism ran cleanly).  Mixed (some rows produced, some parse-missed)
+    # stays "active" but the caller may surface the detail counts via quality-note.
+    parsed_ok = len(rows)  # rows accumulated only from successfully-parsed responses
+    all_parse_missed = (
+        calls_attempted > 0
+        and parsed_ok == 0
+        and calls_failed == 0
+        and parse_miss_count == calls_attempted
+    )
+
     if rows and calls_failed > 0:
         status = "partial:auth" if auth_error_seen else "partial"
     elif auth_error_seen:
         status = "no_api_key"
     elif calls_attempted > 0 and calls_failed == calls_attempted:
         status = "llm_error"
+    elif all_parse_missed:
+        status = "failed:all_responses_unparseable"
     else:
         status = "active"
 

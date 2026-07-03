@@ -99,13 +99,69 @@ class SemanticDiffLlmClient:
         return LlmResult.parsed(value)
 
 
+def _strip_markdown_fence(text: str) -> str:
+    """Strip markdown code fences (```json ... ``` or ``` ... ```) from text.
+
+    Uses str ops only. Returns text with the fence wrapper removed when found,
+    otherwise returns the original text unchanged.
+    """
+    stripped = text.strip()
+    # Match opening fence: ```json or ``` (with optional trailing whitespace)
+    for fence_open in ("```json", "```"):
+        if not stripped.startswith(fence_open):
+            continue
+        after_open = stripped[len(fence_open):]
+        # The character immediately after the fence tag must be whitespace or newline
+        if after_open and after_open[0] not in (" ", "\t", "\r", "\n"):
+            continue
+        # Find the closing ```
+        close_idx = after_open.rfind("```")
+        if close_idx == -1:
+            continue
+        return after_open[:close_idx].strip()
+    return text
+
+
+def _unwrap_single_key_object(value: Any) -> Any:
+    """If value is a dict with exactly one key whose value is a list, return that list.
+
+    Handles responses shaped like {"changes": [...]} or {"claims": [...]}.
+    Returns value unchanged if it is not a single-key dict wrapping a list.
+    """
+    if isinstance(value, dict) and len(value) == 1:
+        inner = next(iter(value.values()))
+        if isinstance(inner, list):
+            return inner
+    return value
+
+
 def _extract_json(text: str) -> Any:
-    """Find and parse the first JSON array/object in text using str ops (no regex)."""
+    """Find and parse the first JSON array/object in text using str ops (no regex).
+
+    Handles:
+      (a) markdown-fenced blocks (```json ... ``` or bare ```)
+      (b) top-level JSON object wrapping the array under a single key
+      (c) leading/trailing prose (bracket-scan with proper string/escape tracking)
+    """
+    # Step 1: try stripping markdown fence first
+    defenced = _strip_markdown_fence(text)
+    if defenced != text:
+        # Fence found — try parsing the defenced content directly
+        try:
+            parsed = json.loads(defenced)
+            return _unwrap_single_key_object(parsed)
+        except json.JSONDecodeError:
+            pass
+        # Fall through to bracket-scan on defenced content
+        text = defenced
+
+    # Step 2: bracket-scan for first JSON array or object
     for start_char, end_char in [("[", "]"), ("{", "}")]:
         start = text.find(start_char)
         if start == -1:
             continue
-        # Walk forward to find the matching close
+        # Walk forward to find the matching close; track string context to handle
+        # nested brackets inside string values correctly.
         depth = 0
         in_str = False
         escape_next = False
@@ -129,7 +185,8 @@ def _extract_json(text: str) -> Any:
                 if depth == 0:
                     candidate = text[start : i + 1]
                     try:
-                        return json.loads(candidate)
+                        parsed = json.loads(candidate)
+                        return _unwrap_single_key_object(parsed)
                     except json.JSONDecodeError:
                         break
     return None

@@ -922,5 +922,103 @@ class TestReviewContextContractDiffSplice(unittest.TestCase):
         self.assertNotIn("base_snapshot", rqs.get("reason", ""))
 
 
+# ---------------------------------------------------------------------------
+# Fix 5: deterministic_static derivation on spliced contract-diff rows
+# ---------------------------------------------------------------------------
+
+class TestContractDiffDerivation(unittest.TestCase):
+    """Fix 5: spliced guard/moved/test rows carry derivation='deterministic_static'."""
+
+    def _review_context(self, head: Path, extra: JsonObject) -> JsonObject:
+        from source.kg.product.mcp_tools import call_tool
+
+        args: JsonObject = {"repo": "svc", "changed_files": ["core.py"], **extra}
+        return call_tool(KgSnapshot(head), "review_context", args)
+
+    def test_spliced_rows_carry_deterministic_static_derivation(self) -> None:
+        """All spliced contract-diff rows must carry derivation='deterministic_static' (exact)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base, head = _build_two_commit_pair(Path(tmpdir))
+            result = self._review_context(head, {"base_snapshot": str(base)})
+
+        hyps = [h for h in result.get("review_hypotheses") or [] if isinstance(h, dict)]
+        contract_hyps = [h for h in hyps if h.get("risk_type") in _CONTRACT_DIFF_FAMILIES]
+        self.assertGreater(len(contract_hyps), 0, "fixture must produce >=1 contract-diff hypothesis")
+        for h in contract_hyps:
+            self.assertEqual(
+                h.get("derivation"), "deterministic_static",
+                f"contract-diff row must carry derivation='deterministic_static'; "
+                f"got {h.get('derivation')!r} for risk_type={h.get('risk_type')!r}",
+            )
+
+    def test_inversion_semantic_rows_are_inferred_llm(self) -> None:
+        """Inversion: semantic diff rows carry derivation='inferred_llm', not 'deterministic_static'."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+        from source.kg.integrations.semantic_llm import LlmResult
+
+        FAKE = [
+            {
+                "claim": "Guard removed.",
+                "cause_line": 2,
+                "consequence": "Callers may pass None.",
+                "negative_check": "No check.",
+                "category": "guard_removal",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            e = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": TENANT,
+                    "repo": "repo_inv_deriv",
+                    "module": "mod.h",
+                    "qualname": "inv_func",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "h.py", "line": 1, "end_line": 3},
+            )
+            snap_dir = root / "snap_inv"
+            JsonlKgStore(snap_dir).write(
+                entities=[e], facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            base_dir = root / "base_inv"
+            base_dir.mkdir()
+            (base_dir / "h.py").write_text("def inv_func():\n    if x: raise\n    return 1\n")
+            head_dir = root / "head_inv"
+            head_dir.mkdir()
+            (head_dir / "h.py").write_text("def inv_func():\n    return 1\n")
+
+            class _FixedClient:
+                def complete_json(self, prompt: str) -> LlmResult:
+                    return LlmResult.parsed(FAKE)
+
+            rows, _ = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=_FixedClient(),
+            )
+            self.assertGreater(len(rows), 0, "semantic diff must produce >=1 row")
+            for row in rows:
+                self.assertEqual(
+                    row.get("derivation"), "inferred_llm",
+                    f"semantic diff row must carry derivation='inferred_llm'; got {row.get('derivation')!r}",
+                )
+                self.assertNotEqual(
+                    row.get("derivation"), "deterministic_static",
+                    "semantic diff row must NOT carry 'deterministic_static'",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
