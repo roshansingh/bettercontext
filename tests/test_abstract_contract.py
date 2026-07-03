@@ -13,6 +13,10 @@ Cases:
   * negative_concrete— new base is NOT abstract → no row
   * negative_same    — base list unchanged → no row
   * ambiguity        — two same-named base candidates, bare name → skip, no row
+  * mro_all          — mixin implements ALL abstract members → no row
+  * mro_some         — mixin implements SOME → row lists only the remainder
+  * mro_unresolvable — an unresolvable second base → suppress (fail closed)
+  * leaf_collision   — same-leaf nested classes disambiguated by line / fail closed
 """
 from __future__ import annotations
 
@@ -50,6 +54,21 @@ _CONCRETE_BASE = (
     "class Concrete:\n"
     "    def evaluate(self):\n"
     "        return 1\n"
+)
+
+# Mixin that CONCRETELY implements BOTH abstract members of BaseThing.
+_FULL_MIXIN = (
+    "class FullMixin:\n"
+    "    counter_names = ('a',)\n"
+    "    def build_it(self, x):\n"
+    "        return x\n"
+)
+
+# Mixin that concretely implements only ONE abstract member (build_it).
+_PARTIAL_MIXIN = (
+    "class PartialMixin:\n"
+    "    def build_it(self, x):\n"
+    "        return x\n"
 )
 
 
@@ -280,6 +299,127 @@ class TestAbstractContractNegatives(unittest.TestCase):
             result = _review_context(out_base, out_head, base_pkg, head_pkg)
             rows = _abstract_rows(result)
             self.assertEqual(rows, [], f"ambiguous bare base name → fail-closed skip; got {rows}")
+
+
+class TestAbstractContractMro(unittest.TestCase):
+    """Multiple-inheritance / MRO: mixins can satisfy the abstract contract."""
+
+    def _run(self, base_core: str, head_core: str) -> list[JsonObject]:
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            out_base, out_head, base_ck, head_ck = _build_pair(tmpdir, base_core, head_core)
+            result = _review_context(out_base, out_head, base_ck, head_ck)
+            return _abstract_rows(result)
+
+    def test_mixin_implements_all_abstract_members_no_row(self) -> None:
+        """Widget(FullMixin, BaseThing) with an empty body → mixin satisfies contract → NO row.
+
+        Inversion vs the positive case: the ONLY difference is the FullMixin base
+        supplying counter_names + build_it via the MRO. Without the MRO subtraction the
+        detector would flag this instantiable class high-confidence (the false positive).
+        """
+        base_core = _ABSTRACT_BASE + _FULL_MIXIN + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _FULL_MIXIN + _CONCRETE_BASE + (
+            "\n\nclass Widget(FullMixin, BaseThing):\n"
+            "    pass\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(rows, [], f"mixin implements all abstract members → no row; got {rows}")
+
+    def test_mixin_implements_some_row_lists_only_remainder(self) -> None:
+        """Widget(PartialMixin, BaseThing): mixin supplies build_it only → row names ONLY counter_names."""
+        base_core = _ABSTRACT_BASE + _PARTIAL_MIXIN + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _PARTIAL_MIXIN + _CONCRETE_BASE + (
+            "\n\nclass Widget(PartialMixin, BaseThing):\n"
+            "    pass\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(len(rows), 1, f"partial mixin → exactly one row; got {rows}")
+        claim = str(rows[0].get("postable_claim") or "")
+        self.assertIn("counter_names", claim, f"claim must name counter_names; got {claim!r}")
+        self.assertNotIn(
+            "build_it", claim,
+            f"build_it is supplied by the mixin and must NOT be claimed unimplemented; got {claim!r}",
+        )
+
+    def test_unresolvable_second_base_suppresses_row(self) -> None:
+        """Widget(Unknown, BaseThing) where Unknown is not a KG class → SUPPRESS (fail closed).
+
+        Unknown is a name with no resolvable class entity (an external/unparseable base
+        could supply the abstract members), so a high-confidence deterministic row must
+        not survive. Inversion: the same fixture WITHOUT the Unknown base is the positive
+        case and emits a row.
+        """
+        base_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(Unknown, BaseThing):\n"
+            "    pass\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(rows, [], f"unresolvable second base → suppress row; got {rows}")
+
+
+class TestClassDefLeafCollision(unittest.TestCase):
+    """_class_def_in_source must disambiguate same-leaf nested classes (finding P2)."""
+
+    def test_line_anchor_selects_correct_nested_class(self) -> None:
+        from source.kg.query.abstract_contract import (
+            _base_names,
+            _class_def_in_source,
+        )
+
+        source = (
+            "class OuterA:\n"
+            "    class Widget(Alpha):\n"
+            "        pass\n"
+            "\n"
+            "class OuterB:\n"
+            "    class Widget(Beta):\n"
+            "        pass\n"
+        )
+        # OuterB.Widget's class-def line is 6 (1-indexed).
+        node = _class_def_in_source(source, "OuterB.Widget", line=6)
+        self.assertIsNotNone(node, "line anchor must resolve the OuterB.Widget class")
+        self.assertEqual(
+            _base_names(node), ["Beta"],
+            "line-6 anchor must select the OuterB.Widget body (base Beta), not OuterA's",
+        )
+        # Inversion: the OuterA.Widget anchor (line 2) selects the OTHER body.
+        node_a = _class_def_in_source(source, "OuterA.Widget", line=2)
+        self.assertEqual(
+            _base_names(node_a), ["Alpha"],
+            "line-2 anchor must select the OuterA.Widget body (base Alpha)",
+        )
+
+    def test_duplicate_leaf_no_anchor_returns_none(self) -> None:
+        from source.kg.query.abstract_contract import _class_def_in_source
+
+        source = (
+            "class OuterA:\n"
+            "    class Widget:\n"
+            "        pass\n"
+            "\n"
+            "class OuterB:\n"
+            "    class Widget:\n"
+            "        pass\n"
+        )
+        # Bare leaf, no line, no nesting path → 2 candidates → fail closed.
+        self.assertIsNone(
+            _class_def_in_source(source, "Widget"),
+            "ambiguous duplicate leaf with no anchor must return None (fail closed)",
+        )
 
 
 if __name__ == "__main__":

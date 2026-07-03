@@ -3574,6 +3574,55 @@ class TestSemanticDiffStats(unittest.TestCase):
             "semantic_diff_stats content must be unchanged after budget sync",
         )
 
+    def test_abstract_contract_status_survives_budget_sync(self) -> None:
+        """abstract_contract_status must survive _sync_review_quality_status_from_packet.
+
+        Mirrors test_stats_survive_budget_sync. Inversion: the sync rebuilds
+        review_quality_status from scratch and only restores an allowlisted set of
+        keys; with abstract_contract_status absent from that allowlist the field is
+        dropped. This test asserts it is preserved end-to-end.
+        """
+        from source.kg.product import output_budget as ob
+
+        result = {
+            "review_quality_status": {
+                "coverage_status": "partial",
+                "specific_hypothesis_count": 1,
+                "generic_hypothesis_count": 0,
+                "specificity": "high",
+                "recommended_action": "use_supercontext_packet",
+                "reason": "Test packet.",
+                "review_readiness": "packet_ready",
+                "abstract_contract_status": "active",
+            },
+            "review_hypotheses": [
+                {
+                    "hypothesis_id": "hyp-abs-001",
+                    "risk_type": "abstract_contract_unimplemented",
+                    "specificity": "high",
+                    "derivation": "deterministic_static",
+                }
+            ],
+        }
+
+        # Inversion: verify status is present BEFORE sync (set up correctly).
+        self.assertIn(
+            "abstract_contract_status", result["review_quality_status"],
+            "abstract_contract_status must be present before sync (test setup check)",
+        )
+
+        ob._sync_review_quality_status_from_packet(result, result["review_hypotheses"])
+
+        synced_rqs = result["review_quality_status"]
+        self.assertIn(
+            "abstract_contract_status", synced_rqs,
+            f"abstract_contract_status must survive budget sync; keys={list(synced_rqs.keys())}",
+        )
+        self.assertEqual(
+            synced_rqs["abstract_contract_status"], "active",
+            "abstract_contract_status content must be unchanged after budget sync",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

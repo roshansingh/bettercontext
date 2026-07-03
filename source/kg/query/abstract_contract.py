@@ -25,9 +25,14 @@ Mechanism (pure ``ast`` + KG structure; NO regex, NO name/keyword lists):
      ``@property`` + ``@abstractmethod``). Collect the required abstract member
      names (functions + properties).
   5. ``unimplemented`` = abstract members with no same-name def/assignment in the
-     changed subclass body. Emit a row ONLY when ``unimplemented`` is non-empty.
-     An empty subclass body (only ``pass``/``...``/docstring) is a strengthening
-     signal included in the claim.
+     changed subclass body AND not concretely supplied by any OTHER base in the MRO.
+     Every other head base (mixin or concrete parent) is resolved + parsed; its
+     concrete members (def/assign not decorated abstractmethod) are subtracted. If
+     ANY other base cannot be resolved or parsed, the row is SUPPRESSED — an unseen
+     base could satisfy the contract, so a high-confidence claim must not survive that
+     uncertainty. Single-base reparenting (no other bases) is never suppressed. Emit a
+     row ONLY when ``unimplemented`` is non-empty. An empty subclass body (only
+     ``pass``/``...``/docstring) is a strengthening signal included in the claim.
   6. Best-effort instantiation evidence: scan head-snapshot CALLS facts whose
      callee is the subclass symbol; if found, the first referencing coordinate is
      included in ``consequence``. Absence does not suppress the row — the ABC
@@ -73,23 +78,88 @@ class _DetectStats:
     non_python_skipped: int = 0
     parse_failures: int = 0
     reparent_triggers: int = 0
+    mro_suppressed: int = 0
     rows_emitted: int = 0
 
 
-def _class_def_in_source(source: str, class_name: str) -> ast.ClassDef | None:
-    """Parse *source* and return the top-level (or nested) ClassDef named *class_name*.
+def _class_defs_by_leaf(tree: ast.Module, leaf: str) -> list[ast.ClassDef]:
+    """All ClassDef nodes in *tree* whose own name equals *leaf* (any nesting depth)."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == leaf
+    ]
 
-    Matches on the last qualname segment so ``pkg.mod.Widget`` finds ``Widget``.
+
+def _class_def_matches_nesting(tree: ast.Module, segments: list[str]) -> ast.ClassDef | None:
+    """Walk *tree* following *segments* (outer→inner class names), returning the leaf ClassDef.
+
+    Only ClassDef bodies are descended, so ``segments == ["Outer", "Widget"]`` matches
+    ``class Outer: class Widget: ...`` and not a top-level ``Widget``. Returns None when
+    the full path is not present.
+    """
+    body: list[ast.stmt] = list(tree.body)
+    node: ast.ClassDef | None = None
+    for seg in segments:
+        node = next(
+            (s for s in body if isinstance(s, ast.ClassDef) and s.name == seg),
+            None,
+        )
+        if node is None:
+            return None
+        body = list(node.body)
+    return node
+
+
+def _class_def_in_source(
+    source: str,
+    class_name: str,
+    *,
+    line: int | None = None,
+) -> ast.ClassDef | None:
+    """Parse *source* and return the ClassDef identified by *class_name* (fail-closed).
+
+    *class_name* is a qualname whose last dotted segment is the class's own name; the
+    remaining segments (if any) form its nesting path. Disambiguation, in order:
+      1. Single leaf-name match → return it.
+      2. Multiple matches + *line* anchor → the candidate whose ``lineno`` matches, else
+         the nearest ClassDef starting at or before *line* (innermost containing def).
+      3. Multiple matches + no usable line anchor → full nesting-path match against the
+         qualname segments (e.g. ``Outer.Widget``).
+      4. Still ambiguous (2+ candidates, no anchor resolves) → None (fail closed).
     Returns None when the source does not parse or the class is absent.
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None
-    target = class_name.rsplit(".", 1)[-1]
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == target:
-            return node
+
+    segments = [s for s in class_name.split(".") if s]
+    leaf = segments[-1] if segments else class_name
+    candidates = _class_defs_by_leaf(tree, leaf)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Ambiguous leaf name: prefer the KG line anchor.
+    if line is not None:
+        exact = [c for c in candidates if c.lineno == line]
+        if len(exact) == 1:
+            return exact[0]
+        containing = [c for c in candidates if c.lineno <= line]
+        if containing:
+            nearest = max(containing, key=lambda c: c.lineno)
+            if sum(1 for c in containing if c.lineno == nearest.lineno) == 1:
+                return nearest
+
+    # No usable line anchor: try the full nesting path from the qualname.
+    if len(segments) > 1:
+        matched = _class_def_matches_nesting(tree, segments)
+        if matched is not None:
+            return matched
+
+    # 2+ candidates and nothing disambiguates → fail closed.
     return None
 
 
@@ -184,6 +254,26 @@ def _defined_member_names(class_def: ast.ClassDef) -> set[str]:
     return names
 
 
+def _concrete_member_names(class_def: ast.ClassDef) -> set[str]:
+    """Names CONCRETELY defined in a base body (def/assign NOT decorated abstractmethod).
+
+    A concrete def or an assignment satisfies an abstract member of the same name via
+    the MRO. abstractmethod-decorated defs do NOT count — they re-declare, not satisfy.
+    """
+    names: set[str] = set()
+    for stmt in class_def.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not _has_abstractmethod_decorator(stmt):
+                names.add(stmt.name)
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            names.add(stmt.target.id)
+    return names
+
+
 def _body_is_empty(class_def: ast.ClassDef) -> bool:
     """True when the class body is only ``pass``/``...``/a docstring (no real members)."""
     for stmt in class_def.body:
@@ -257,19 +347,46 @@ def _abstract_base_from_entity(
     source = _read_full_source(head_root, bpath)
     if source is None:
         return None
-    class_def = _class_def_in_source(source, qualname)
+    raw_line = props.get("line")
+    class_def = _class_def_in_source(
+        source, qualname, line=int(raw_line) if raw_line is not None else None
+    )
     if class_def is None:
         return None
     is_abstract, required = _base_is_abstract_and_members(class_def)
     if not is_abstract or not required:
         return None
-    line = props.get("line")
+    line = raw_line
     return _AbstractBase(
         qualname=qualname,
         path=bpath,
         line=int(line) if line is not None else None,
         required_members=required,
     )
+
+
+def _concrete_members_from_entity(base_entity: JsonObject, head_root: Path) -> set[str] | None:
+    """Concrete member names supplied by a resolved base, or None if it cannot be parsed.
+
+    None signals uncertainty: an unreadable file, unsafe path, or class body that does
+    not parse could supply implementations we cannot see, so the caller must fail closed.
+    """
+    identity = base_entity.get("identity") or {}
+    props = base_entity.get("properties") or {}
+    bpath = str(props.get("path") or "")
+    if not bpath:
+        return None
+    qualname = str(identity.get("qualname") or "")
+    source = _read_full_source(head_root, bpath)
+    if source is None:
+        return None
+    raw_line = props.get("line")
+    class_def = _class_def_in_source(
+        source, qualname, line=int(raw_line) if raw_line is not None else None
+    )
+    if class_def is None:
+        return None
+    return _concrete_member_names(class_def)
 
 
 def _read_full_source(root: Path, path: str) -> str | None:
@@ -380,7 +497,12 @@ def abstract_contract_diff(
         if head_source is None or base_source is None:
             continue
 
-        head_class = _class_def_in_source(head_source, qualname)
+        raw_line = props.get("line")
+        head_line = int(raw_line) if raw_line is not None else None
+        # head_line is the head-snapshot coordinate; only anchor the head lookup with
+        # it. The base checkout may place the same qualname on a different line, so the
+        # base lookup relies on leaf uniqueness / nesting-path disambiguation.
+        head_class = _class_def_in_source(head_source, qualname, line=head_line)
         base_class = _class_def_in_source(base_source, qualname)
         if head_class is None or base_class is None:
             # Class absent on one side (new/deleted) → not a reparent of an
@@ -411,7 +533,32 @@ def abstract_contract_diff(
             if abstract_base is None:
                 continue
 
-            unimplemented = tuple(m for m in abstract_base.required_members if m not in defined)
+            # MRO fail-closed: any OTHER base (mixin or concrete parent) can supply the
+            # abstract members via the MRO. Resolve every other head base and subtract its
+            # concrete members. If ANY other base cannot be resolved or parsed, an
+            # unseen implementation could exist — suppress the row entirely.
+            other_bases = [b for b in head_bases if b != base_name]
+            mro_supplied: set[str] = set()
+            suppressed = False
+            for other_name in other_bases:
+                other_entity = _resolve_base_entity(other_name, head_snapshot, subclass_repo)
+                if other_entity is None:
+                    suppressed = True
+                    break
+                concrete = _concrete_members_from_entity(other_entity, head_root)
+                if concrete is None:
+                    suppressed = True
+                    break
+                mro_supplied |= concrete
+            if suppressed:
+                stats.mro_suppressed += 1
+                continue
+
+            unimplemented = tuple(
+                m
+                for m in abstract_base.required_members
+                if m not in defined and m not in mro_supplied
+            )
             if not unimplemented:
                 continue
 

@@ -4327,6 +4327,7 @@ def _sync_review_quality_status_from_packet(
         "suggested_followups",
         "semantic_diff_status",
         "semantic_diff_stats",
+        "abstract_contract_status",
     ):
         if _s1_key in status:
             synced[_s1_key] = status[_s1_key]
