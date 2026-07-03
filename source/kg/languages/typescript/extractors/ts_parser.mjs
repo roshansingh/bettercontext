@@ -2944,10 +2944,16 @@ function collectSymbols(sourceFile) {
 }
 
 function collectCallsForSymbol(sourceFile, symbol) {
+  // Prune subtrees that do not overlap the symbol range, but keep descending
+  // through containers that extend beyond it (e.g. the VariableStatement
+  // wrapping `export const fn = async () => {...}` starts before the
+  // VariableDeclaration that defines the symbol range).  The previous guard
+  // (node.pos < symbol.pos || node.end > symbol.end) pruned those containers
+  // outright, so variable-declared functions never produced any calls.
   const calls = [];
   function visit(node) {
-    if (node !== sourceFile && (node.pos < symbol.pos || node.end > symbol.end)) return;
-    if (ts.isCallExpression(node)) {
+    if (node !== sourceFile && (node.end <= symbol.pos || node.pos >= symbol.end)) return;
+    if (ts.isCallExpression(node) && node.pos >= symbol.pos && node.end <= symbol.end) {
       const name = callName(node.expression, sourceFile);
       if (name) {
         calls.push({ name, line: lineOf(sourceFile, node.expression.getStart(sourceFile)) });
