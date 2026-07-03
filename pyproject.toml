@@ -50,6 +50,7 @@ supercontext-judge-ab-quality = "source.scripts.judge_ab_quality:main"
 supercontext-run-validation = "source.scripts.run_product_validation:main"
 supercontext-coverage-metrics = "source.scripts.coverage_metrics:main"
 supercontext-coverage-report = "source.scripts.coverage_report:main"
+supercontext-diff-kg = "source.scripts.diff_kg:main"
 
 [tool.setuptools.packages.find]
 include = ["source*"]
