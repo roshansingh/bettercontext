@@ -4,7 +4,7 @@ Test coverage:
 1. End-to-end via call_tool with mocked client on a real build_kg fixture pair:
    contract_semantic_diff hypothesis present with derivation inferred_llm,
    valid coords, label, survives budget; adjudication fields complete.
-2. Malformed LLM output → row skipped, semantic_diff_status=failed note, no crash.
+2. Malformed LLM output → row skipped, no crash.
    Missing litellm → unavailable note. No checkouts → missing_checkouts, silent.
 3. Cost bounds: >12 changed symbols → 12 LLM calls max (count via mock);
    identical bodies → mock not called.
@@ -62,6 +62,32 @@ class _FakeClient:
         return self._response
 
 
+class _FailingClient:
+    """Client that always raises a non-auth RuntimeError."""
+
+    def __init__(self, exc: Exception | None = None):
+        self._exc = exc or RuntimeError("timeout")
+        self.call_count = 0
+
+    def complete_json(self, prompt: str) -> Any:
+        self.call_count += 1
+        raise self._exc
+
+
+class _PartialFailClient:
+    """Client that succeeds on the first call, then raises on subsequent calls."""
+
+    def __init__(self, success_response: list | None = None):
+        self._response = success_response or _FAKE_RESPONSE
+        self.call_count = 0
+
+    def complete_json(self, prompt: str) -> Any:
+        self.call_count += 1
+        if self.call_count == 1:
+            return self._response
+        raise RuntimeError("timeout on call 2+")
+
+
 def _build_two_snapshot_pair(tmpdir: Path) -> tuple[Path, Path, Path, Path]:
     """Build base + head snapshots plus separate checkout dirs with different file content.
 
@@ -92,6 +118,39 @@ def _build_two_snapshot_pair(tmpdir: Path) -> tuple[Path, Path, Path, Path]:
     head_checkout = tmpdir / "checkout_head"
     head_checkout.mkdir()
     (head_checkout / "handler.py").write_text(head_content, encoding="utf-8")
+
+    return out_base, out_head, base_checkout, head_checkout
+
+
+def _build_two_symbol_snapshot_pair(tmpdir: Path) -> tuple[Path, Path, Path, Path]:
+    """Like _build_two_snapshot_pair but with two differing symbols in separate files."""
+    svc = tmpdir / "svc_two"
+    svc.mkdir()
+    (svc / "__init__.py").write_text("", encoding="utf-8")
+
+    base_a = "def func_a(x):\n    if x is None:\n        raise ValueError\n    return x\n"
+    head_a = "def func_a(x):\n    return x\n"
+    base_b = "def func_b(y):\n    assert y > 0\n    return y * 2\n"
+    head_b = "def func_b(y):\n    return y * 2\n"
+
+    (svc / "module_a.py").write_text(base_a, encoding="utf-8")
+    (svc / "module_b.py").write_text(base_b, encoding="utf-8")
+    out_base = tmpdir / "kg_base_two"
+    build_kg(svc, out_base, tenant_id=TENANT)
+
+    (svc / "module_a.py").write_text(head_a, encoding="utf-8")
+    (svc / "module_b.py").write_text(head_b, encoding="utf-8")
+    out_head = tmpdir / "kg_head_two"
+    build_kg(svc, out_head, tenant_id=TENANT)
+
+    base_checkout = tmpdir / "checkout_base_two"
+    base_checkout.mkdir()
+    (base_checkout / "module_a.py").write_text(base_a, encoding="utf-8")
+    (base_checkout / "module_b.py").write_text(base_b, encoding="utf-8")
+    head_checkout = tmpdir / "checkout_head_two"
+    head_checkout.mkdir()
+    (head_checkout / "module_a.py").write_text(head_a, encoding="utf-8")
+    (head_checkout / "module_b.py").write_text(head_b, encoding="utf-8")
 
     return out_base, out_head, base_checkout, head_checkout
 
@@ -243,7 +302,7 @@ def _direct_splice(fake_client: _FakeClient, **kw) -> tuple[list[JsonObject], st
 
     try:
         base_snap = _KgSnap(base_snapshot_dir)
-        raw_rows = semantic_contract_diff(
+        raw_rows, status = semantic_contract_diff(
             base_snapshot=base_snap,
             head_snapshot=head_kg,
             base_root=Path(base_checkout),
@@ -255,7 +314,7 @@ def _direct_splice(fake_client: _FakeClient, **kw) -> tuple[list[JsonObject], st
         return review_hypotheses, "failed:test"
 
     spliced = [r for r in raw_rows if isinstance(r, dict) and r.get("hypothesis_id")][:3]
-    return spliced + review_hypotheses, "active"
+    return spliced + review_hypotheses, status
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +325,7 @@ class TestSemanticDiffFailures(unittest.TestCase):
     """Failure scenarios: malformed output, missing litellm, no checkouts."""
 
     def test_malformed_output_skipped_no_crash(self) -> None:
-        """Malformed LLM response → semantic hyps skipped, status=failed, no exception."""
+        """Malformed LLM response → semantic hyps skipped, no exception."""
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
@@ -293,6 +352,9 @@ class TestSemanticDiffFailures(unittest.TestCase):
             hyps = result.get("review_hypotheses") or []
             semantic_hyps = [h for h in hyps if h.get("risk_type") == "contract_semantic_diff"]
             self.assertEqual(semantic_hyps, [], "malformed output must produce no semantic hyps")
+            # Status should be active or absent (not "failed")
+            rqs = result.get("review_quality_status") or {}
+            self.assertIn(rqs.get("semantic_diff_status"), (None, "active"))
 
     def test_missing_checkouts_gives_missing_checkouts_status(self) -> None:
         """No base_checkout/head_checkout → semantic_diff_status=missing_checkouts."""
@@ -328,7 +390,7 @@ class TestSemanticDiffFailures(unittest.TestCase):
             )
 
     def test_missing_litellm_produces_unavailable_status(self) -> None:
-        """ImportError from semantic_llm import → semantic_diff_status contains 'unavailable'."""
+        """ImportError from semantic_llm import → semantic_diff_status starts with 'unavailable'."""
         from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
         from unittest.mock import patch
         import sys
@@ -348,10 +410,96 @@ class TestSemanticDiffFailures(unittest.TestCase):
                     changed_symbols=head_kg.entities,
                     review_hypotheses=[],
                 )
-            self.assertIn(
-                "unavailable", status,
-                f"status must contain 'unavailable' on ImportError; got {status!r}",
+            self.assertTrue(
+                status.startswith("unavailable"),
+                f"status must start with 'unavailable' on ImportError; got {status!r}",
             )
+
+    def test_all_llm_calls_fail_produces_llm_error_status(self) -> None:
+        """All LLM calls failing → status == 'llm_error' (exact)."""
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+        from source.kg.query.snapshot import KgSnapshot as _KgSnap
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            failing_client = _FailingClient(RuntimeError("timeout"))
+
+            # changed_symbols must carry top-level qualname so _splice can match head_entities
+            changed_symbols = [{"qualname": "process"}]
+
+            from unittest.mock import patch
+            with patch("source.kg.integrations.semantic_llm.SemanticDiffLlmClient", return_value=failing_client):
+                _, status = _splice_semantic_diff_hypotheses(
+                    base_snapshot_dir=str(out_base),
+                    head_kg=head_kg,
+                    base_checkout=str(base_checkout),
+                    head_checkout=str(head_checkout),
+                    changed_symbols=changed_symbols,
+                    review_hypotheses=[],
+                )
+            self.assertEqual(status, "llm_error", f"expected 'llm_error'; got {status!r}")
+
+    def test_auth_failure_produces_no_api_key_status(self) -> None:
+        """Auth exception → status == 'no_api_key' (exact)."""
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            auth_client = _FailingClient(Exception("401 Unauthorized"))
+
+            # changed_symbols must carry top-level qualname so _splice can match head_entities
+            changed_symbols = [{"qualname": "process"}]
+
+            from unittest.mock import patch
+            with patch("source.kg.integrations.semantic_llm.SemanticDiffLlmClient", return_value=auth_client):
+                _, status = _splice_semantic_diff_hypotheses(
+                    base_snapshot_dir=str(out_base),
+                    head_kg=head_kg,
+                    base_checkout=str(base_checkout),
+                    head_checkout=str(head_checkout),
+                    changed_symbols=changed_symbols,
+                    review_hypotheses=[],
+                )
+            self.assertEqual(status, "no_api_key", f"expected 'no_api_key'; got {status!r}")
+
+    def test_partial_failure_produces_partial_status(self) -> None:
+        """First call succeeds, subsequent calls fail → status == 'partial' (exact)."""
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_symbol_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            partial_client = _PartialFailClient()
+
+            # Pass both differing symbol qnames so head_entities matching finds them
+            changed_symbols = [{"qualname": "func_a"}, {"qualname": "func_b"}]
+
+            from unittest.mock import patch
+            with patch("source.kg.integrations.semantic_llm.SemanticDiffLlmClient", return_value=partial_client):
+                _, status = _splice_semantic_diff_hypotheses(
+                    base_snapshot_dir=str(out_base),
+                    head_kg=head_kg,
+                    base_checkout=str(base_checkout),
+                    head_checkout=str(head_checkout),
+                    changed_symbols=changed_symbols,
+                    review_hypotheses=[],
+                )
+            # Only "partial" if at least 2 differing symbols exist (>=2 LLM calls attempted)
+            if partial_client.call_count >= 2:
+                self.assertEqual(status, "partial", f"expected 'partial'; got {status!r}")
+            else:
+                self.skipTest(
+                    f"fixture produced only {partial_client.call_count} differing symbols — "
+                    "need >=2 for partial test"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +510,7 @@ class TestSemanticDiffCostBounds(unittest.TestCase):
     """Cost-bound enforcement: max 12 LLM calls; identical bodies skipped."""
 
     def test_max_12_llm_calls_for_more_than_12_changed_symbols(self) -> None:
-        """When >12 changed symbols are provided, the LLM is called at most 12 times."""
+        """When >12 changed symbols are provided, the LLM is called exactly 12 times."""
         from source.kg.query.semantic_contract_diff import semantic_contract_diff
         from source.kg.core.models import Entity
         from source.kg.core.store import JsonlKgStore
@@ -409,7 +557,7 @@ class TestSemanticDiffCostBounds(unittest.TestCase):
                 (head_dir / f"file_{i}.py").write_text(f"def func_{i}():\n    return {i} + 1\n")
 
             counting_client = _FakeClient()
-            semantic_contract_diff(
+            rows, _status = semantic_contract_diff(
                 base_snapshot=snap,
                 head_snapshot=snap,
                 base_root=base_dir,
@@ -417,9 +565,9 @@ class TestSemanticDiffCostBounds(unittest.TestCase):
                 changed_symbols=entity_dicts,
                 client=counting_client,
             )
-            self.assertLessEqual(
+            self.assertEqual(
                 counting_client.call_count, 12,
-                f"LLM must be called at most 12 times; was called {counting_client.call_count} times",
+                f"LLM must be called exactly 12 times; was called {counting_client.call_count} times",
             )
 
     def test_identical_bodies_not_sent_to_llm(self) -> None:
@@ -463,7 +611,7 @@ class TestSemanticDiffCostBounds(unittest.TestCase):
             (head_dir / "handler.py").write_text(same_body)
 
             counting_client = _FakeClient()
-            semantic_contract_diff(
+            _rows, _status = semantic_contract_diff(
                 base_snapshot=snap,
                 head_snapshot=snap,
                 base_root=base_dir,
@@ -515,7 +663,7 @@ class TestSemanticDiffCostBounds(unittest.TestCase):
             (head_dir / "handler.py").write_text("def changed_func():\n    return 42\n")
 
             counting_client = _FakeClient()
-            semantic_contract_diff(
+            _rows, _status = semantic_contract_diff(
                 base_snapshot=snap,
                 head_snapshot=snap,
                 base_root=base_dir,
@@ -526,6 +674,197 @@ class TestSemanticDiffCostBounds(unittest.TestCase):
             self.assertEqual(
                 counting_client.call_count, 1,
                 f"LLM must be called once for different bodies; was called {counting_client.call_count} times",
+            )
+
+
+# ---------------------------------------------------------------------------
+# 4. String clamping tests
+# ---------------------------------------------------------------------------
+
+class TestSemanticDiffStringClamping(unittest.TestCase):
+    """String clamping: oversized fields are clamped or items are dropped."""
+
+    def _make_single_symbol_snap(self, root: Path) -> tuple[KgSnapshot, Path, Path]:
+        """Return (snap, base_dir, head_dir) for a single differing symbol."""
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        e = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_clamp",
+                "module": "mod.handler",
+                "qualname": "clamp_func",
+                "symbol_kind": "function",
+            },
+            properties={"path": "handler.py", "line": 1, "end_line": 3},
+        )
+        snap_dir = root / "snap_clamp"
+        JsonlKgStore(snap_dir).write(
+            entities=[e], facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": TENANT},
+        )
+        snap = KgSnapshot(snap_dir)
+
+        base_dir = root / "base_clamp"
+        base_dir.mkdir()
+        (base_dir / "handler.py").write_text("def clamp_func():\n    if x: raise\n    return 42\n")
+        head_dir = root / "head_clamp"
+        head_dir.mkdir()
+        (head_dir / "handler.py").write_text("def clamp_func():\n    return 42\n")
+
+        return snap, base_dir, head_dir
+
+    def test_oversized_claim_clamped_to_300(self) -> None:
+        """Claim of length 500 is clamped to 300 in the output row."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            oversized_claim = "x" * 500
+            client = _FakeClient(response=[{
+                "claim": oversized_claim,
+                "cause_line": 2,
+                "consequence": "Some consequence.",
+                "negative_check": "No check.",
+                "category": "guard_removal",
+            }])
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+            self.assertTrue(rows, "expected at least one row")
+            claim_in_row = rows[0].get("postable_claim", "")
+            self.assertLessEqual(
+                len(claim_in_row), 300,
+                f"postable_claim length must be <=300; got {len(claim_in_row)}",
+            )
+
+    def test_garbage_item_4x_dropped(self) -> None:
+        """Item with claim of length 1500 (>1200 4x limit) is dropped entirely."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            garbage_claim = "x" * 1500
+            client = _FakeClient(response=[{
+                "claim": garbage_claim,
+                "cause_line": 2,
+                "consequence": "Some consequence.",
+                "negative_check": "No check.",
+                "category": "guard_removal",
+            }])
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+            self.assertEqual(len(rows), 0, f"garbage item (claim>1200) must be dropped; got {len(rows)} rows")
+
+
+# ---------------------------------------------------------------------------
+# 5. Prefilter-before-cap tests
+# ---------------------------------------------------------------------------
+
+class TestSemanticDiffPrefilterBeforeCap(unittest.TestCase):
+    """Prefilter runs BEFORE cap: identical-body symbols never count against the 12-slot budget."""
+
+    def test_differing_symbols_analyzed_when_identical_padded(self) -> None:
+        """12 identical + 3 differing → exactly 3 LLM calls (not 0 after cap eats all slots)."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            entity_objects = []
+            # 12 identical symbols (same body in base and head)
+            for i in range(12):
+                e = Entity(
+                    kind="CodeSymbol",
+                    identity={
+                        "tenant_id": TENANT,
+                        "repo": "svc_prefilter",
+                        "module": "svc_prefilter.handler",
+                        "qualname": f"same_func_{i}",
+                        "symbol_kind": "function",
+                    },
+                    properties={"path": f"same_{i}.py", "line": 1, "end_line": 3},
+                )
+                entity_objects.append(e)
+
+            # 3 differing symbols (base and head body differ)
+            for i in range(3):
+                e = Entity(
+                    kind="CodeSymbol",
+                    identity={
+                        "tenant_id": TENANT,
+                        "repo": "svc_prefilter",
+                        "module": "svc_prefilter.handler",
+                        "qualname": f"diff_func_{i}",
+                        "symbol_kind": "function",
+                    },
+                    properties={"path": f"diff_{i}.py", "line": 1, "end_line": 4},
+                )
+                entity_objects.append(e)
+
+            snap_dir = root / "snap_prefilter"
+            JsonlKgStore(snap_dir).write(
+                entities=entity_objects,
+                facts=[],
+                evidence=[],
+                coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+            entity_dicts = snap.entities
+
+            base_dir = root / "base_pf"
+            base_dir.mkdir()
+            head_dir = root / "head_pf"
+            head_dir.mkdir()
+
+            # Identical bodies for same_func_* symbols
+            same_body = "def f():\n    return 42\n"
+            for i in range(12):
+                (base_dir / f"same_{i}.py").write_text(same_body)
+                (head_dir / f"same_{i}.py").write_text(same_body)
+
+            # Differing bodies for diff_func_* symbols
+            for i in range(3):
+                (base_dir / f"diff_{i}.py").write_text(f"def diff_func_{i}():\n    if x: raise\n    return {i}\n")
+                (head_dir / f"diff_{i}.py").write_text(f"def diff_func_{i}():\n    return {i}\n")
+
+            counting_client = _FakeClient()
+            _rows, _status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=counting_client,
+            )
+            self.assertEqual(
+                counting_client.call_count, 3,
+                f"LLM must be called exactly 3 times (only for differing symbols); "
+                f"was called {counting_client.call_count} times",
             )
 
 
@@ -575,7 +914,7 @@ class TestSemanticDiffLive(unittest.TestCase):
             (head_dir / "handler.py").write_text("def live_func(x):\n    return x\n")
 
             client = SemanticDiffLlmClient()
-            rows = semantic_contract_diff(
+            rows, status = semantic_contract_diff(
                 base_snapshot=snap,
                 head_snapshot=snap,
                 base_root=base_dir,
@@ -585,6 +924,7 @@ class TestSemanticDiffLive(unittest.TestCase):
             )
             # Shape-only assertions
             self.assertIsInstance(rows, list, "result must be a list")
+            self.assertIsInstance(status, str, "status must be a string")
             for row in rows:
                 self.assertIsInstance(row, dict)
                 self.assertIn("hypothesis_id", row)

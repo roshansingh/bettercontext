@@ -3479,7 +3479,7 @@ def _splice_semantic_diff_hypotheses(
     """Run semantic_contract_diff and splice inferred_llm hypothesis rows.
 
     Returns (merged_hypotheses, semantic_diff_status).
-    semantic_diff_status: "active" | "unavailable" | "failed".
+    semantic_diff_status: "active" | "unavailable" | "no_api_key" | "llm_error" | "partial".
     High-specificity rows are inserted at front of review_hypotheses.
     Failure is honest: never raises, always returns a status string.
     """
@@ -3514,7 +3514,7 @@ def _splice_semantic_diff_hypotheses(
     try:
         base_snap = _KgSnap(base_snapshot_dir)
         client = SemanticDiffLlmClient()
-        raw_rows = semantic_contract_diff(
+        raw_rows, inner_status = semantic_contract_diff(
             base_snapshot=base_snap,
             head_snapshot=head_kg,
             base_root=Path(base_checkout),
@@ -3527,8 +3527,15 @@ def _splice_semantic_diff_hypotheses(
     except Exception as exc:  # noqa: BLE001
         return review_hypotheses, f"failed:{exc}"
 
+    # Map inner_status to outer status
+    if inner_status == "no_api_key":
+        return review_hypotheses, "no_api_key"
+    if inner_status == "llm_error":
+        return review_hypotheses, "llm_error"
+
+    # For "partial" or "active": splice available rows
     if not raw_rows:
-        return review_hypotheses, "active"
+        return review_hypotheses, inner_status
 
     # Cap and splice — mirror the contract-diff round-robin pattern (single family here)
     spliced: list[JsonObject] = []
@@ -3543,9 +3550,9 @@ def _splice_semantic_diff_hypotheses(
         spliced.append(row)
 
     if not spliced:
-        return review_hypotheses, "active"
+        return review_hypotheses, inner_status
 
-    return spliced + review_hypotheses, "active"
+    return spliced + review_hypotheses, inner_status
 
 
 def _review_context_lead_packet(

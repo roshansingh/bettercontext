@@ -44,6 +44,21 @@ _PROMPT_TEMPLATE = (
 
 _REQUIRED_KEYS = {"claim", "cause_line", "consequence", "negative_check", "category"}
 
+# String clamp limits
+_CLAMP_CLAIM = 300
+_CLAMP_CONSEQUENCE = 300
+_CLAMP_NEGATIVE_CHECK = 200
+_CLAMP_CATEGORY = 50
+
+# 4x drop thresholds (items exceeding these are garbage-signalled and dropped)
+_DROP_CLAIM = 1200
+_DROP_CONSEQUENCE = 1200
+_DROP_NEGATIVE_CHECK = 800
+_DROP_CATEGORY = 200
+
+# Auth error substrings (checked on lowercased exception message)
+_AUTH_SUBSTRINGS = ("auth", "unauthorized", "401", "api_key", "apikey")
+
 
 def _read_body(root: Path, path: str, line_start: int | None, line_end: int | None) -> str:
     """Read symbol body from checkout root. Returns empty string on any error."""
@@ -74,6 +89,12 @@ def _validate_item(item: Any) -> bool:
     return _REQUIRED_KEYS.issubset(item.keys())
 
 
+def _is_auth_error(exc: Exception) -> bool:
+    """Return True if the exception looks like an auth/API-key error."""
+    msg = str(exc).lower()
+    return any(sub in msg for sub in _AUTH_SUBSTRINGS)
+
+
 def _cluster_rank(
     changed_symbols: list[JsonObject],
     max_symbols: int,
@@ -101,10 +122,15 @@ def semantic_contract_diff(
     changed_symbols: list[JsonObject],
     client: "SemanticDiffLlmClient",
     max_symbols: int = _MAX_SYMBOLS,
-) -> list[JsonObject]:
+) -> tuple[list[JsonObject], str]:
     """Generate LLM-backed contract-diff hypothesis rows for changed symbols.
 
-    Returns a list of hypothesis rows with derivation="inferred_llm".
+    Returns (rows, status) where status is one of:
+      "active"     — completed normally (zero or more rows)
+      "no_api_key" — auth/API-key error detected
+      "llm_error"  — all LLM calls failed (non-auth)
+      "partial"    — some calls succeeded, some failed
+
     Each row is a candidate-class hypothesis only — never stored as a canonical fact.
 
     Args:
@@ -117,15 +143,14 @@ def semantic_contract_diff(
         max_symbols: Cost cap — at most this many symbols sent to the LLM.
     """
     if not changed_symbols:
-        return []
+        return [], "active"
 
     # Build URN → entity for both snapshots
     base_by_urn: dict[str, JsonObject] = {e["urn"]: e for e in base_snapshot.entities}
 
-    ranked = _cluster_rank(changed_symbols, max_symbols)
-    rows: list[JsonObject] = []
-
-    for head_entity in ranked:
+    # Problem C fix: prefilter (read bodies, keep only differing) BEFORE cap
+    differing: list[tuple[JsonObject, str, str]] = []  # (entity, base_body, head_body)
+    for head_entity in changed_symbols:
         urn = head_entity.get("urn", "")
         if not urn:
             continue
@@ -133,8 +158,6 @@ def semantic_contract_diff(
         if base_entity is None:
             continue
 
-        identity = head_entity.get("identity") or {}
-        qualname = str(identity.get("qualname") or urn)
         head_props = head_entity.get("properties") or {}
         base_props = base_entity.get("properties") or {}
         head_path = str(head_props.get("path") or "")
@@ -156,15 +179,49 @@ def semantic_contract_diff(
             # Identical bodies — skip (cost-bound pre-filter).
             continue
 
+        differing.append((head_entity, base_body, head_body))
+
+    if not differing:
+        return [], "active"
+
+    # Apply cap AFTER prefilter — only differing symbols count against the slot budget
+    ranked_differing = _cluster_rank([d[0] for d in differing], max_symbols)
+    differing_by_urn: dict[str, tuple[str, str]] = {
+        d[0].get("urn", ""): (d[1], d[2]) for d in differing
+    }
+
+    rows: list[JsonObject] = []
+    calls_attempted = 0
+    calls_failed = 0
+    auth_error_seen = False
+
+    for head_entity in ranked_differing:
+        urn = head_entity.get("urn", "")
+        bodies = differing_by_urn.get(urn)
+        if bodies is None:
+            continue
+        base_body, head_body = bodies
+
+        identity = head_entity.get("identity") or {}
+        qualname = str(identity.get("qualname") or urn)
+        head_props = head_entity.get("properties") or {}
+        head_path = str(head_props.get("path") or "")
+        head_line_start = head_props.get("line")
+        head_line_end = head_props.get("end_line")
+
         prompt = _PROMPT_TEMPLATE.format(
             qualname=qualname,
             before=base_body,
             after=head_body,
         )
+        calls_attempted += 1
         try:
             parsed = client.complete_json(prompt)
-        except Exception:  # noqa: BLE001
-            return rows  # propagate failure up via caller's error handling
+        except Exception as exc:  # noqa: BLE001
+            if _is_auth_error(exc):
+                auth_error_seen = True
+            calls_failed += 1
+            continue
 
         if not isinstance(parsed, list):
             continue
@@ -179,17 +236,41 @@ def semantic_contract_diff(
             if repo:
                 sym_span["repo"] = repo
 
-        hyps_from_symbol = 0
+        # Problem D fix: dedupe by claim text (first wins) before processing
+        seen_claims: set[str] = set()
+        deduped_items: list[Any] = []
         for item in parsed:
+            claim_key = str(item.get("claim", "")) if isinstance(item, dict) else ""
+            if claim_key not in seen_claims:
+                seen_claims.add(claim_key)
+                deduped_items.append(item)
+
+        hyps_from_symbol = 0
+        for item in deduped_items:
             if hyps_from_symbol >= _MAX_HYPS_PER_SYMBOL:
                 break
             if not _validate_item(item):
                 continue
 
-            claim = str(item["claim"])
-            consequence_text = str(item["consequence"])
-            negative_check = str(item["negative_check"])
-            category = str(item["category"])
+            # Problem B fix: drop garbage-signal items (4x threshold)
+            raw_claim = str(item["claim"])
+            raw_consequence = str(item["consequence"])
+            raw_negative_check = str(item["negative_check"])
+            raw_category = str(item["category"])
+
+            if (
+                len(raw_claim) > _DROP_CLAIM
+                or len(raw_consequence) > _DROP_CONSEQUENCE
+                or len(raw_negative_check) > _DROP_NEGATIVE_CHECK
+                or len(raw_category) > _DROP_CATEGORY
+            ):
+                continue
+
+            # Clamp strings to their limits
+            claim = raw_claim[:_CLAMP_CLAIM]
+            consequence_text = raw_consequence[:_CLAMP_CONSEQUENCE]
+            negative_check = raw_negative_check[:_CLAMP_NEGATIVE_CHECK]
+            category = raw_category[:_CLAMP_CATEGORY]
 
             # Validate and clamp cause_line to symbol span
             raw_line = item.get("cause_line")
@@ -251,4 +332,14 @@ def semantic_contract_diff(
             rows.append(row)
             hyps_from_symbol += 1
 
-    return rows
+    # Compute status
+    if auth_error_seen:
+        status = "no_api_key"
+    elif calls_attempted > 0 and calls_failed == calls_attempted:
+        status = "llm_error"
+    elif calls_attempted > 0 and calls_failed > 0 and rows:
+        status = "partial"
+    else:
+        status = "active"
+
+    return rows, status
