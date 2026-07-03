@@ -18,12 +18,10 @@ Role derivation per role (in priority order for ranking):
                         subject/object in PRODUCES_EVENT or CONSUMES_EVENT facts
                         (message-broker transport, serverless.yaml, terraform).
 
-  intra_repo_consumer:  default for same-repo code edges (CodeSymbol/CodeModule whose
-                        repo identity matches the snapshot's primary repo).
+  intra_repo_consumer:  default for code edges whose other endpoint is not
+                        classified by any rule above.
 
-  generic_utility:      other endpoint has entity kind ExternalPackage (Python/TS
-                        extractor_adapter.py) OR resolves to an entity outside the repo
-                        (ExternalSymbol kind, or subject entity has no repo identity match).
+  generic_utility:      other endpoint has entity kind ExternalPackage.
 
 Ranking priority (highest first): test_assertion, persistence, external_side_effect,
 intra_repo_consumer, generic_utility. generic_utility is last so budget eviction removes

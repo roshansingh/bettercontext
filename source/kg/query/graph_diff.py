@@ -32,7 +32,7 @@ def _entity_coordinates(entity: JsonObject, snap: KgSnapshot) -> JsonObject:
     """Return best-available source coordinates for *entity* as a flat dict.
 
     Priority:
-      1. entity properties (path/line/end_line) — always present for extractor-built symbols.
+      1. entity properties (path/line, and end_line when the extractor emits it).
       2. first evidence row's bytes_ref for that entity.
 
     Returns {} when no coordinates are available (unit-test synthetic entities

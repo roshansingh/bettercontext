@@ -49,12 +49,12 @@ def main() -> None:
 
     try:
         base = KgSnapshot(base_dir)
-    except (FileNotFoundError, OSError) as exc:
+    except (FileNotFoundError, OSError, ValueError) as exc:
         parser.error(f"Cannot open base snapshot {base_dir}: {exc}")
 
     try:
         head = KgSnapshot(head_dir)
-    except (FileNotFoundError, OSError) as exc:
+    except (FileNotFoundError, OSError, ValueError) as exc:
         parser.error(f"Cannot open head snapshot {head_dir}: {exc}")
 
     if args.command == "review-packet":
