@@ -110,6 +110,27 @@ class TestGuardCallRemoved(unittest.TestCase):
         self.assertEqual(row["subject"]["urn"], alpha.urn)
         self.assertEqual(row["removed_callee"]["urn"], gamma.urn)
 
+    def test_moved_file_matches_head_side_changed_path(self) -> None:
+        """Subject survives by URN but its file moved (svc/core.py -> svc/core/index.py
+        keeps the module name); the changed path is the HEAD-side path — the base-path
+        filter alone would silently skip it. Either-side matching must keep the row."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mod = _module("svc", "svc.core")
+            alpha_base = _symbol("svc", "svc.core", "alpha", "svc/core.py", 1)
+            gamma_base = _symbol("svc", "svc.core", "gamma", "svc/core.py", 10)
+            alpha_head = _symbol("svc", "svc.core", "alpha", "svc/core/index.py", 1)
+            gamma_head = _symbol("svc", "svc.core", "gamma", "svc/core/index.py", 10)
+            self.assertEqual(alpha_base.urn, alpha_head.urn)  # same identity, moved file
+
+            base = _make_snapshot(root, "base", [mod, alpha_base, gamma_base], [_calls(alpha_base, gamma_base)])
+            head = _make_snapshot(root, "head", [mod, alpha_head, gamma_head], [])
+            delta = diff_snapshots(base, head)
+            rows = guard_call_removed(delta, base, head, ["svc/core/index.py"])
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["subject"]["urn"], alpha_head.urn)
+
     def test_negative_symbol_removed_with_callee_no_row(self) -> None:
         """alpha is removed from head entirely — not a surviving changed symbol."""
         with tempfile.TemporaryDirectory() as tmpdir:

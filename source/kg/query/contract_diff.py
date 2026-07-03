@@ -154,7 +154,6 @@ def guard_call_removed(
 
     # Build: base entity_id → entity for quick lookup.
     base_by_id: dict[str, JsonObject] = base.entities_by_id
-    head_by_id: dict[str, JsonObject] = head.entities_by_id
 
     # Index removed CALLS facts by subject_id.
     removed_calls_by_subject: dict[str, list[JsonObject]] = {}
@@ -174,13 +173,17 @@ def guard_call_removed(
         # Kind filter: only CodeSymbol subjects (tripwire #4).
         if base_subject.get("kind") != "CodeSymbol":
             continue
-        # Path filter: subject's path must be in the given set.
-        subj_path = (base_subject.get("properties") or {}).get("path") or ""
-        if not subj_path or _norm(subj_path) not in normalized_paths:
-            continue
         # Survival filter: subject must exist in head.
         head_subject = head_by_urn.get(base_subject["urn"])
         if head_subject is None:
+            continue
+        # Path filter: match EITHER side's path so a file moved/renamed between
+        # base and head (subject survives by URN, base path differs from the
+        # head-side changed path) is not silently skipped.
+        base_path = (base_subject.get("properties") or {}).get("path") or ""
+        head_path = (head_subject.get("properties") or {}).get("path") or ""
+        candidate_paths = {_norm(p) for p in (base_path, head_path) if p}
+        if not candidate_paths or not (candidate_paths & normalized_paths):
             continue
 
         for fact in sorted(removed_facts, key=lambda f: str(f.get("object_id", ""))):

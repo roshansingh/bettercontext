@@ -127,7 +127,8 @@ def _extract_signals(
             callee_left = row.get("callee_left") or ""
             callee_right = row.get("callee_right") or ""
             line = row.get("line")
-            if not isinstance(signal, str) or not signal:
+            # Only the family this adapter owns — reject unexpected parser rows.
+            if signal != _RISK_FAMILY:
                 continue
             if not isinstance(qualname, str) or not qualname:
                 continue
