@@ -2397,6 +2397,7 @@ def _compact_relation_rows(value: object, *, limit: int) -> list[JsonObject]:
             "predicate": row.get("predicate"),
             "depth": row.get("depth"),
             "traversal": row.get("traversal"),
+            "edge_role": row.get("edge_role"),
             "subject": _compact_relation_endpoint(row.get("subject")),
             "object": _compact_relation_endpoint(row.get("object")),
             "caller_symbol": _compact_relation_endpoint(row.get("caller_symbol")),

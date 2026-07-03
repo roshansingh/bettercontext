@@ -21,6 +21,7 @@ from source.kg.product.output_budget import (
     enforce_reverse_impact_budget,
     enforce_service_brief_budget,
 )
+from source.kg.product.edge_role import annotate_edge_roles, build_edge_role_index, rank_by_review_value
 from source.kg.product.review_attribution import (
     add_review_lead_ids,
     review_available_counts,
@@ -2791,6 +2792,13 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         kg, changed_symbols=changed_symbols, depth=3, limit=detail_limit
     )
     repo_dependencies = _review_context_dedupe_rows(repo_dependencies)[:detail_limit]
+    _edge_index = build_edge_role_index(kg)
+    annotate_edge_roles(direct_callers, _edge_index, caller_perspective=True)
+    annotate_edge_roles(direct_callees, _edge_index, caller_perspective=False)
+    annotate_edge_roles(transitive_callers, _edge_index, caller_perspective=True)
+    direct_callers = rank_by_review_value(direct_callers)
+    direct_callees = rank_by_review_value(direct_callees)
+    transitive_callers = rank_by_review_value(transitive_callers)
     runtime_surfaces = _review_context_runtime_surfaces(
         kg, repo=repo, changed_symbols=changed_symbols, limit=detail_limit
     )
