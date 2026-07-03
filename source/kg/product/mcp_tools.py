@@ -3511,20 +3511,40 @@ def _splice_semantic_diff_hypotheses(
     except ImportError as exc:
         return review_hypotheses, f"unavailable:{exc}"
 
-    # Find head-snapshot CodeSymbol entities corresponding to changed symbols
-    # (by matching qualname/path from the symbol rows to entities in head_kg).
+    # Find head-snapshot CodeSymbol entities corresponding to changed symbols.
+    # Match by composite (normalized_path, qualname) when the changed row has a path;
+    # fall back to qualname-only for changed rows that carry no path (e.g. compact rows).
     head_entities: list[JsonObject] = []
-    changed_qnames: set[str] = {
-        str(s.get("qualname") or s.get("qualified_name") or "")
-        for s in changed_symbols
-        if s.get("qualname") or s.get("qualified_name")
-    }
+
+    # Build separate key sets: composite keys (path+qualname) and qualname-only fallback.
+    composite_keys: set[tuple[str, str]] = set()
+    qname_only_keys: set[str] = set()
+    for s in changed_symbols:
+        qname = str(s.get("qualname") or s.get("qualified_name") or "")
+        if not qname:
+            continue
+        path = str(s.get("path") or "")
+        if path:
+            composite_keys.add((_planning_context_normalize_path(path), qname))
+        else:
+            qname_only_keys.add(qname)
+
     for entity in head_kg.entities:
         if entity.get("kind") != "CodeSymbol":
             continue
         identity = entity.get("identity") or {}
         qname = str(identity.get("qualname") or "")
-        if qname and qname in changed_qnames:
+        if not qname:
+            continue
+        props = entity.get("properties") or {}
+        epath = _planning_context_normalize_path(str(props.get("path") or ""))
+        if epath and (epath, qname) in composite_keys:
+            head_entities.append(entity)
+        elif not epath and qname in qname_only_keys:
+            # Entity has no path in KG — fall back to qualname-only match.
+            head_entities.append(entity)
+        elif qname in qname_only_keys:
+            # Changed row had no path — qualname-only match (documented fallback).
             head_entities.append(entity)
 
     if not head_entities:

@@ -48,8 +48,11 @@ _FAKE_RESPONSE = [
 ]
 
 
+from source.kg.integrations.semantic_llm import LlmResult
+
+
 class _FakeClient:
-    """Deterministic fake LLM client — returns fixed valid JSON."""
+    """Deterministic fake LLM client — returns fixed valid JSON via LlmResult."""
 
     def __init__(self, response: list | None = None, raise_import: bool = False, return_malformed: bool = False):
         self._response = response or _FAKE_RESPONSE
@@ -57,13 +60,13 @@ class _FakeClient:
         self._return_malformed = return_malformed
         self.call_count = 0
 
-    def complete_json(self, prompt: str) -> Any:
+    def complete_json(self, prompt: str) -> LlmResult:
         if self._raise_import:
             raise ImportError("litellm not installed")
         self.call_count += 1
         if self._return_malformed:
-            return "not valid json structure"
-        return self._response
+            return LlmResult.parse_miss()
+        return LlmResult.parsed(self._response)
 
 
 class _FailingClient:
@@ -73,7 +76,7 @@ class _FailingClient:
         self._exc = exc or RuntimeError("timeout")
         self.call_count = 0
 
-    def complete_json(self, prompt: str) -> Any:
+    def complete_json(self, prompt: str) -> LlmResult:
         self.call_count += 1
         raise self._exc
 
@@ -85,10 +88,10 @@ class _PartialFailClient:
         self._response = success_response or _FAKE_RESPONSE
         self.call_count = 0
 
-    def complete_json(self, prompt: str) -> Any:
+    def complete_json(self, prompt: str) -> LlmResult:
         self.call_count += 1
         if self.call_count == 1:
-            return self._response
+            return LlmResult.parsed(self._response)
         raise RuntimeError("timeout on call 2+")
 
 
@@ -1454,6 +1457,269 @@ class TestSemanticLlmClient(unittest.TestCase):
         with patch.dict(sys.modules, {"litellm": None}):
             with self.assertRaises(ImportError):
                 c.complete_json("test prompt")
+
+
+# ---------------------------------------------------------------------------
+# P1: Real SemanticDiffLlmClient with patched litellm — typed result
+# ---------------------------------------------------------------------------
+
+class TestRealClientTypedResult(unittest.TestCase):
+    """P1 fix: real SemanticDiffLlmClient with litellm.completion patched at the import site.
+
+    Tests exercise the REAL client path (not a fake client) so that the typed
+    LlmResult mapping is verified end-to-end through semantic_contract_diff.
+    litellm may not be installed in this venv — we inject a fake litellm module
+    via sys.modules so the lazy import inside complete_json always succeeds.
+    """
+
+    def _make_single_symbol_snap(self, root: Path) -> tuple[KgSnapshot, Path, Path]:
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        e = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": "default",
+                "repo": "real_client_repo",
+                "module": "mod.handler",
+                "qualname": "real_func",
+                "symbol_kind": "function",
+            },
+            properties={"path": "handler.py", "line": 1, "end_line": 3},
+        )
+        snap_dir = root / "snap_real"
+        JsonlKgStore(snap_dir).write(
+            entities=[e], facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": "default"},
+        )
+        snap = KgSnapshot(snap_dir)
+        base_dir = root / "base_real"
+        base_dir.mkdir()
+        (base_dir / "handler.py").write_text("def real_func():\n    if x: raise\n    return 42\n")
+        head_dir = root / "head_real"
+        head_dir.mkdir()
+        (head_dir / "handler.py").write_text("def real_func():\n    return 42\n")
+        return snap, base_dir, head_dir
+
+    def _inject_fake_litellm(self, completion_side_effect) -> Any:
+        """Return a fake litellm module whose .completion raises or returns per side_effect."""
+        import types
+        fake = types.ModuleType("litellm")
+
+        def fake_completion(**kwargs):
+            return completion_side_effect(**kwargs)
+
+        fake.completion = fake_completion
+        return fake
+
+    def test_auth_error_produces_no_api_key_via_real_client(self) -> None:
+        """Real client: litellm.completion raises 401 → LlmResult.kind == 'no_api_key'.
+
+        Verified through semantic_contract_diff: status must be 'no_api_key', not 'active'.
+        """
+        import sys
+        from unittest.mock import patch
+        from source.kg.integrations.semantic_llm import SemanticDiffLlmClient
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        def _raise_auth(**kwargs):
+            raise Exception("401 Unauthorized: invalid API key")
+
+        fake_litellm = self._inject_fake_litellm(_raise_auth)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            with patch.dict(sys.modules, {"litellm": fake_litellm}):
+                client = SemanticDiffLlmClient(model="fake-model")
+                rows, status = semantic_contract_diff(
+                    base_snapshot=snap,
+                    head_snapshot=snap,
+                    base_root=base_dir,
+                    head_root=head_dir,
+                    changed_symbols=entity_dicts,
+                    client=client,
+                )
+        self.assertEqual(
+            status, "no_api_key",
+            f"auth failure via real client must produce 'no_api_key'; got {status!r}",
+        )
+        self.assertEqual(rows, [], "no rows must be produced on auth failure")
+
+    def test_timeout_produces_llm_error_via_real_client(self) -> None:
+        """Real client: litellm.completion raises RuntimeError('timeout') → status 'llm_error'.
+
+        Verified through semantic_contract_diff: status must be 'llm_error', not 'active'.
+        """
+        import sys
+        from unittest.mock import patch
+        from source.kg.integrations.semantic_llm import SemanticDiffLlmClient
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        def _raise_timeout(**kwargs):
+            raise RuntimeError("timeout")
+
+        fake_litellm = self._inject_fake_litellm(_raise_timeout)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            with patch.dict(sys.modules, {"litellm": fake_litellm}):
+                client = SemanticDiffLlmClient(model="fake-model")
+                rows, status = semantic_contract_diff(
+                    base_snapshot=snap,
+                    head_snapshot=snap,
+                    base_root=base_dir,
+                    head_root=head_dir,
+                    changed_symbols=entity_dicts,
+                    client=client,
+                )
+        self.assertEqual(
+            status, "llm_error",
+            f"timeout via real client must produce 'llm_error'; got {status!r}",
+        )
+        self.assertEqual(rows, [], "no rows must be produced on llm_error")
+
+    def test_absent_litellm_propagates_import_error(self) -> None:
+        """Real client: litellm absent (ImportError) → propagated through semantic_contract_diff.
+
+        The ImportError must propagate so _splice catches it as 'unavailable'.
+        semantic_contract_diff does not swallow it.
+        """
+        import sys
+        from unittest.mock import patch
+        from source.kg.integrations.semantic_llm import SemanticDiffLlmClient
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            with patch.dict(sys.modules, {"litellm": None}):
+                client = SemanticDiffLlmClient(model="fake-model")
+                with self.assertRaises(ImportError):
+                    semantic_contract_diff(
+                        base_snapshot=snap,
+                        head_snapshot=snap,
+                        base_root=base_dir,
+                        head_root=head_dir,
+                        changed_symbols=entity_dicts,
+                        client=client,
+                    )
+
+
+# ---------------------------------------------------------------------------
+# P2: Composite (path, qualname) matching — duplicate qualname in different files
+# ---------------------------------------------------------------------------
+
+class TestSpliceDuplicateQualname(unittest.TestCase):
+    """P2 fix: _splice_semantic_diff_hypotheses matches by (path, qualname) not qualname alone.
+
+    Two CodeSymbol entities share the same qualname in different files.
+    Only one file is in the changed_symbols list (with path).
+    Assert: fake client called exactly once, for the correct file.
+    """
+
+    def test_duplicate_qualname_only_changed_file_analyzed(self) -> None:
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+        from source.kg.query.snapshot import KgSnapshot
+
+        SHARED_QNAME = "process"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # Two entities: same qualname, different files
+            entity_a = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "dup_repo",
+                    "module": "mod_a",
+                    "qualname": SHARED_QNAME,
+                    "symbol_kind": "function",
+                },
+                properties={"path": "pkg/a.py", "line": 1, "end_line": 4},
+            )
+            entity_b = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "dup_repo",
+                    "module": "mod_b",
+                    "qualname": SHARED_QNAME,
+                    "symbol_kind": "function",
+                },
+                properties={"path": "pkg/b.py", "line": 1, "end_line": 4},
+            )
+
+            snap_dir = root / "snap_dup"
+            JsonlKgStore(snap_dir).write(
+                entities=[entity_a, entity_b],
+                facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": "default"},
+            )
+            head_kg = KgSnapshot(snap_dir)
+
+            base_dir = root / "base_dup"
+            base_dir.mkdir()
+            (base_dir / "pkg").mkdir()
+            (base_dir / "pkg" / "a.py").write_text(
+                "def process():\n    if x: raise\n    return 1\n"
+            )
+            (base_dir / "pkg" / "b.py").write_text(
+                "def process():\n    if y: raise\n    return 2\n"
+            )
+            head_dir = root / "head_dup"
+            head_dir.mkdir()
+            (head_dir / "pkg").mkdir()
+            (head_dir / "pkg" / "a.py").write_text("def process():\n    return 1\n")
+            (head_dir / "pkg" / "b.py").write_text("def process():\n    return 2\n")
+
+            # Only pkg/a.py is in the changed_symbols (with path)
+            changed_symbols = [{"qualname": SHARED_QNAME, "path": "pkg/a.py"}]
+
+            prompt_log: list[str] = []
+
+            class _LoggingClient:
+                def complete_json(self, prompt: str) -> LlmResult:
+                    prompt_log.append(prompt)
+                    return LlmResult.parsed([{
+                        "claim": "Guard removed.",
+                        "cause_line": 2,
+                        "consequence": "Callers may pass None.",
+                        "negative_check": "No check.",
+                        "category": "guard_removal",
+                    }])
+
+            _, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(snap_dir),
+                head_kg=head_kg,
+                base_checkout=str(base_dir),
+                head_checkout=str(head_dir),
+                changed_symbols=changed_symbols,
+                review_hypotheses=[],
+                _client=_LoggingClient(),
+            )
+
+            # Exactly one call — only pkg/a.py analyzed, not pkg/b.py
+            self.assertEqual(
+                len(prompt_log), 1,
+                f"fake client must be called exactly once (only pkg/a.py); got {len(prompt_log)} calls",
+            )
+            # The prompt references pkg/a.py's qualname (SHARED_QNAME)
+            self.assertIn(
+                SHARED_QNAME, prompt_log[0],
+                f"prompt must reference the changed symbol qualname {SHARED_QNAME!r}",
+            )
+            # Status reflects the call succeeded
+            self.assertIn(status, ("active", "partial"),
+                          f"unexpected status {status!r}")
 
 
 if __name__ == "__main__":

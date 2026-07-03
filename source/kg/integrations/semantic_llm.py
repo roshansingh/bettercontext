@@ -8,6 +8,50 @@ DEFAULT_SEMANTIC_DIFF_MODEL = "gpt-5.4-mini"
 
 _LITELLM_UNAVAILABLE: Exception | None = None
 
+# Auth error substrings (checked on lowercased exception message).
+_AUTH_SUBSTRINGS = ("auth", "unauthorized", "401", "api_key", "apikey")
+
+# Sentinel so None can be a valid parsed JSON value.
+_MISSING = object()
+
+
+class LlmResult:
+    """Typed result from SemanticDiffLlmClient.complete_json.
+
+    Discriminated by .kind:
+      "" (empty string)  — parsed_ok; .value holds the parsed JSON
+      "parse_miss"       — call succeeded but no parseable JSON in response
+      "no_api_key"       — auth/API-key failure from the provider
+      "llm_error"        — provider error (timeout, 5xx, non-auth)
+    """
+
+    __slots__ = ("kind", "_value")
+
+    def __init__(self, kind: str, value: Any = _MISSING) -> None:
+        self.kind = kind
+        self._value = value
+
+    @classmethod
+    def parsed(cls, value: Any) -> "LlmResult":
+        return cls("", value)
+
+    @classmethod
+    def parse_miss(cls) -> "LlmResult":
+        return cls("parse_miss")
+
+    @classmethod
+    def call_failure(cls, kind: str) -> "LlmResult":
+        return cls(kind)
+
+    def is_ok(self) -> bool:
+        return self.kind == ""
+
+    @property
+    def value(self) -> Any:
+        if self._value is _MISSING:
+            raise AttributeError(f"LlmResult.value not set (kind={self.kind!r})")
+        return self._value
+
 
 class SemanticDiffLlmClient:
     """litellm-based client for semantic contract-diff hypothesis generation."""
@@ -19,13 +63,20 @@ class SemanticDiffLlmClient:
             or DEFAULT_SEMANTIC_DIFF_MODEL
         )
 
-    def complete_json(self, prompt: str) -> Any:
-        """Call the LLM; return parsed JSON or None on any failure."""
-        try:
-            import litellm  # lazy: core package works without litellm installed
-        except ImportError as exc:
-            # Propagate ImportError so callers can distinguish unavailable from failure.
-            raise ImportError(f"litellm not installed: {exc}") from exc
+    def complete_json(self, prompt: str) -> LlmResult:
+        """Call the LLM; return a typed LlmResult.
+
+        Returns:
+          LlmResult.parsed(value)               — JSON parsed from response
+          LlmResult.parse_miss()                — call ok, no parseable JSON
+          LlmResult.call_failure("no_api_key")  — auth/API-key error
+          LlmResult.call_failure("llm_error")   — provider error (timeout, 5xx, etc.)
+
+        Raises:
+          ImportError — litellm not installed; propagated so caller routes to
+                        "unavailable" status (never caught here).
+        """
+        import litellm  # lazy: propagated ImportError → "unavailable" in caller
 
         try:
             response = litellm.completion(
@@ -36,10 +87,16 @@ class SemanticDiffLlmClient:
                 max_tokens=512,
             )
             raw = response.choices[0].message.content or ""
-        except Exception:  # noqa: BLE001
-            return None
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if any(sub in msg for sub in _AUTH_SUBSTRINGS):
+                return LlmResult.call_failure("no_api_key")
+            return LlmResult.call_failure("llm_error")
 
-        return _extract_json(raw)
+        value = _extract_json(raw)
+        if value is None:
+            return LlmResult.parse_miss()
+        return LlmResult.parsed(value)
 
 
 def _extract_json(text: str) -> Any:

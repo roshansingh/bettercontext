@@ -8978,6 +8978,9 @@ class TestSpliceFamilyRoundRobin(unittest.TestCase):
 # FW2: Problem A — trust-tier ordering in _splice_semantic_diff_hypotheses
 # ---------------------------------------------------------------------------
 
+from source.kg.integrations.semantic_llm import LlmResult as _LlmResult
+
+
 class _TierFakeClient:
     """Minimal fake LLM client for tier-ordering tests."""
 
@@ -8985,9 +8988,9 @@ class _TierFakeClient:
         self._items_per_call = items_per_call
         self.call_count = 0
 
-    def complete_json(self, prompt: str) -> list:
+    def complete_json(self, prompt: str) -> _LlmResult:
         self.call_count += 1
-        return [
+        return _LlmResult.parsed([
             {
                 "claim": f"Claim {j} from call {self.call_count}",
                 "cause_line": 2,
@@ -8996,7 +8999,7 @@ class _TierFakeClient:
                 "category": "guard_removal",
             }
             for j in range(self._items_per_call)
-        ]
+        ])
 
 
 class TestSemanticSpliceTrustTierOrdering(unittest.TestCase):

@@ -216,13 +216,29 @@ def semantic_contract_diff(
         )
         calls_attempted += 1
         try:
-            parsed = client.complete_json(prompt)
+            result = client.complete_json(prompt)
+        except ImportError:
+            # litellm not installed — re-raise so _splice catches it as "unavailable"
+            raise
         except Exception as exc:  # noqa: BLE001
             if _is_auth_error(exc):
                 auth_error_seen = True
             calls_failed += 1
             continue
 
+        # Map typed result to status tracking
+        if result.kind == "no_api_key":
+            auth_error_seen = True
+            calls_failed += 1
+            continue
+        if result.kind == "llm_error":
+            calls_failed += 1
+            continue
+        # parse_miss: call completed but no valid JSON → not a failure, just no rows
+        if result.kind == "parse_miss":
+            continue
+
+        parsed = result.value
         if not isinstance(parsed, list):
             continue
 
