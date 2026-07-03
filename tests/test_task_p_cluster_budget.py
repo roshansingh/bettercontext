@@ -201,10 +201,12 @@ class TestClusterCoverageMultiFile(unittest.TestCase):
 
     def test_every_cluster_retains_at_least_one_changed_symbol(self):
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
-        # Verify it starts over budget
+        # Verify it starts over budget (broad context included in raw packet)
         self.assertGreater(len(canonical_json(packet)), 40_000, "fixture must start over budget")
 
-        result = enforce_review_context_budget(packet)
+        # include_broad_context=True: tests the 40K broad-path budgeter (the fixture uses
+        # application_impact bulk to create pressure, which is stripped in compact profile).
+        result = enforce_review_context_budget(packet, include_broad_context=True)
 
         review_leads = result.get("review_leads")
         self.assertIsInstance(review_leads, dict, "review_leads must be present")
@@ -227,7 +229,8 @@ class TestClusterCoverageMultiFile(unittest.TestCase):
 
     def test_returned_counts_match_review_leads_rows(self):
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
-        result = enforce_review_context_budget(packet)
+        # include_broad_context=True: tests the 40K broad-path counts.
+        result = enforce_review_context_budget(packet, include_broad_context=True)
 
         lead_status = result.get("review_lead_status")
         self.assertIsInstance(lead_status, dict)
@@ -245,9 +248,58 @@ class TestClusterCoverageMultiFile(unittest.TestCase):
 
     def test_cap_never_exceeded(self):
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
-        result = enforce_review_context_budget(packet)
+        # include_broad_context=True: broad-path 40K cap assertion.
+        result = enforce_review_context_budget(packet, include_broad_context=True)
         size = len(canonical_json(result))
         self.assertLessEqual(size, 40_000, f"packet size {size} exceeds 40000 cap")
+
+
+class TestClusterCoverageCompactProfile(unittest.TestCase):
+    """B4: P1 cluster coverage and cap must hold on the default compact (15K) profile.
+
+    Pressure comes from lead mass (many changed symbols/callers), not broad-context
+    bulk — the compact profile strips broad sections, so a broad-bulk fixture would
+    test nothing here.
+    """
+
+    def _make_compact_pressure_packet(self, file_count: int = 5) -> dict:
+        packet = _make_over_budget_packet(file_count=file_count, symbols_per_file=60)
+        from source.kg.product.output_budget import _strip_broad_context
+        stripped_size = len(canonical_json(_strip_broad_context(packet)))
+        self.assertGreater(
+            stripped_size,
+            15_000,
+            "fixture must exceed the compact cap without broad-context mass",
+        )
+        return packet
+
+    def test_cap_held_at_15k_compact_default(self):
+        packet = self._make_compact_pressure_packet()
+        result = enforce_review_context_budget(packet)
+        size = len(canonical_json(result))
+        self.assertLessEqual(size, 15_000, f"packet size {size} exceeds the 15000 compact cap")
+
+    def test_every_cluster_retains_anchor_at_15k_compact_default(self):
+        file_count = 5
+        packet = self._make_compact_pressure_packet(file_count=file_count)
+        result = enforce_review_context_budget(packet)
+        self.assertLessEqual(len(canonical_json(result)), 15_000)
+        review_leads = result.get("review_leads") or {}
+        changed_symbols = [r for r in (review_leads.get("changed_symbols") or []) if isinstance(r, dict)]
+        self.assertTrue(changed_symbols, "no changed_symbols retained; cluster assertions did not execute")
+        retained_paths = {r.get("path") for r in changed_symbols}
+        for i in range(file_count):
+            path = f"src/module_{i}.py"
+            self.assertIn(
+                path,
+                retained_paths,
+                f"cluster {path} has no changed-symbol anchor at the 15K compact cap; retained: {retained_paths}",
+            )
+
+    def test_broad_sections_absent_on_compact_default(self):
+        packet = self._make_compact_pressure_packet()
+        result = enforce_review_context_budget(packet)
+        self.assertNotIn("application_impact", result, "broad context must be stripped on compact profile")
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +351,9 @@ class TestExtremePressureClusterDrop(unittest.TestCase):
         lowest-ranked clusters drop whole — the exact contract from the brief.
         """
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=9_000)
+        # include_broad_context=True: fixture uses application_impact bulk to create cluster-drop
+        # pressure at 9K; stripping broad context (compact profile) removes that pressure.
+        result = enforce_review_context_budget(packet, max_chars=9_000, include_broad_context=True)
         self.assertLessEqual(len(canonical_json(result)), 9_000)
 
         retained_paths = self._retained_paths(result)
@@ -328,7 +382,9 @@ class TestExtremePressureClusterDrop(unittest.TestCase):
         """At an extreme cap not all dropped clusters fit; the recorded ones must be the
         highest-ranked dropped clusters, in rank order, and all must really be omitted."""
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=8_000)
+        # include_broad_context=True: fixture uses application_impact bulk for 8K
+        # cluster-drop pressure; the compact composer keeps all anchors (no drops).
+        result = enforce_review_context_budget(packet, max_chars=8_000, include_broad_context=True)
         self.assertLessEqual(len(canonical_json(result)), 8_000)
         retained_paths = self._retained_paths(result)
         omitted_paths = self._ORIGINAL_PATHS - retained_paths
@@ -351,7 +407,8 @@ class TestExtremePressureClusterDrop(unittest.TestCase):
         """Retained clusters must come from the hypothesis-referenced set when fewer
         clusters survive than were referenced (rank: referenced first)."""
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=8_000)
+        # include_broad_context=True: broad-bulk fixture; see note on the sibling 8K test.
+        result = enforce_review_context_budget(packet, max_chars=8_000, include_broad_context=True)
         retained_paths = self._retained_paths(result)
         # Non-vacuous: something must be retained and something dropped.
         self.assertTrue(retained_paths, "no changed_symbols retained at all")
@@ -370,7 +427,8 @@ class TestExtremePressureClusterDrop(unittest.TestCase):
         so the ``if uncovered`` branch fires and the assertion is non-vacuous.
         """
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=9_000)
+        # include_broad_context=True: broad bulk is required to create 9K cluster-drop pressure.
+        result = enforce_review_context_budget(packet, max_chars=9_000, include_broad_context=True)
         self.assertLessEqual(len(canonical_json(result)), 9_000)
         review_leads = result.get("review_leads") or {}
         changed_symbols = [r for r in (review_leads.get("changed_symbols") or []) if isinstance(r, dict)]
@@ -460,12 +518,13 @@ class TestTruncationSummaryShape(unittest.TestCase):
     def test_no_truncation_summary_broad_bulk_only(self):
         """Broad-bulk-only truncation (no lead rows omitted) must not produce a summary.
 
-        The 3-file x 8-symbol fixture at the default 40k cap keeps all lead rows
+        The 3-file x 8-symbol fixture at the 40k broad cap keeps all lead rows
         (only application_impact bulk is evicted), so the summary would be all-zero
-        and is suppressed.
+        and is suppressed. include_broad_context=True: fixture relies on broad bulk;
+        compact profile strips it entirely so no budget pressure arises there.
         """
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
-        result = enforce_review_context_budget(packet)
+        result = enforce_review_context_budget(packet, include_broad_context=True)
         ob = result.get("output_budget") or {}
         # Packet must be truncated (bulk evicted) but have no omitted lead rows.
         self.assertTrue(ob.get("truncated"), "fixture should be truncated at default cap")
@@ -697,7 +756,10 @@ class TestTopLevelChangedSymbolsMirror(unittest.TestCase):
             symbols_per_file=10,
             hyp_cluster_paths=["src/module_0.py", "src/module_1.py"],
         )
-        result = enforce_review_context_budget(packet, max_chars=9_000)
+        # include_broad_context=True: the desync path under test (repair de-alias +
+        # post-repair eviction + re-mirror) exists only on the broad ladder; the
+        # compact composer has no top-level changed_symbols mirror by design.
+        result = enforce_review_context_budget(packet, max_chars=9_000, include_broad_context=True)
         self.assertLessEqual(len(canonical_json(result)), 9_000)
 
         review_leads = result.get("review_leads") or {}
@@ -725,7 +787,8 @@ class TestTopLevelChangedSymbolsMirror(unittest.TestCase):
             symbols_per_file=10,
             hyp_cluster_paths=["src/module_0.py", "src/module_1.py"],
         )
-        result = enforce_review_context_budget(packet, max_chars=8_000)
+        # include_broad_context=True: broad-ladder desync path; see sibling test note.
+        result = enforce_review_context_budget(packet, max_chars=8_000, include_broad_context=True)
         self.assertLessEqual(len(canonical_json(result)), 8_000)
 
         review_leads = result.get("review_leads") or {}

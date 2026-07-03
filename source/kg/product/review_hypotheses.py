@@ -260,8 +260,38 @@ def _make_hypothesis(
         row["consequence"] = consequence
     if negative_checks is not None:
         row["negative_checks"] = negative_checks
+    source_spans = _source_spans_from_evidence_refs(evidence_refs)
+    if source_spans:
+        row["source_spans"] = source_spans
     row["hypothesis_id"] = hypothesis_stable_id(risk_type, supporting_lead_ids, evidence_refs)
     return row
+
+
+_SOURCE_SPAN_KEYS = ("repo", "path", "line_start", "line_end", "qualified_name", "qualname")
+_SOURCE_SPAN_LIMIT = 4
+
+
+def _source_spans_from_evidence_refs(evidence_refs: list[JsonObject]) -> list[JsonObject]:
+    """Project pure coordinate spans from a hypothesis's evidence_refs.
+
+    Keeps only path-bearing refs, reduced to coordinate keys, deduped in order,
+    bounded at _SOURCE_SPAN_LIMIT. Never fabricates coordinates: refs without a
+    path produce no span.
+    """
+    spans: list[JsonObject] = []
+    seen: set[tuple] = set()
+    for ref in evidence_refs:
+        if not isinstance(ref, dict) or not ref.get("path"):
+            continue
+        span = {key: ref[key] for key in _SOURCE_SPAN_KEYS if ref.get(key) is not None}
+        dedupe_key = tuple(sorted(span.items()))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        spans.append(span)
+        if len(spans) >= _SOURCE_SPAN_LIMIT:
+            break
+    return spans
 
 
 def _lead_ids_for_fields(review_leads: JsonObject, fields: tuple[str, ...]) -> list[str]:

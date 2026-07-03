@@ -36,6 +36,7 @@ from source.kg.product.output_budget import (
     RELATED_FACT_SECTION_KEYS,
     _BUDGET_BACKFILL_LIST_PATHS,
     REVERSE_IMPACT_MAX_CHARS,
+    REVIEW_CONTEXT_BROAD_MAX_CHARS,
     REVIEW_CONTEXT_MAX_CHARS,
     _compact_authz_surface,
     _compact_disambiguation,
@@ -1493,11 +1494,13 @@ class McpToolsTest(unittest.TestCase):
         }
         original = deepcopy(result)
 
-        budgeted = enforce_review_context_budget(result)
+        # include_broad_context=True: asserts the broad ladder's top-level detail
+        # sampling limits and top-level/review_leads equality contracts.
+        budgeted = enforce_review_context_budget(result, include_broad_context=True)
 
         self.assertEqual(result, original)
         self.assertTrue(budgeted["output_budget"]["truncated"])
-        self.assertLessEqual(len(canonical_json(budgeted)), REVIEW_CONTEXT_MAX_CHARS)
+        self.assertLessEqual(len(canonical_json(budgeted)), REVIEW_CONTEXT_BROAD_MAX_CHARS)
         # Curated head start and contracts survive; verbose detail is bounded.
         self.assertIn("review_answer_packet", budgeted)
         self.assertEqual(budgeted["summary"], original["summary"])
@@ -1585,7 +1588,9 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=8_000)
+        # include_broad_context=True: asserts compacted row shape on the broad
+        # ladder's top-level detail lists (absent in the compact profile).
+        budgeted = enforce_review_context_budget(result, max_chars=8_000, include_broad_context=True)
 
         self.assertLessEqual(len(canonical_json(budgeted)), 8_000)
         self.assertEqual(budgeted["direct_callers"][0]["subject"], "pkg.module_0.caller")
@@ -1698,7 +1703,7 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=20_000)
+        budgeted = enforce_review_context_budget(result, max_chars=20_000, include_broad_context=True)
 
         self.assertLessEqual(len(canonical_json(budgeted)), 20_000)
         self.assertNotIn("exceeded_after_minimization", budgeted["output_budget"])
@@ -1778,7 +1783,9 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=20_000)
+        # include_broad_context=True: backfill/truncated_sections clearing is broad
+        # ladder machinery over top-level detail lists.
+        budgeted = enforce_review_context_budget(result, max_chars=20_000, include_broad_context=True)
 
         self.assertEqual(len(budgeted["direct_callers"]), len(relation_rows))
         self.assertEqual(len(budgeted["review_leads"]["direct_callers"]), len(relation_rows))
@@ -1985,7 +1992,7 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+        budgeted = enforce_review_context_budget(result, max_chars=10_000, include_broad_context=True)
 
         self.assertLessEqual(len(canonical_json(budgeted)), 10_000)
         self.assertTrue(budgeted["output_budget"]["lead_only"])
@@ -2205,7 +2212,7 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+        budgeted = enforce_review_context_budget(result, max_chars=10_000, include_broad_context=True)
 
         self.assertLessEqual(len(canonical_json(budgeted)), 10_000)
         self.assertTrue(budgeted["output_budget"].get("lead_only"))
@@ -2414,7 +2421,7 @@ class McpToolsTest(unittest.TestCase):
         """engine_version is preserved when budget degrades to lead_only packet."""
         result = self._minimal_review_context_result(bloat=50_000)
         result["output_budget"] = {"engine_version": "test-sha"}
-        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+        budgeted = enforce_review_context_budget(result, max_chars=10_000, include_broad_context=True)
         budget = budgeted.get("output_budget")
         self.assertIsInstance(budget, dict)
         self.assertTrue(budget.get("lead_only"), "expected lead_only degradation")
@@ -3670,7 +3677,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["status"], "found")
@@ -3763,7 +3770,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 KgSnapshot(root),
                 "review_context",
-                {"repo": "campaign", "changed_files": ["campaign/app.py"], "limit": 10},
+                {"repo": "campaign", "changed_files": ["campaign/app.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["summary"]["event_fact_count"], 0)
@@ -3788,7 +3795,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         impact = result["application_impact"]
@@ -3817,6 +3824,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": ["UI", "scheduled_jobs", "SQS", "workers", "tracking"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3853,6 +3861,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 1, "end_line": 200}],
                     "requested_surfaces": ["callers", "reverse_impact"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3871,6 +3880,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": ["services", "schemas", "contracts", "deployables", "owners"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3903,6 +3913,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": ["rule_actions", "abilities", "authz", "tests"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3932,6 +3943,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": ["scheduled_jobs", "authz"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3957,6 +3969,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 1, "end_line": 200}],
                     "requested_surfaces": ["ability_checks"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3984,6 +3997,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": surfaces,
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4004,6 +4018,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": [long_token],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4043,7 +4058,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["summary"]["endpoint_consumer_fact_count"], 1)
@@ -4057,7 +4072,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "Payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "Payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["status"], "found")
@@ -4069,7 +4084,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "latticeai/payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "latticeai/payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["status"], "found")
@@ -4081,7 +4096,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["status"], "found")
@@ -4092,7 +4107,9 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "owner-b/payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                # include_broad_context=True: changed_file_symbols inventory is a broad
+                # section; the compact profile omits it entirely (nothing to leak).
+                {"repo": "owner-b/payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertFalse(any(row["qualname"] == "handle_checkout" for row in result["changed_file_symbols"]))
@@ -4107,6 +4124,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4125,6 +4143,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4165,6 +4184,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4232,6 +4252,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4434,7 +4455,9 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "owner-b/payments", "changed_files": ["payments/missing.py"], "limit": 10},
+                # include_broad_context=True: repo_dependencies is a broad section,
+                # omitted by the compact profile.
+                {"repo": "owner-b/payments", "changed_files": ["payments/missing.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["repo_dependencies"], [])
@@ -4482,6 +4505,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4521,6 +4545,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4560,6 +4585,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4580,6 +4606,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                    "include_broad_context": True,
                 },
             )
         self.assertEqual(
@@ -4599,6 +4626,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 15, "end_line": 15}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4614,6 +4642,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 5, "end_line": 25}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4630,6 +4659,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 1, "end_line": 30}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4646,6 +4676,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 15, "end_line": 15}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4733,6 +4764,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_ranges": [{"path": "payments/config.yaml", "start_line": 4, "end_line": 6}],
                     "include_unlinked_leads": True,
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4756,6 +4788,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_ranges": [{"path": "payments/config.yaml", "start_line": 4, "end_line": 6}],
                     "requested_surfaces": ["ui_screens"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4802,6 +4835,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["app/config.yaml"],
                     "changed_ranges": [{"path": "app/config.yaml", "start_line": 1, "end_line": 1}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4820,6 +4854,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4843,6 +4878,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 1, "end_line": 200}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4864,6 +4900,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4886,6 +4923,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py", "payments/gateway.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4936,7 +4974,7 @@ class McpToolsTest(unittest.TestCase):
 
     def test_review_context_missing_changed_file_still_returns_repo_dependencies(self) -> None:
         with _fixture_snapshot() as kg:
-            result = call_tool(kg, "review_context", {"repo": "payments", "changed_files": ["payments/missing.py"]})
+            result = call_tool(kg, "review_context", {"repo": "payments", "changed_files": ["payments/missing.py"], "include_broad_context": True})
 
         self.assertEqual(result["status"], "found")
         self.assertEqual(result["changed_symbols"], [])
@@ -4949,7 +4987,7 @@ class McpToolsTest(unittest.TestCase):
 
     def test_review_context_does_not_create_application_anchor_from_test_path(self) -> None:
         with _fixture_snapshot() as kg:
-            result = call_tool(kg, "review_context", {"repo": "payments", "changed_files": ["tests/test_checkout.py"]})
+            result = call_tool(kg, "review_context", {"repo": "payments", "changed_files": ["tests/test_checkout.py"], "include_broad_context": True})
 
         self.assertEqual(result["application_impact"]["status"], "missing_anchor")
         self.assertEqual(result["application_impact"]["anchors"], [])
@@ -5027,7 +5065,7 @@ class McpToolsTest(unittest.TestCase):
             opted_in = call_tool(
                 kg,
                 "review_context",
-                {"repo": "payments", "changed_files": ["payments/checkout.py"], "include_deploy_blockers": True},
+                {"repo": "payments", "changed_files": ["payments/checkout.py"], "include_deploy_blockers": True, "include_broad_context": True},
             )
 
         self.assertEqual(default["unsupported_scopes"], [])
@@ -6094,6 +6132,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -6176,6 +6215,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                    "include_broad_context": True,
                 },
             )
         # summary.direct_caller_count must reflect all 7 callers, not a truncated 5
@@ -8029,6 +8069,80 @@ class TestR1FundingBoilerplateVictim(unittest.TestCase):
         # At least some anchors must survive
         retained = (result.get("review_leads") or {}).get("changed_symbols") or []
         self.assertTrue(retained, "review_leads.changed_symbols must be non-empty after boilerplate eviction")
+
+    def test_unknown_surface_honesty_survives_boilerplate_eviction(self) -> None:
+        """Tier-2 surface_status eviction must not erase unknown-surface refusal rows.
+
+        Inversion: before this fix, _evict_broad_context_to_fit popped surface_status
+        rows blindly from the end, so a single unsupported_or_unlinked honesty row was
+        evicted to fund the hypothesis floor and truncation implied absence. With the
+        fix, supported rows are evicted first, at least one unknown row always
+        survives, and unknown rows dropped as last resort fold into
+        omitted_unknown_surface_count on the last surviving unknown row.
+        """
+        packet = self._build_boilerplate_heavy_packet(n_clusters=5, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        # Mixed list: fat supported rows (evictable) around a bounded unknown row.
+        packet["surface_status"] = (
+            [
+                {"surface": f"linked_surface_{j}", "status": "linked", "detail": "L" * 600}
+                for j in range(20)
+            ]
+            + [
+                {
+                    "surface": "unknown_surface_a",
+                    "status": "unsupported_or_unlinked",
+                    "source_inspection_terms": ["unknown_surface_a"],
+                }
+            ]
+            + [
+                {"surface": f"linked_surface_tail_{j}", "status": "linked", "detail": "T" * 600}
+                for j in range(20)
+            ]
+        )
+        from source.kg.core.models import canonical_json
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        self.assertLessEqual(len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
+        rows = result.get("surface_status") or []
+        unknown_rows = [r for r in rows if isinstance(r, dict) and r.get("status") == "unsupported_or_unlinked"]
+        self.assertEqual(len(unknown_rows), 1, "the unknown-surface honesty row must survive eviction")
+        self.assertEqual(unknown_rows[0]["surface"], "unknown_surface_a")
+        # Inversion evidence: supported rows were the eviction victims.
+        linked_rows = [r for r in rows if isinstance(r, dict) and r.get("status") == "linked"]
+        self.assertLess(len(linked_rows), 40, "supported rows must have been evicted to fund the cap")
+
+    def test_unknown_surface_last_resort_eviction_keeps_omitted_count(self) -> None:
+        """When only unknown rows remain, eviction keeps >= 1 and counts the drops.
+
+        The fixture's surface_status is all-unknown and fat (40 rows x ~1KB), so the
+        cap can only be held by evicting unknown rows. The last surviving unknown row
+        must carry omitted_unknown_surface_count equal to the evicted unknown rows so
+        the packet stays count-truthful.
+        """
+        packet = self._build_boilerplate_heavy_packet(n_clusters=5, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        original_unknown = [
+            r for r in packet["surface_status"] if r.get("status") == "unsupported_or_unlinked"
+        ]
+        self.assertEqual(len(original_unknown), 40, "fixture precondition: all-unknown surface_status")
+        from source.kg.core.models import canonical_json
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        self.assertLessEqual(len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
+        rows = [
+            r
+            for r in (result.get("surface_status") or [])
+            if isinstance(r, dict) and r.get("status") == "unsupported_or_unlinked"
+        ]
+        self.assertGreaterEqual(len(rows), 1, "at least one unknown-surface row must survive")
+        if len(rows) < 40:
+            omitted = rows[-1].get("omitted_unknown_surface_count")
+            self.assertEqual(
+                omitted,
+                40 - len(rows),
+                "dropped unknown rows must be folded into omitted_unknown_surface_count",
+            )
 
 
 class TestTotalRetrievalBound(unittest.TestCase):

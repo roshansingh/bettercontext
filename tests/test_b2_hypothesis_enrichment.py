@@ -389,6 +389,111 @@ class TestAdjudicabilityFields(unittest.TestCase):
 # Unit tests: test_locks ordering (must not outrank high-specificity)
 # ---------------------------------------------------------------------------
 
+class TestSourceSpans(unittest.TestCase):
+    """B4: every hypothesis carries source_spans — pure coordinate rows projected
+    from its own evidence_refs, path-bearing only, deduped, bounded at 4."""
+
+    _SPAN_KEYS = {"repo", "path", "line_start", "line_end", "qualified_name", "qualname"}
+
+    def _call(self, **overrides):
+        return review_hypotheses_for_context(**_base_context(**overrides))
+
+    def test_signal_backed_hypothesis_carries_coordinate_source_spans(self):
+        sym = _sym("handleEvent", "src/handler.ts", symbol_id="eid-ss-1", lead_id="lead-ss-1")
+        sig = _risk_signal("unawaited_async_call", "eid-ss-1", path="src/handler.ts", line=12)
+        hyps = self._call(
+            changed_symbols=[sym],
+            risk_signals=[sig],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-ss-1", "path": "src/handler.ts", "symbol_id": "eid-ss-1"}
+                ]
+            },
+        )
+        h = next(h for h in hyps if h["risk_type"] == "async_side_effect_lifecycle_drift")
+        spans = h.get("source_spans")
+        self.assertIsInstance(spans, list, "source_spans must be present")
+        self.assertGreater(len(spans), 0, "source_spans must be non-empty when evidence_refs carry coordinates")
+        self.assertLessEqual(len(spans), 4)
+        for span in spans:
+            self.assertIn("path", span, "every source span must carry a path")
+            self.assertTrue(
+                set(span) <= self._SPAN_KEYS,
+                f"span keys must be pure coordinates, got {sorted(span)}",
+            )
+        # Row shape verified against producer: spans project the signal's bytes_ref.
+        self.assertEqual(spans[0]["path"], "src/handler.ts")
+        self.assertEqual(spans[0]["line_start"], 12)
+
+    def test_source_spans_are_subset_of_evidence_ref_coordinates(self):
+        sym = _sym("handleEvent", "src/handler.ts", symbol_id="eid-ss-2", lead_id="lead-ss-2")
+        sig = _risk_signal("async_callback_in_iteration", "eid-ss-2", path="src/handler.ts", line=7)
+        hyps = self._call(
+            changed_symbols=[sym],
+            risk_signals=[sig],
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-ss-2", "path": "src/handler.ts", "symbol_id": "eid-ss-2"}
+                ]
+            },
+        )
+        for h in hyps:
+            spans = h.get("source_spans") or []
+            ref_coords = {
+                (r.get("path"), r.get("line_start"))
+                for r in h.get("evidence_refs") or []
+                if isinstance(r, dict) and r.get("path")
+            }
+            for span in spans:
+                self.assertIn(
+                    (span.get("path"), span.get("line_start")),
+                    ref_coords,
+                    f"span not derived from evidence_refs on {h['risk_type']}",
+                )
+
+    def test_source_spans_bounded_at_4_and_deduped(self):
+        sym = _sym("handleEvent", "src/handler.ts", symbol_id="eid-ss-3", lead_id="lead-ss-3")
+        # 5 distinct signal sites (evidence ref cap) + 1 duplicate — spans must dedupe and cap at 4.
+        sigs = [
+            _risk_signal("unawaited_async_call", "eid-ss-3", path="src/handler.ts", line=10 + i)
+            for i in range(5)
+        ]
+        sigs.append(_risk_signal("unawaited_async_call", "eid-ss-3", path="src/handler.ts", line=10))
+        hyps = self._call(
+            changed_symbols=[sym],
+            risk_signals=sigs,
+            review_leads={
+                "changed_symbols": [
+                    {"lead_id": "lead-ss-3", "path": "src/handler.ts", "symbol_id": "eid-ss-3"}
+                ]
+            },
+        )
+        h = next(h for h in hyps if h["risk_type"] == "async_side_effect_lifecycle_drift")
+        spans = h.get("source_spans") or []
+        self.assertEqual(len(spans), 4, f"spans must cap at 4, got {len(spans)}")
+        self.assertEqual(
+            len({(s.get("path"), s.get("line_start"), s.get("line_end")) for s in spans}),
+            len(spans),
+            "spans must be deduped",
+        )
+
+    def test_no_source_spans_when_evidence_refs_lack_coordinates(self):
+        # direct_call_contract_drift from edge-only leads (no path on lead rows) → no spans key.
+        sym = _sym("fn", "src/a.ts", symbol_id="eid-ss-4", lead_id="lead-ss-4")
+        hyps = self._call(
+            changed_symbols=[sym],
+            direct_callers=[_edge("Caller", "fn", "lead-edge-ss-4")],
+            review_leads={
+                "changed_symbols": [{"lead_id": "lead-ss-4", "symbol_id": "eid-ss-4"}],
+                "direct_callers": [{"lead_id": "lead-edge-ss-4", "subject": "mod.Caller", "object": "mod.fn"}],
+            },
+        )
+        h = next(h for h in hyps if h["risk_type"] == "direct_call_contract_drift")
+        self.assertNotIn(
+            "source_spans", h, "no fabricated spans when evidence_refs carry no path coordinates"
+        )
+
+
 class TestTestLocksOrdering(unittest.TestCase):
 
     def _call(self, **overrides):
@@ -534,6 +639,23 @@ class TestCompactHypothesisPassthrough(unittest.TestCase):
         compacted = _compact_review_hypothesis(full)
         # Capped at 2
         self.assertEqual(compacted["negative_checks"], ["check A", "check B"])
+
+    def test_source_spans_pass_through_capped_at_4(self):
+        row = {
+            "risk_type": "async_side_effect_lifecycle_drift",
+            "confidence": "medium",
+            "why": "w",
+            "evidence_refs": [],
+            "source_checks": [],
+            "supporting_lead_ids": [],
+            "hypothesis_id": "h-ss",
+            "source_spans": [
+                {"path": f"src/f{i}.ts", "line_start": i} for i in range(6)
+            ],
+        }
+        compact = _compact_review_hypothesis(row)
+        self.assertEqual(len(compact["source_spans"]), 4)
+        self.assertEqual(compact["source_spans"][0], {"path": "src/f0.ts", "line_start": 0})
 
     def test_null_postable_claim_not_present_when_absent(self):
         full = {
@@ -732,6 +854,7 @@ class TestFieldReplayCalDiy7232(unittest.TestCase):
     def setUpClass(cls):
         with open(_FIELD_REPLAY_ARGS) as f:
             cls.args = json.load(f)
+        cls.args = {**cls.args, "include_broad_context": True}
         cls.result = call_tool(KgSnapshot(Path(_FIELD_REPLAY_KG)), "review_context", cls.args)
 
     def test_canonical_size_le_40000(self):
@@ -774,6 +897,73 @@ class TestFieldReplayCalDiy7232(unittest.TestCase):
         self.assertIsNotNone(h.get("postable_claim"), "postable_claim must be non-null on async hypothesis")
 
     def test_review_quality_status_present_with_high_specificity(self):
+        rqs = self.result.get("review_quality_status")
+        self.assertIsNotNone(rqs, "review_quality_status must be present")
+        self.assertEqual(rqs["specificity"], "high")
+        self.assertEqual(rqs["recommended_action"], "use_supercontext_packet")
+
+
+@unittest.skipUnless(
+    os.path.isdir(_FIELD_REPLAY_KG) and os.path.isfile(_FIELD_REPLAY_ARGS),
+    "field replay KG or args not available",
+)
+class TestFieldReplayCalDiy7232Compact(unittest.TestCase):
+    """B4 field gate: pr-7232 replay on the default compact (hypothesis-first) profile."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(_FIELD_REPLAY_ARGS) as f:
+            cls.args = json.load(f)
+        # No include_broad_context: existing callers passing nothing get the compact profile.
+        cls.result = call_tool(KgSnapshot(Path(_FIELD_REPLAY_KG)), "review_context", cls.args)
+
+    def test_canonical_size_le_15000(self):
+        from source.kg.core.models import canonical_json
+        size = len(canonical_json(self.result))
+        self.assertLessEqual(size, 15000, f"compact canonical size {size} exceeds 15000")
+
+    def test_broad_sections_absent(self):
+        for key in ("application_impact", "framework_impact", "runtime_surfaces", "impact"):
+            self.assertNotIn(key, self.result, f"broad section {key} must be stripped on compact profile")
+
+    def test_async_family_is_first_with_postable_claim_and_source_spans(self):
+        # Primary payload: top-level review_hypotheses, async first, fully enriched.
+        hyps = self.result.get("review_hypotheses") or []
+        self.assertTrue(hyps, "review_hypotheses must be non-empty")
+        first = hyps[0]
+        self.assertEqual(
+            first["risk_type"],
+            "async_side_effect_lifecycle_drift",
+            f"expected async family first, got {first['risk_type']}",
+        )
+        self.assertIsNotNone(first.get("postable_claim"), "postable_claim must be non-null on async hypothesis")
+        spans = first.get("source_spans")
+        self.assertIsInstance(spans, list, "source_spans must be present on async hypothesis")
+        self.assertGreater(len(spans), 0)
+        self.assertLessEqual(len(spans), 4)
+        for span in spans:
+            self.assertIn("path", span)
+        # Mirror pairing: slim mirror rows keep ordering and hypothesis_id pairing.
+        packet = self.result.get("review_answer_packet") or {}
+        top_hyps = packet.get("top_review_hypotheses") or []
+        self.assertTrue(top_hyps, "top_review_hypotheses mirror must be non-empty")
+        self.assertEqual(top_hyps[0]["risk_type"], "async_side_effect_lifecycle_drift")
+        self.assertEqual(top_hyps[0]["hypothesis_id"], first["hypothesis_id"])
+
+    def test_one_anchor_per_changed_file_cluster(self):
+        review_leads = self.result.get("review_leads") or {}
+        changed_symbols = [
+            r for r in (review_leads.get("changed_symbols") or []) if isinstance(r, dict)
+        ]
+        self.assertTrue(changed_symbols, "review_leads.changed_symbols must be non-empty")
+        retained_paths = {r.get("path") for r in changed_symbols}
+        self.assertGreaterEqual(
+            len(retained_paths),
+            5,
+            f"expected >= 1 anchor for each of the 5 changed-file clusters, got paths: {sorted(p or '' for p in retained_paths)}",
+        )
+
+    def test_review_quality_status_honest(self):
         rqs = self.result.get("review_quality_status")
         self.assertIsNotNone(rqs, "review_quality_status must be present")
         self.assertEqual(rqs["specificity"], "high")

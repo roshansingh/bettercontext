@@ -16,6 +16,7 @@ from source.kg.product.output_budget import (
     AUTHZ_COMPACT_LIST_KEYS,
     COMPACT_AUTHZ_INSPECTION_REF_LIMIT,
     PLANNING_CONTEXT_ANCHORED_MAX_CHARS,
+    REVIEW_CONTEXT_BROAD_MAX_CHARS,
     enforce_planning_context_budget,
     enforce_review_context_budget,
     enforce_reverse_impact_budget,
@@ -258,7 +259,8 @@ def call_tool(kg: KgSnapshot, name: str, arguments: JsonObject | None = None) ->
         )
     if name == "review_context":
         payload.setdefault("output_budget", {})["engine_version"] = engine_version()
-        return enforce_review_context_budget(payload)
+        include_broad = _optional_bool(arguments, "include_broad_context", default=False)
+        return enforce_review_context_budget(payload, include_broad_context=include_broad)
     if name == "reverse_impact":
         return enforce_reverse_impact_budget(payload)
     if name == "get_service_brief":
@@ -2343,6 +2345,24 @@ def _review_context_properties() -> JsonObject:
                 "By default, file-anchor-only PR-review packets stay compact and point back to source inspection."
             ),
         },
+        "include_broad_context": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "When true, include broad application/runtime/framework context sections and raise the packet cap to "
+                f"{REVIEW_CONTEXT_BROAD_MAX_CHARS} chars (legacy behavior). "
+                "By default (false), broad sections are suppressed and the cap is 15,000 chars for a hypothesis-first compact packet."
+            ),
+        },
+        "base_snapshot": {
+            "type": "string",
+            "description": (
+                "Optional path to a base KG snapshot directory. When provided and loadable, runs a contract-diff "
+                "against the current snapshot and splices guard_call_removed_drift / responsibility_moved_drift / "
+                "test_reference_removed_drift hypotheses (specificity=high) into the review_hypotheses pipeline. "
+                "Tenant mismatch or unloadable base snapshot is reported in review_quality_status.reason, never an error."
+            ),
+        },
     }
 
 
@@ -2709,6 +2729,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     requested_review_sections = _optional_review_section_aliases(arguments, "requested_surfaces")
     include_deploy_blockers = _optional_bool(arguments, "include_deploy_blockers", default=False)
     include_unlinked_leads = _optional_bool(arguments, "include_unlinked_leads", default=False)
+    base_snapshot_dir = _optional_string(arguments, "base_snapshot")
 
     changed_symbols: list[JsonObject] = []
     range_filters = _changed_ranges_by_path(changed_ranges)
@@ -2999,10 +3020,19 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         review_lead_status=review_lead_packet["review_lead_status"],
         risk_signals=risk_signals,
     )
+    contract_diff_note: str | None = None
+    if base_snapshot_dir:
+        review_hypotheses, contract_diff_note = _splice_contract_diff_hypotheses(
+            base_snapshot_dir=base_snapshot_dir,
+            head_kg=kg,
+            changed_files=changed_files,
+            review_hypotheses=review_hypotheses,
+        )
     review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     review_quality_status = _build_review_quality_status(
         review_hypotheses=review_hypotheses,
         coverage_status=review_lead_packet["review_lead_status"].get("coverage_status", ""),
+        contract_diff_note=contract_diff_note,
     )
     result = {
         "status": status,
@@ -3091,6 +3121,7 @@ def _build_review_quality_status(
     *,
     review_hypotheses: list[JsonObject],
     coverage_status: str,
+    contract_diff_note: str | None = None,
 ) -> JsonObject:
     """Build the review_quality_status scalar object emitted alongside review_lead_status.
 
@@ -3101,6 +3132,7 @@ def _build_review_quality_status(
       specificity — "high" | "medium" | "low" (max class present; "low" when none generated)
       recommended_action — "use_supercontext_packet" when high or medium, else "use_live_followups_or_plain_review"
       reason — short explanation
+      contract_diff_note — present only when a base_snapshot was provided; carries load/tenant status
     """
     specific_count = 0
     generic_count = 0
@@ -3108,7 +3140,8 @@ def _build_review_quality_status(
     for h in review_hypotheses:
         if not isinstance(h, dict):
             continue
-        spec = _FAMILY_SPECIFICITY.get(str(h.get("risk_type") or ""), "low")
+        # Contract-diff families always injected as "high" specificity; other families use _FAMILY_SPECIFICITY
+        spec = h.get("specificity") or _FAMILY_SPECIFICITY.get(str(h.get("risk_type") or ""), "low")
         if spec in ("high", "medium"):
             specific_count += 1
         else:
@@ -3127,7 +3160,10 @@ def _build_review_quality_status(
             "All generated hypotheses are generic (no signal/delta or convention-specific evidence); "
             "live source inspection will yield higher precision."
         )
-    return {
+    if contract_diff_note:
+        # Coverage-honest: base_snapshot problems surface in the reason, never as errors.
+        reason = f"{reason} {contract_diff_note}"
+    status: JsonObject = {
         "coverage_status": coverage_status,
         "specific_hypothesis_count": specific_count,
         "generic_hypothesis_count": generic_count,
@@ -3135,6 +3171,113 @@ def _build_review_quality_status(
         "recommended_action": recommended_action,
         "reason": reason,
     }
+    if contract_diff_note is not None:
+        status["contract_diff_note"] = contract_diff_note
+    return status
+
+
+# Contract-diff families treated as "high" specificity when spliced into review_hypotheses.
+_CONTRACT_DIFF_FAMILIES = frozenset(
+    {"guard_call_removed_drift", "responsibility_moved_drift", "test_reference_removed_drift"}
+)
+# Maximum contract-diff hypotheses to splice per family (avoid packet explosion).
+_CONTRACT_DIFF_SPLICE_CAP = 3
+
+
+def _splice_contract_diff_hypotheses(
+    *,
+    base_snapshot_dir: str,
+    head_kg: KgSnapshot,
+    changed_files: list[str],
+    review_hypotheses: list[JsonObject],
+) -> tuple[list[JsonObject], str | None]:
+    """Run contract_diff against base_snapshot_dir and splice high-specificity rows.
+
+    Returns (merged_hypotheses, note_string).
+    note_string is None on success; a coverage-honest message on tenant mismatch or
+    load failure (never raises).
+
+    Spliced rows carry:
+      specificity = "high"
+      cause = first before_ref (path + line_start)
+      consequence = first after_ref (path + line_start)
+      source_spans = up to 4 evidence refs (before_refs + after_refs capped)
+      evidence_refs = same as source_spans
+    High-specificity rows are inserted at the front of review_hypotheses so they rank
+    before generic families; existing hypothesis order is preserved after them.
+    """
+    try:
+        from source.kg.query.contract_diff import contract_diff_packet
+        from source.kg.query.snapshot import KgSnapshot
+    except ImportError as exc:
+        return review_hypotheses, f"contract_diff unavailable: {exc}"
+
+    try:
+        head_tenant = head_kg.manifest.get("tenant_id") or "default"
+        base_snap = KgSnapshot(base_snapshot_dir)
+        base_tenant = base_snap.manifest.get("tenant_id") or "default"
+        if head_tenant != base_tenant:
+            return review_hypotheses, (
+                f"base_snapshot tenant '{base_tenant}' does not match head tenant '{head_tenant}'; "
+                "contract-diff skipped — provide a base snapshot from the same tenant."
+            )
+        head_snapshot_dir = str(head_kg.root)
+        packet = contract_diff_packet(
+            base_snapshot_dir,
+            head_snapshot_dir,
+            changed_paths=changed_files,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return review_hypotheses, f"base_snapshot load failed: {exc}"
+
+    raw_hypotheses = packet.get("contract_diff_packet", {}).get("hypotheses", [])
+    if not raw_hypotheses:
+        return review_hypotheses, None
+
+    spliced: list[JsonObject] = []
+    family_counts: dict[str, int] = {}
+    for h in raw_hypotheses:
+        if not isinstance(h, dict):
+            continue
+        risk_type = str(h.get("risk_type") or "")
+        if risk_type not in _CONTRACT_DIFF_FAMILIES:
+            continue
+        if family_counts.get(risk_type, 0) >= _CONTRACT_DIFF_SPLICE_CAP:
+            continue
+        family_counts[risk_type] = family_counts.get(risk_type, 0) + 1
+        before_refs = [r for r in (h.get("before_refs") or []) if isinstance(r, dict)]
+        after_refs = [r for r in (h.get("after_refs") or []) if isinstance(r, dict)]
+        source_spans = (before_refs + after_refs)[:4]
+        cause: JsonObject | None = None
+        if before_refs:
+            br = before_refs[0]
+            cause = {k: br[k] for k in ("path", "line_start", "repo") if k in br}
+        consequence: JsonObject | None = None
+        if after_refs:
+            ar = after_refs[0]
+            consequence = {k: ar[k] for k in ("path", "line_start", "repo") if k in ar}
+        spliced_row: JsonObject = {
+            "hypothesis_id": h["hypothesis_id"],
+            "risk_type": risk_type,
+            "specificity": "high",
+            "confidence": "medium",
+            "concrete_invariant": h.get("concrete_invariant", ""),
+            "why": h.get("why", ""),
+            "source_checks": (h.get("source_checks") or [])[:2],
+            "supporting_lead_ids": [],
+            "evidence_refs": source_spans,
+            "source_spans": source_spans,
+        }
+        if cause is not None:
+            spliced_row["cause"] = cause
+        if consequence is not None:
+            spliced_row["consequence"] = consequence
+        spliced.append(spliced_row)
+
+    if not spliced:
+        return review_hypotheses, None
+
+    return spliced + review_hypotheses, None
 
 
 def _review_context_lead_packet(

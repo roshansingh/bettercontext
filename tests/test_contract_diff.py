@@ -390,6 +390,49 @@ class TestResponsibilityMoved(unittest.TestCase):
 # Tests: contract_diff_packet (builder)
 # ---------------------------------------------------------------------------
 
+def _build_two_commit_pair(tmpdir: Path, *, base_tenant: str = TENANT) -> tuple[Path, Path]:
+    """
+    Build base + head snapshot from two versions of a Python fixture repo.
+
+    v1 (base): alpha calls beta AND gamma (guard call).
+    v2 (head): alpha calls beta only (gamma call removed = guard_call_removed).
+               Also: delta calls gamma (so gamma call moved alpha→delta = responsibility_moved).
+    Test file calling alpha exists in base but the call is removed in head (test_reference_removed).
+    """
+    svc = tmpdir / "svc"
+    svc.mkdir()
+    (svc / "__init__.py").write_text("", encoding="utf-8")
+    (svc / "core.py").write_text(
+        "def alpha():\n    beta()\n    gamma()\n\ndef beta():\n    pass\n\ndef gamma():\n    pass\n\ndef delta():\n    pass\n",
+        encoding="utf-8",
+    )
+    tests_dir = svc / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+    (tests_dir / "test_core.py").write_text(
+        "from svc.core import alpha\n\ndef test_alpha():\n    alpha()\n",
+        encoding="utf-8",
+    )
+
+    out_base = tmpdir / "kg_base"
+    build_kg(svc, out_base, tenant_id=base_tenant)
+
+    # v2: remove gamma call from alpha; add gamma call to delta; remove test reference to alpha
+    (svc / "core.py").write_text(
+        "def alpha():\n    beta()\n\ndef beta():\n    pass\n\ndef gamma():\n    pass\n\ndef delta():\n    gamma()\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_core.py").write_text(
+        "def test_other():\n    pass\n",
+        encoding="utf-8",
+    )
+
+    out_head = tmpdir / "kg_head"
+    build_kg(svc, out_head, tenant_id=TENANT)
+
+    return out_base, out_head
+
+
 class TestContractDiffPacket(unittest.TestCase):
     """
     Verify the packet builder wires all three families and produces correct shapes.
@@ -397,46 +440,7 @@ class TestContractDiffPacket(unittest.TestCase):
     """
 
     def _build_pair_from_source(self, tmpdir: Path) -> tuple[Path, Path]:
-        """
-        Build base + head snapshot from two versions of a Python fixture repo.
-
-        v1 (base): alpha calls beta AND gamma (guard call).
-        v2 (head): alpha calls beta only (gamma call removed = guard_call_removed).
-                   Also: delta calls gamma (so gamma call moved alpha→delta = responsibility_moved).
-        Test file calling alpha exists in base but the call is removed in head (test_reference_removed).
-        """
-        svc = tmpdir / "svc"
-        svc.mkdir()
-        (svc / "__init__.py").write_text("", encoding="utf-8")
-        (svc / "core.py").write_text(
-            "def alpha():\n    beta()\n    gamma()\n\ndef beta():\n    pass\n\ndef gamma():\n    pass\n\ndef delta():\n    pass\n",
-            encoding="utf-8",
-        )
-        tests_dir = svc / "tests"
-        tests_dir.mkdir()
-        (tests_dir / "__init__.py").write_text("", encoding="utf-8")
-        (tests_dir / "test_core.py").write_text(
-            "from svc.core import alpha\n\ndef test_alpha():\n    alpha()\n",
-            encoding="utf-8",
-        )
-
-        out_base = tmpdir / "kg_base"
-        build_kg(svc, out_base, tenant_id=TENANT)
-
-        # v2: remove gamma call from alpha; add gamma call to delta; remove test reference to alpha
-        (svc / "core.py").write_text(
-            "def alpha():\n    beta()\n\ndef beta():\n    pass\n\ndef gamma():\n    pass\n\ndef delta():\n    gamma()\n",
-            encoding="utf-8",
-        )
-        (tests_dir / "test_core.py").write_text(
-            "def test_other():\n    pass\n",
-            encoding="utf-8",
-        )
-
-        out_head = tmpdir / "kg_head"
-        build_kg(svc, out_head, tenant_id=TENANT)
-
-        return out_base, out_head
+        return _build_two_commit_pair(tmpdir)
 
     def test_packet_structure_has_required_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -767,6 +771,98 @@ class TestGuardCallRemovedNoiseBound(unittest.TestCase):
             if h["risk_type"] == "guard_call_removed_drift"
         ]
         self.assertEqual(len(guard_hyps), 0)
+
+
+# ---------------------------------------------------------------------------
+# Tests: B4 review_context splice (base_snapshot argument)
+# ---------------------------------------------------------------------------
+
+_CONTRACT_DIFF_FAMILIES = {
+    "guard_call_removed_drift",
+    "responsibility_moved_drift",
+    "test_reference_removed_drift",
+}
+
+
+class TestReviewContextContractDiffSplice(unittest.TestCase):
+    """B4: optional base_snapshot on review_context splices contract-diff hypotheses
+    into the normal hypothesis pipeline; tenant mismatch / unloadable base are
+    coverage-honest notes, never errors."""
+
+    def _review_context(self, head: Path, extra: JsonObject) -> JsonObject:
+        from source.kg.product.mcp_tools import call_tool
+
+        args: JsonObject = {"repo": "svc", "changed_files": ["core.py"], **extra}
+        return call_tool(KgSnapshot(head), "review_context", args)
+
+    def test_guard_call_removed_drift_spliced_with_cause_and_consequence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base, head = _build_two_commit_pair(Path(tmpdir))
+            result = self._review_context(head, {"base_snapshot": str(base)})
+
+        hyps = [h for h in result.get("review_hypotheses") or [] if isinstance(h, dict)]
+        guard = [h for h in hyps if h.get("risk_type") == "guard_call_removed_drift"]
+        self.assertGreaterEqual(len(guard), 1, "guard_call_removed_drift must be spliced in")
+        h = guard[0]
+        self.assertEqual(h["specificity"], "high")
+        self.assertIn("cause", h, "cause must map from before_refs")
+        self.assertIn("path", h["cause"])
+        self.assertIn("consequence", h, "consequence must map from after_refs")
+        self.assertIn("path", h["consequence"])
+        spans = h.get("source_spans")
+        self.assertIsInstance(spans, list)
+        self.assertGreater(len(spans), 0)
+        self.assertLessEqual(len(spans), 4)
+        # High-specificity splice ranks ahead of the generic families this fixture makes.
+        self.assertIn(hyps[0]["risk_type"], _CONTRACT_DIFF_FAMILIES)
+        # Quality status counts spliced rows as specific.
+        rqs = result.get("review_quality_status") or {}
+        self.assertEqual(rqs.get("specificity"), "high")
+
+    def test_splice_enters_answer_packet_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base, head = _build_two_commit_pair(Path(tmpdir))
+            result = self._review_context(head, {"base_snapshot": str(base)})
+
+        mirror = (result.get("review_answer_packet") or {}).get("top_review_hypotheses") or []
+        self.assertTrue(mirror, "mirror must be non-empty")
+        self.assertIn(mirror[0].get("risk_type"), _CONTRACT_DIFF_FAMILIES)
+
+    def test_tenant_mismatch_is_note_not_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base, head = _build_two_commit_pair(Path(tmpdir), base_tenant="other-tenant")
+            result = self._review_context(head, {"base_snapshot": str(base)})
+
+        hyps = [h.get("risk_type") for h in result.get("review_hypotheses") or []]
+        self.assertFalse(
+            set(hyps) & _CONTRACT_DIFF_FAMILIES,
+            "tenant mismatch must skip the splice entirely",
+        )
+        rqs = result.get("review_quality_status") or {}
+        self.assertIn("tenant", rqs.get("reason", ""), "reason must carry the coverage-honest note")
+
+    def test_unloadable_base_is_note_not_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base, head = _build_two_commit_pair(Path(tmpdir))
+            result = self._review_context(
+                head, {"base_snapshot": str(Path(tmpdir) / "does-not-exist")}
+            )
+
+        hyps = [h.get("risk_type") for h in result.get("review_hypotheses") or []]
+        self.assertFalse(set(hyps) & _CONTRACT_DIFF_FAMILIES)
+        rqs = result.get("review_quality_status") or {}
+        self.assertIn("base_snapshot", rqs.get("reason", ""), "reason must carry the load-failure note")
+
+    def test_absent_base_snapshot_identical_to_today(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _base, head = _build_two_commit_pair(Path(tmpdir))
+            result = self._review_context(head, {})
+
+        hyps = [h.get("risk_type") for h in result.get("review_hypotheses") or []]
+        self.assertFalse(set(hyps) & _CONTRACT_DIFF_FAMILIES)
+        rqs = result.get("review_quality_status") or {}
+        self.assertNotIn("contract_diff_note", rqs)
+        self.assertNotIn("base_snapshot", rqs.get("reason", ""))
 
 
 if __name__ == "__main__":
