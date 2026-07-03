@@ -3063,6 +3063,9 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         )
     elif base_snapshot_dir:
         semantic_diff_status = "missing_checkouts"
+    elif base_checkout or head_checkout:
+        # Minor 11: checkouts provided without a base_snapshot — note the missing dependency.
+        semantic_diff_status = "missing_base_snapshot"
     # Cap the top-level list to PLANNING_CONTEXT_SECTION_LIMIT (5). The splice
     # inserts high-specificity rows at the front so the specifics-first partition is
     # already correct; slicing here preserves that order while bounding the list.
@@ -3226,17 +3229,30 @@ def _build_review_quality_status(
         reason = f"{reason} {contract_diff_note}"
 
     # review_readiness routing
+    # Minor 12 fix: compute _build_suggested_followups ONCE with include_base_build
+    # correct for the emission path. The first call was previously a boolean gate only
+    # (no include_base_build). Compute the full version once and reuse for both gate
+    # and emission.
+    # Safety: include_base_build=True only when base_diff_status=="missing" AND no
+    # has_changed_ranges (the elif branch handles the changed_ranges case above the else,
+    # so the else with base_diff_status=="missing" implies no changed_ranges).
     has_changed_ranges = bool(changed_ranges)
+    if max_spec not in ("high", "medium"):
+        # Compute once; reused for both gate and emission.
+        followups = _build_suggested_followups(
+            review_hypotheses=review_hypotheses,
+            changed_symbols=changed_symbols or [],
+            include_base_build=(base_diff_status == "missing"),
+        )
+    else:
+        followups = []
+
     if max_spec in ("high", "medium"):
         review_readiness = "packet_ready"
     elif base_diff_status == "missing" and has_changed_ranges:
         review_readiness = "base_snapshot_required"
     else:
-        suggested = _build_suggested_followups(
-            review_hypotheses=review_hypotheses,
-            changed_symbols=changed_symbols or [],
-        )
-        review_readiness = "needs_followup" if suggested else "plain_review_better"
+        review_readiness = "needs_followup" if followups else "plain_review_better"
 
     status: JsonObject = {
         "coverage_status": coverage_status,
@@ -3257,14 +3273,8 @@ def _build_review_quality_status(
         status["contract_diff_note"] = contract_diff_note
 
     # suggested_followups: only on low-specificity packets
-    if max_spec not in ("high", "medium"):
-        followups = _build_suggested_followups(
-            review_hypotheses=review_hypotheses,
-            changed_symbols=changed_symbols or [],
-            include_base_build=(base_diff_status == "missing"),
-        )
-        if followups:
-            status["suggested_followups"] = followups
+    if max_spec not in ("high", "medium") and followups:
+        status["suggested_followups"] = followups
 
     return status
 
@@ -3725,12 +3735,11 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
         },
         "repo_dependencies": repo_dependencies,
         "source_coordinates": stamped_source_coordinates,
+        # compact-unanchored path: only stylesheet gap hypotheses; semantic diff is dead-code here
+        # (requires checkouts which are incompatible with the zero-anchor trigger condition)
         "review_hypotheses": [
             h for h in (result.get("review_hypotheses") or [])
-            if isinstance(h, dict) and h.get("risk_type") in {
-                "low_coverage_stylesheet_gap",
-                "contract_semantic_diff",
-            }
+            if isinstance(h, dict) and h.get("risk_type") == "low_coverage_stylesheet_gap"
         ],
         "answerability": answerability,
         "coverage_warnings": result.get("coverage_warnings", []),

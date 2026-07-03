@@ -9054,5 +9054,231 @@ class TestSemanticSpliceTrustTierOrdering(unittest.TestCase):
         self.assertEqual(merged[3]["hypothesis_id"], "old-llm-0")
 
 
+# ---------------------------------------------------------------------------
+# FW2: Minor 11 — missing_base_snapshot status
+# ---------------------------------------------------------------------------
+
+class TestMissingBaseSnapshotStatus(unittest.TestCase):
+    """Minor 11: checkouts provided without base_snapshot → semantic_diff_status=missing_base_snapshot."""
+
+    def _make_minimal_kg(self, root: Path) -> object:
+        import json as _json
+        (root / "entities.jsonl").write_text("")
+        (root / "facts.jsonl").write_text("")
+        (root / "evidence.jsonl").write_text("")
+        (root / "coverage.jsonl").write_text("")
+        (root / "manifest.json").write_text(_json.dumps({"tenant_id": "default", "version": 1}))
+        from source.kg.query.snapshot import KgSnapshot
+        return KgSnapshot(root)
+
+    def test_checkouts_without_base_snapshot_gives_missing_base_snapshot(self) -> None:
+        """base_checkout provided, no base_snapshot → semantic_diff_status=missing_base_snapshot."""
+        with tempfile.TemporaryDirectory() as head_dir, \
+             tempfile.TemporaryDirectory() as checkout_dir:
+            head_kg = self._make_minimal_kg(Path(head_dir))
+            result = call_tool(head_kg, "review_context", {
+                "repo": "default",
+                "changed_files": ["src/a.py"],
+                # No base_snapshot — only checkout provided
+                "base_checkout": checkout_dir,
+                "head_checkout": checkout_dir,
+            })
+            rqs = result.get("review_quality_status") or {}
+            self.assertEqual(
+                rqs.get("semantic_diff_status"), "missing_base_snapshot",
+                f"expected missing_base_snapshot; got {rqs.get('semantic_diff_status')}; rqs={rqs}",
+            )
+
+    def test_head_checkout_only_without_base_snapshot_gives_missing_base_snapshot(self) -> None:
+        """head_checkout provided without base_snapshot → missing_base_snapshot."""
+        with tempfile.TemporaryDirectory() as head_dir, \
+             tempfile.TemporaryDirectory() as checkout_dir:
+            head_kg = self._make_minimal_kg(Path(head_dir))
+            result = call_tool(head_kg, "review_context", {
+                "repo": "default",
+                "changed_files": ["src/a.py"],
+                "head_checkout": checkout_dir,
+                # No base_snapshot, no base_checkout
+            })
+            rqs = result.get("review_quality_status") or {}
+            self.assertEqual(
+                rqs.get("semantic_diff_status"), "missing_base_snapshot",
+                f"expected missing_base_snapshot; got {rqs.get('semantic_diff_status')}; rqs={rqs}",
+            )
+
+    def test_no_checkouts_no_base_snapshot_no_status(self) -> None:
+        """No checkouts, no base_snapshot → semantic_diff_status absent."""
+        with tempfile.TemporaryDirectory() as head_dir:
+            head_kg = self._make_minimal_kg(Path(head_dir))
+            result = call_tool(head_kg, "review_context", {
+                "repo": "default",
+                "changed_files": ["src/a.py"],
+            })
+            rqs = result.get("review_quality_status") or {}
+            self.assertNotIn(
+                "semantic_diff_status", rqs,
+                f"semantic_diff_status must be absent with no checkouts/base_snapshot; got {rqs}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# FW2: Minor 13 — review_readiness recomputed from final max_spec
+# ---------------------------------------------------------------------------
+
+class TestReviewReadinessResyncOnBudget(unittest.TestCase):
+    """Minor 13: review_readiness must be downgraded when high-spec rows are budget-evicted."""
+
+    def test_review_readiness_downgraded_when_high_spec_evicted(self) -> None:
+        """High-spec rows evicted by budget → review_readiness not packet_ready."""
+        from source.kg.product import output_budget as ob
+        from copy import deepcopy
+
+        # Build a status with review_readiness=packet_ready (pre-budget max_spec=high)
+        original_status = {
+            "coverage_status": "useful",
+            "specificity": "high",
+            "specific_hypothesis_count": 2,
+            "generic_hypothesis_count": 0,
+            "recommended_action": "use_supercontext_packet",
+            "reason": "Packet contains 2 specific hypotheses.",
+            "review_readiness": "packet_ready",
+        }
+
+        # Build a result that has NO hypotheses remaining (all evicted) but the status
+        # still says packet_ready
+        result = {
+            "review_quality_status": deepcopy(original_status),
+            "review_hypotheses": [],  # All high-spec rows evicted
+        }
+
+        # Run the sync: final max_spec=low → review_readiness must be downgraded
+        ob._sync_review_quality_status_from_packet(result, original_hypotheses=[
+            {
+                "hypothesis_id": "hyp-001",
+                "specificity": "high",
+                "derivation": "inferred_llm",
+            }
+        ])
+
+        synced = result.get("review_quality_status") or {}
+        self.assertNotEqual(
+            synced.get("review_readiness"), "packet_ready",
+            f"review_readiness must NOT be packet_ready after high-spec eviction; got {synced}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# FW2: Problem E — compact-unanchored allowlist revert
+# ---------------------------------------------------------------------------
+
+class TestCompactUnanchoredAllowlist(unittest.TestCase):
+    """Problem E: _review_context_compact_unanchored_result must exclude semantic diff rows."""
+
+    def _make_minimal_result(self, hypotheses: list[dict]) -> dict:
+        """Build a minimal result dict suitable for _review_context_compact_unanchored_result."""
+        return {
+            "status": "found",
+            "repo": "default",
+            "requested_repo": "default",
+            "repo_resolution": {},
+            "summary": {
+                "changed_symbol_count": 0,
+                "symbol_anchor_count": 0,
+                "diff_anchor_count": 1,
+                "file_anchor_count": 1,
+            },
+            "review_answer_packet": {"summary": {}},
+            "review_lead_status": {
+                "coverage_status": "low_coverage",
+                "changed_anchor_count": 0,
+                "changed_symbol_count": 0,
+                "direct_impact_count": 0,
+                "transitive_impact_count": 0,
+                "source_coordinate_count": 0,
+                "file_anchor_count": 1,
+                "available": {
+                    "changed_symbol_count": 0,
+                    "direct_caller_count": 0,
+                    "direct_callee_count": 0,
+                    "transitive_caller_count": 0,
+                    "source_coordinate_count": 0,
+                },
+            },
+            "review_quality_status": {},
+            "review_leads": {
+                "changed_files": ["src/style.css"],
+                "changed_symbols": [],
+                "direct_callers": [],
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "diff_anchors": [{"anchor_type": "file", "path": "src/style.css"}],
+            "changed_symbols": [],
+            "changed_file_symbols": [],
+            "direct_callers": [],
+            "direct_callees": [],
+            "direct_callers_of_changed_symbols": [],
+            "direct_callees_from_changed_symbols": [],
+            "transitive_callers": [],
+            "repo_dependencies": [],
+            "changed_surface": {"files": ["src/style.css"], "symbols": []},
+            "impact": {"direct_callers": [], "direct_callees": [], "transitive_callers": [], "repo_dependencies": []},
+            "runtime_surfaces": {"endpoints": [], "endpoint_consumers": [], "event_channels": [],
+                                 "candidate_or_unlinked_event_channels": [], "deploy_mappings": []},
+            "framework_impact": {},
+            "application_impact": {},
+            "surface_status": {},
+            "source_coordinates": [],
+            "answerability": {},
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "unsupported_review_scopes": [],
+            "evidence": [],
+            "review_hypotheses": hypotheses,
+            "next_actions": [],
+        }
+
+    def test_semantic_diff_hypothesis_excluded_from_compact(self) -> None:
+        """contract_semantic_diff risk_type must NOT appear in compact-unanchored result."""
+        from source.kg.product.mcp_tools import _review_context_compact_unanchored_result
+
+        result = self._make_minimal_result(hypotheses=[
+            {
+                "hypothesis_id": "sem-001",
+                "risk_type": "contract_semantic_diff",
+                "specificity": "high",
+                "derivation": "inferred_llm",
+            }
+        ])
+        compact = _review_context_compact_unanchored_result(result)
+        compact_hyps = compact.get("review_hypotheses") or []
+        sem_hyps = [h for h in compact_hyps if h.get("risk_type") == "contract_semantic_diff"]
+        self.assertEqual(
+            sem_hyps, [],
+            f"contract_semantic_diff must NOT appear in compact-unanchored result; got {sem_hyps}",
+        )
+
+    def test_stylesheet_hypothesis_included_in_compact(self) -> None:
+        """low_coverage_stylesheet_gap risk_type MUST appear in compact-unanchored result."""
+        from source.kg.product.mcp_tools import _review_context_compact_unanchored_result
+
+        result = self._make_minimal_result(hypotheses=[
+            {
+                "hypothesis_id": "css-001",
+                "risk_type": "low_coverage_stylesheet_gap",
+                "specificity": "low",
+                "derivation": "deterministic_static",
+            }
+        ])
+        compact = _review_context_compact_unanchored_result(result)
+        compact_hyps = compact.get("review_hypotheses") or []
+        css_hyps = [h for h in compact_hyps if h.get("risk_type") == "low_coverage_stylesheet_gap"]
+        self.assertTrue(
+            css_hyps,
+            f"low_coverage_stylesheet_gap must appear in compact-unanchored result; got {compact_hyps}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

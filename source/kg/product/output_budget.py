@@ -4255,9 +4255,25 @@ def _sync_review_quality_status_from_packet(
         )
     synced["reason"] = f"{base_reason} {contract_note}" if contract_note else base_reason
     # Preserve S1 measurement-validity fields through the sync rewrite.
-    for _s1_key in ("base_diff_status", "suggested_setup", "review_readiness", "suggested_followups"):
+    # review_readiness is recomputed from FINAL max_spec (Minor 13 fix) — not blindly preserved.
+    for _s1_key in ("base_diff_status", "suggested_setup", "suggested_followups"):
         if _s1_key in status:
             synced[_s1_key] = status[_s1_key]
+    # Minor 13: recompute review_readiness from the final (post-budget) max_spec and base_diff_status.
+    # Pre-budget max_spec may have been "high" (packet_ready) but after truncation all high-spec rows
+    # may be evicted, so review_readiness must be downgraded to reflect actual remaining content.
+    if max_spec in ("high", "medium"):
+        synced["review_readiness"] = "packet_ready"
+    elif base_diff_note == "missing":
+        synced["review_readiness"] = "base_snapshot_required"
+    else:
+        # Preserve needs_followup/plain_review_better from status — those routing decisions depend
+        # on suggested_followups content and remain valid post-budget.
+        # Do NOT preserve "packet_ready" when max_spec is now low (stale from pre-budget status).
+        orig_readiness = status.get("review_readiness", "plain_review_better")
+        synced["review_readiness"] = (
+            orig_readiness if orig_readiness != "packet_ready" else "plain_review_better"
+        )
     # Honesty: if truncation removed high-specificity rows that were generated, record the
     # pre-budget count so the caller can distinguish "none generated" from "truncated away".
     orig_specific = sum(
