@@ -384,7 +384,15 @@ def call_edge_delta_for_paths(
             continue
         subj_path = _entity_path(fact["subject_id"], base)
         obj_path = _entity_path(fact["object_id"], base)
-        if _path_matches(subj_path) or _path_matches(obj_path):
+        # A file move that keeps the module/URN (e.g. index-module normalization)
+        # leaves the surviving entity's HEAD path different from its base path;
+        # match either side so head-side changed paths still select the edge.
+        subj_head_path = _entity_path(fact["subject_id"], head)
+        obj_head_path = _entity_path(fact["object_id"], head)
+        if (
+            _path_matches(subj_path) or _path_matches(obj_path)
+            or _path_matches(subj_head_path) or _path_matches(obj_head_path)
+        ):
             rows.append({
                 "change_kind": "removed",
                 "predicate": fact["predicate"],

@@ -21,7 +21,8 @@ Role derivation per role (in priority order for ranking):
   intra_repo_consumer:  default for code edges whose other endpoint is not
                         classified by any rule above.
 
-  generic_utility:      other endpoint has entity kind ExternalPackage.
+  generic_utility:      other endpoint has entity kind ExternalPackage or
+                        ExternalSymbol (see _EXTERNAL_ENTITY_KINDS).
 
 Ranking priority (highest first): test_assertion, persistence, external_side_effect,
 intra_repo_consumer, generic_utility. generic_utility is last so budget eviction removes
