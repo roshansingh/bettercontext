@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from source.kg.query.contract_diff import contract_diff_packet
 from source.kg.query.graph_diff import (
     call_edge_delta_for_paths,
     diff_snapshots,
@@ -29,6 +30,18 @@ def main() -> None:
     call_edge = subparsers.add_parser("call-edge-delta")
     call_edge.add_argument("--path", action="append", default=[], help="File path filter (repeatable)")
 
+    review_packet = subparsers.add_parser(
+        "review-packet",
+        help="Emit hypothesis-shaped contract-diff packet (guard_call_removed, responsibility_moved, test_reference_removed).",
+    )
+    review_packet.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        dest="changed_paths",
+        help="Changed file path (repeatable); used by guard_call_removed family.",
+    )
+
     args = parser.parse_args()
 
     base_dir = Path(args.base_snapshot)
@@ -43,6 +56,22 @@ def main() -> None:
         head = KgSnapshot(head_dir)
     except (FileNotFoundError, OSError) as exc:
         parser.error(f"Cannot open head snapshot {head_dir}: {exc}")
+
+    if args.command == "review-packet":
+        # review-packet bypasses the shared delta path and loads snapshots internally
+        # via contract_diff_packet (which re-opens them) to keep the packet builder
+        # self-contained.  Changed paths come from --path flags on the subcommand.
+        try:
+            result = contract_diff_packet(
+                str(base_dir),
+                str(head_dir),
+                changed_paths=getattr(args, "changed_paths", []) or [],
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
 
     try:
         delta = diff_snapshots(base, head)
