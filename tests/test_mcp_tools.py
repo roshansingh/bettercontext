@@ -8766,5 +8766,213 @@ class TestCompactSkeletonCommonContract(unittest.TestCase):
         self.assertLessEqual(size, REVIEW_CONTEXT_MAX_CHARS, f"compact size {size} exceeds 15000")
 
 
+class TestSpliceFamilyRoundRobin(unittest.TestCase):
+    """P2 regression: family diversity before the top-level [:5] cap.
+
+    All three contract-diff families populated (3+3+1) + native hypotheses.
+    After the fix, each populated family must have at least one row in the
+    returned 5; without round-robin the test-reference family is silently evicted.
+
+    Inversion evidence: the pre-fix in-order list (guard*3 + moved*3 + test*1)
+    sliced to 5 contains ZERO test rows — proven explicitly in
+    test_inversion_in_order_list_starves_test_family.
+    """
+
+    _GUARD = "guard_call_removed_drift"
+    _MOVED = "responsibility_moved_drift"
+    _TEST = "test_reference_removed_drift"
+
+    def _make_packet(self, guard_n: int, moved_n: int, test_n: int) -> dict:
+        """Build a synthetic contract_diff_packet with the given family sizes."""
+        hypotheses = []
+        for i in range(guard_n):
+            hypotheses.append({
+                "hypothesis_id": f"guard-{i}",
+                "risk_type": self._GUARD,
+                "concrete_invariant": f"guard invariant {i}",
+                "why": "guard why",
+                "source_checks": [],
+                "before_refs": [{"path": f"a.py", "line_start": i}],
+                "after_refs": [],
+            })
+        for i in range(moved_n):
+            hypotheses.append({
+                "hypothesis_id": f"moved-{i}",
+                "risk_type": self._MOVED,
+                "concrete_invariant": f"moved invariant {i}",
+                "why": "moved why",
+                "source_checks": [],
+                "before_refs": [{"path": f"b.py", "line_start": i}],
+                "after_refs": [],
+            })
+        for i in range(test_n):
+            hypotheses.append({
+                "hypothesis_id": f"test-{i}",
+                "risk_type": self._TEST,
+                "concrete_invariant": f"test invariant {i}",
+                "why": "test why",
+                "source_checks": [],
+                "before_refs": [{"path": f"c.py", "line_start": i}],
+                "after_refs": [],
+            })
+        return {
+            "contract_diff_packet": {
+                "hypotheses": hypotheses,
+                "families": {
+                    self._GUARD: guard_n,
+                    self._MOVED: moved_n,
+                    self._TEST: test_n,
+                },
+            }
+        }
+
+    def _run_splice(self, packet: dict, native_count: int = 0) -> tuple[list, str | None]:
+        """Call _splice_contract_diff_hypotheses with a patched contract_diff_packet."""
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from source.kg.product.mcp_tools import _splice_contract_diff_hypotheses
+        from source.kg.query.snapshot import KgSnapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for fname in ("entities.jsonl", "facts.jsonl", "evidence.jsonl", "coverage.jsonl"):
+                (root / fname).write_text("")
+            (root / "manifest.json").write_text(_json.dumps({"tenant_id": "default"}))
+            head_kg = KgSnapshot(root)
+            native = [
+                {
+                    "hypothesis_id": f"native-{i}",
+                    "risk_type": "swallowed_exception",
+                    "specificity": "medium",
+                    "why": "native",
+                    "source_checks": [],
+                    "negative_checks": [],
+                    "supporting_lead_ids": [],
+                    "evidence_refs": [],
+                    "source_spans": [],
+                }
+                for i in range(native_count)
+            ]
+            # Patch both the import-time and call-site references to contract_diff_packet.
+            with patch(
+                "source.kg.query.contract_diff.contract_diff_packet",
+                return_value=packet,
+            ), patch(
+                "source.kg.product.mcp_tools.contract_diff_packet",
+                return_value=packet,
+                create=True,
+            ):
+                return _splice_contract_diff_hypotheses(
+                    base_snapshot_dir=str(root),
+                    head_kg=head_kg,
+                    changed_files=["a.py"],
+                    review_hypotheses=native,
+                )
+
+    def test_inversion_in_order_list_starves_test_family(self) -> None:
+        """Inversion evidence: without round-robin, 3+3+1 in declaration order silently drops test family.
+
+        Build the pre-fix in-order spliced list (guard*3 then moved*3 then test*1,
+        capped at 3 per family = same list since each is already <=3), then apply
+        the top-level [:5] slice. The test family is at positions 6 which is beyond
+        the cap — zero test rows survive. This is the starvation bug.
+        """
+        from source.kg.product.mcp_tools import PLANNING_CONTEXT_SECTION_LIMIT
+
+        guard_ids = [f"guard-{i}" for i in range(3)]
+        moved_ids = [f"moved-{i}" for i in range(3)]
+        test_ids = ["test-0"]
+
+        # Pre-fix order: guard family first, then moved, then test.
+        in_order = (
+            [{"hypothesis_id": hid, "risk_type": self._GUARD} for hid in guard_ids]
+            + [{"hypothesis_id": hid, "risk_type": self._MOVED} for hid in moved_ids]
+            + [{"hypothesis_id": hid, "risk_type": self._TEST} for hid in test_ids]
+        )
+        capped = in_order[:PLANNING_CONTEXT_SECTION_LIMIT]
+        returned_types = [r["risk_type"] for r in capped]
+        self.assertNotIn(
+            self._TEST,
+            returned_types,
+            "Inversion evidence: in declaration order the test family is absent after [:5] — this is the bug being fixed",
+        )
+        self.assertEqual(len(capped), 5)
+
+    def test_round_robin_3_3_1_all_families_represented(self) -> None:
+        """3 guard + 3 moved + 1 test: after round-robin + [:5], each family has >= 1 row."""
+        from source.kg.product.mcp_tools import PLANNING_CONTEXT_SECTION_LIMIT
+
+        packet = self._make_packet(guard_n=3, moved_n=3, test_n=1)
+        merged, note = self._run_splice(packet, native_count=0)
+        self.assertIsNone(note, f"unexpected splice note: {note}")
+
+        capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+        self.assertEqual(len(capped), 5, f"expected 5 rows, got {len(capped)}")
+
+        returned_types = [r["risk_type"] for r in capped]
+        self.assertIn(self._GUARD, returned_types, "guard family must appear in capped list")
+        self.assertIn(self._MOVED, returned_types, "moved family must appear in capped list")
+        self.assertIn(self._TEST, returned_types, "test family must appear in capped list — round-robin fix required")
+
+    def test_omitted_count_annotated_on_last_included_row(self) -> None:
+        """When round-robin still omits rows, the last included row of each omitted family carries a count."""
+        from source.kg.product.mcp_tools import PLANNING_CONTEXT_SECTION_LIMIT
+
+        packet = self._make_packet(guard_n=3, moved_n=3, test_n=1)
+        merged, note = self._run_splice(packet, native_count=0)
+        self.assertIsNone(note)
+
+        capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+        # 3+3+1 = 7 spliced rows; round-robin: g0,m0,t0,g1,m1,g2,m2 → [:5] = g0,m0,t0,g1,m1
+        # g2 and m2 omitted: guard omitted=1, moved omitted=1, test omitted=0.
+        guard_rows = [r for r in capped if r.get("risk_type") == self._GUARD]
+        moved_rows = [r for r in capped if r.get("risk_type") == self._MOVED]
+        test_rows = [r for r in capped if r.get("risk_type") == self._TEST]
+
+        self.assertEqual(len(guard_rows), 2, "guard should have 2 rows in capped list")
+        self.assertEqual(len(moved_rows), 2, "moved should have 2 rows in capped list")
+        self.assertEqual(len(test_rows), 1, "test should have 1 row in capped list")
+
+        # Last guard row should carry omitted_contract_diff_family_count = 1
+        last_guard = guard_rows[-1]
+        self.assertEqual(
+            last_guard.get("omitted_contract_diff_family_count"),
+            1,
+            f"last guard row must carry omitted_contract_diff_family_count=1, got: {last_guard}",
+        )
+        # Last moved row should carry omitted_contract_diff_family_count = 1
+        last_moved = moved_rows[-1]
+        self.assertEqual(
+            last_moved.get("omitted_contract_diff_family_count"),
+            1,
+            f"last moved row must carry omitted_contract_diff_family_count=1, got: {last_moved}",
+        )
+        # Test family: 1 row, not omitted — no annotation.
+        last_test = test_rows[-1]
+        self.assertNotIn(
+            "omitted_contract_diff_family_count",
+            last_test,
+            "test family has no omitted rows; annotation must not be present",
+        )
+
+    def test_native_hypotheses_preserved_after_cap(self) -> None:
+        """Native hypotheses that fit after the spliced prefix are preserved."""
+        from source.kg.product.mcp_tools import PLANNING_CONTEXT_SECTION_LIMIT
+
+        # 1 guard + 1 moved + 1 test = 3 spliced, 2 native slots.
+        packet = self._make_packet(guard_n=1, moved_n=1, test_n=1)
+        merged, note = self._run_splice(packet, native_count=5)
+        self.assertIsNone(note)
+
+        capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+        self.assertEqual(len(capped), 5)
+        spliced_in_cap = [r for r in capped if r.get("risk_type") in (self._GUARD, self._MOVED, self._TEST)]
+        native_in_cap = [r for r in capped if r.get("risk_type") == "swallowed_exception"]
+        self.assertEqual(len(spliced_in_cap), 3, "all 3 spliced rows must be in the cap")
+        self.assertEqual(len(native_in_cap), 2, "2 native rows fill remaining slots")
+
+
 if __name__ == "__main__":
     unittest.main()

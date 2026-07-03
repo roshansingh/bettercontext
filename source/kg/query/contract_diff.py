@@ -12,9 +12,9 @@ Tripwire resolutions (from Phase-1 final review):
      for the changed-symbol subject roles; IMPORTS-subject kinds are not treated as guards.
 
 Boundary note:
-  This module owns query + packet-builder. The product-side splice (wiring into
-  review_hypotheses.py) is NOT done here — it belongs to Phase B when branches
-  converge. See the task-A2 report for the explicit boundary statement.
+  This module owns query + packet-builder only. Product-side splice (family
+  round-robin interleaving, omission counts, and wiring into review_hypotheses)
+  is implemented in mcp_tools._splice_contract_diff_hypotheses.
 """
 
 from typing import Any

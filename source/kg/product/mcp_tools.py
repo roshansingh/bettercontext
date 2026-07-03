@@ -3243,7 +3243,8 @@ def _splice_contract_diff_hypotheses(
     if not raw_hypotheses:
         return review_hypotheses, None
 
-    spliced: list[JsonObject] = []
+    # Group rows by family; preserve within-family order (deterministic).
+    rows_by_family: dict[str, list[JsonObject]] = {}
     family_counts: dict[str, int] = {}
     for h in raw_hypotheses:
         if not isinstance(h, dict):
@@ -3299,10 +3300,42 @@ def _splice_contract_diff_hypotheses(
             spliced_row["cause"] = cause
         if consequence is not None:
             spliced_row["consequence"] = consequence
-        spliced.append(spliced_row)
+        rows_by_family.setdefault(risk_type, []).append(spliced_row)
 
-    if not spliced:
+    if not rows_by_family:
         return review_hypotheses, None
+
+    # Round-robin across populated families: one row from each, then seconds, then thirds.
+    # Deterministic family order = sorted family names (stable across runs).
+    populated_families = sorted(rows_by_family)
+    max_per_family = max(len(rows_by_family[f]) for f in populated_families)
+    spliced: list[JsonObject] = []
+    for slot in range(max_per_family):
+        for family in populated_families:
+            rows = rows_by_family[family]
+            if slot < len(rows):
+                spliced.append(rows[slot])
+
+    # When the merged list exceeds the top-level cap, some family rows at the tail
+    # of the spliced prefix will be omitted by the [:PLANNING_CONTEXT_SECTION_LIMIT]
+    # slice in _review_context. Annotate the last included row of each affected family
+    # with a per-family omitted count so the omission is visible (mirrors
+    # omitted_removed_call_count in contract_diff_packet).
+    if len(spliced) > PLANNING_CONTEXT_SECTION_LIMIT:
+        # Identify which rows survive the cap.
+        surviving = set(id(r) for r in spliced[:PLANNING_CONTEXT_SECTION_LIMIT])
+        # For each family, count rows that don't survive.
+        for family in populated_families:
+            omitted_count = sum(1 for r in rows_by_family[family] if id(r) not in surviving)
+            if omitted_count == 0:
+                continue
+            # Annotate the last surviving row of this family.
+            last_surviving = next(
+                (r for r in reversed(spliced[:PLANNING_CONTEXT_SECTION_LIMIT]) if r.get("risk_type") == family),
+                None,
+            )
+            if last_surviving is not None:
+                last_surviving["omitted_contract_diff_family_count"] = omitted_count
 
     return spliced + review_hypotheses, None
 
