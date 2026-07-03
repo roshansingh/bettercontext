@@ -9167,6 +9167,104 @@ class TestSemanticSpliceTrustTierOrdering(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# FW3: omitted_semantic_diff_count annotation
+# ---------------------------------------------------------------------------
+
+class TestOmittedSemanticDiffCount(unittest.TestCase):
+    """omitted_semantic_diff_count is annotated on last spliced row when raw_rows > splice cap (3).
+
+    Strategy: _MAX_HYPS_PER_SYMBOL=2, so 2 differing symbols each yielding 2 hypotheses
+    produces 4 raw rows; cap is 3 → 1 omitted → last spliced row carries
+    omitted_semantic_diff_count=1.
+    """
+
+    def _make_two_symbol_tier_pair(self, root: Path) -> tuple[Path, Path, Path, Path]:
+        """2 differing CodeSymbol entities in separate files, same pattern as _make_tier_kg_pair."""
+        entities = [
+            Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "omit_repo",
+                    "module": "omit_mod",
+                    "qualname": f"omit_func_{i}",
+                    "symbol_kind": "function",
+                },
+                properties={"path": f"omit_{i}.py", "line": 1, "end_line": 4},
+            )
+            for i in range(2)
+        ]
+        snap_dir = root / "snap_omit"
+        JsonlKgStore(snap_dir).write(
+            entities=entities, facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": "default"},
+        )
+        base_dir = root / "base_omit"
+        base_dir.mkdir()
+        head_dir = root / "head_omit"
+        head_dir.mkdir()
+        for i in range(2):
+            (base_dir / f"omit_{i}.py").write_text(
+                f"def omit_func_{i}():\n    if x: raise\n    return {i}\n"
+            )
+            (head_dir / f"omit_{i}.py").write_text(
+                f"def omit_func_{i}():\n    return {i}\n"
+            )
+        return snap_dir, snap_dir, base_dir, head_dir
+
+    def test_last_spliced_row_carries_omitted_count(self) -> None:
+        """4 raw rows (2 symbols × 2 hyps each) → 3 spliced + omitted_semantic_diff_count=1 on last.
+
+        Uses the REAL _splice_semantic_diff_hypotheses via _client= seam.
+        Fake client returns 2 valid items per call so _MAX_HYPS_PER_SYMBOL=2 is fully used.
+        """
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+        from source.kg.query.snapshot import KgSnapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap_dir, base_snap_dir, base_dir, head_dir = self._make_two_symbol_tier_pair(root)
+            head_kg = KgSnapshot(snap_dir)
+
+            # 2 items per LLM call → 2 symbols × 2 items = 4 raw rows > splice cap (3)
+            fake_client = _TierFakeClient(items_per_call=2)
+            changed_symbols = [{"qualname": "omit_func_0"}, {"qualname": "omit_func_1"}]
+
+            merged, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(base_snap_dir),
+                head_kg=head_kg,
+                base_checkout=str(base_dir),
+                head_checkout=str(head_dir),
+                changed_symbols=changed_symbols,
+                review_hypotheses=[],
+                _client=fake_client,
+            )
+
+            # Inversion evidence: real splice called fake client
+            self.assertGreaterEqual(
+                fake_client.call_count, 1,
+                f"real splice must call LLM client; call_count={fake_client.call_count}",
+            )
+
+            semantic_rows = [h for h in merged if h.get("risk_type") == "contract_semantic_diff"]
+
+            # Exactly 3 semantic rows spliced (cap=3)
+            self.assertEqual(
+                len(semantic_rows), 3,
+                f"splice cap is 3; expected exactly 3 semantic rows; got {len(semantic_rows)}",
+            )
+
+            # Last spliced semantic row carries omitted_semantic_diff_count=1
+            last_semantic = semantic_rows[-1]
+            self.assertEqual(
+                last_semantic.get("omitted_semantic_diff_count"), 1,
+                f"last spliced row must carry omitted_semantic_diff_count=1; "
+                f"got {last_semantic.get('omitted_semantic_diff_count')!r}; "
+                f"keys={list(last_semantic.keys())}",
+            )
+
+
+# ---------------------------------------------------------------------------
 # FW2: Minor 11 — missing_base_snapshot status
 # ---------------------------------------------------------------------------
 

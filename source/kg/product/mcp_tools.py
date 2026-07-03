@@ -3490,9 +3490,14 @@ def _splice_semantic_diff_hypotheses(
     """Run semantic_contract_diff and splice inferred_llm hypothesis rows.
 
     Returns (merged_hypotheses, semantic_diff_status).
-    semantic_diff_status: "active" | "unavailable" | "no_api_key" | "llm_error" | "partial".
+    semantic_diff_status values:
+      "active"              — splice ran, rows available (or no differing symbols found)
+      "unavailable[:detail]"— litellm/import not available; detail is the exception string
+      "no_api_key"          — auth/API-key error from the LLM
+      "llm_error"           — all LLM calls failed with non-auth errors
+      "partial"             — at least one call succeeded and at least one failed
+      "failed:<detail>"     — catch-all for unexpected exceptions in the splice body (never raises)
     High-specificity rows are inserted at front of review_hypotheses.
-    Failure is honest: never raises, always returns a status string.
 
     _client: optional SemanticDiffLlmClient instance; if None, a real client is constructed.
     Pass a fake client in tests to exercise the real splice logic without LLM calls.

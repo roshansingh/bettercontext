@@ -793,6 +793,230 @@ class TestSemanticDiffStringClamping(unittest.TestCase):
             )
             self.assertEqual(len(rows), 0, f"garbage item (claim>1200) must be dropped; got {len(rows)} rows")
 
+    def test_adversarial_50kb_claim_through_real_splice_and_budget(self) -> None:
+        """Regression: adversarial 50KB claim through REAL splice + budget → packet <= 15,000.
+
+        Two-item response:
+          item A: claim = 50,000 chars → exceeds _DROP_CLAIM (1200) → DROPPED entirely
+          item B: claim = 500 chars   → exceeds _CLAMP_CLAIM (300) → clamped to exactly 300
+
+        Asserts:
+          (a) canonical_json(packet) size <= 15,000
+          (b) no hypothesis has postable_claim longer than 300
+          (c) item A produced NO row (50KB > _DROP_CLAIM → dropped)
+          (d) item B produced a row with postable_claim of exactly 300 chars (clamped)
+        """
+        from source.kg.core.models import canonical_json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            self.assertTrue(
+                any(e.get("kind") == "CodeSymbol" for e in head_kg.entities),
+                "fixture KG must have CodeSymbol entities — check build_kg output",
+            )
+
+            # item A: 50KB claim → must be DROPPED (> _DROP_CLAIM = 1200)
+            claim_50kb = "x" * 50_000
+            # item B: 500-char claim → above 300 clamp, below 1200 drop → CLAMPED to 300
+            claim_500 = "y" * 500
+
+            two_item_client = _FakeClient(response=[
+                {
+                    "claim": claim_50kb,
+                    "cause_line": 2,
+                    "consequence": "Consequence for 50KB item.",
+                    "negative_check": "No check.",
+                    "category": "guard_removal",
+                },
+                {
+                    "claim": claim_500,
+                    "cause_line": 3,
+                    "consequence": "Consequence for 500-char item.",
+                    "negative_check": "No check.",
+                    "category": "guard_removal",
+                },
+            ])
+
+            result = _call_tool_with_fake_client(two_item_client, head_kg, {
+                "repo": _SVC2_REPO,
+                "changed_files": ["handler.py"],
+                "base_snapshot": str(out_base),
+                "base_checkout": str(base_checkout),
+                "head_checkout": str(head_checkout),
+            })
+
+            # (a) Total packet size <= 15,000
+            packet_json = canonical_json(result)
+            packet_size = len(packet_json)
+            self.assertLessEqual(
+                packet_size, 15_000,
+                f"canonical_json packet size {packet_size} exceeds 15,000",
+            )
+
+            hyps = result.get("review_hypotheses") or []
+            semantic_hyps = [h for h in hyps if h.get("risk_type") == "contract_semantic_diff"]
+
+            # (b) No hypothesis has postable_claim longer than 300
+            for h in semantic_hyps:
+                claim_len = len(h.get("postable_claim", ""))
+                self.assertLessEqual(
+                    claim_len, 300,
+                    f"postable_claim length {claim_len} exceeds 300; claim={h.get('postable_claim', '')[:60]!r}",
+                )
+
+            # (c) 50KB item produced NO row (dropped because claim > _DROP_CLAIM = 1200)
+            fifty_kb_rows = [
+                h for h in semantic_hyps
+                if h.get("postable_claim", "").startswith("x" * 50)
+            ]
+            self.assertEqual(
+                len(fifty_kb_rows), 0,
+                f"50KB claim item must be dropped; found {len(fifty_kb_rows)} rows with x-prefix",
+            )
+
+            # (d) 500-char item → postable_claim exactly 300 chars (clamped)
+            clamped_rows = [
+                h for h in semantic_hyps
+                if h.get("postable_claim", "").startswith("y")
+            ]
+            self.assertEqual(
+                len(clamped_rows), 1,
+                f"500-char claim item must produce exactly 1 row; got {len(clamped_rows)}",
+            )
+            self.assertEqual(
+                len(clamped_rows[0].get("postable_claim", "")), 300,
+                f"clamped postable_claim must be exactly 300 chars; "
+                f"got {len(clamped_rows[0].get('postable_claim', ''))}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# 8. Claim dedupe: first wins, different claims → 2 rows
+# ---------------------------------------------------------------------------
+
+class TestSemanticDiffClaimDedupe(unittest.TestCase):
+    """Problem D: per-symbol claim dedupe — first item wins on duplicate claim text."""
+
+    def _make_single_symbol_snap_dedupe(self, root: Path) -> tuple[KgSnapshot, Path, Path]:
+        """Return (snap, base_dir, head_dir) for a single differing symbol."""
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        e = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_dedupe",
+                "module": "mod.handler",
+                "qualname": "dedupe_func",
+                "symbol_kind": "function",
+            },
+            properties={"path": "handler.py", "line": 1, "end_line": 4},
+        )
+        snap_dir = root / "snap_dedupe"
+        JsonlKgStore(snap_dir).write(
+            entities=[e], facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": TENANT},
+        )
+        snap = KgSnapshot(snap_dir)
+
+        base_dir = root / "base_dedupe"
+        base_dir.mkdir()
+        (base_dir / "handler.py").write_text("def dedupe_func():\n    if x: raise\n    return 42\n")
+        head_dir = root / "head_dedupe"
+        head_dir.mkdir()
+        (head_dir / "handler.py").write_text("def dedupe_func():\n    return 42\n")
+
+        return snap, base_dir, head_dir
+
+    def test_identical_claims_dedupe_to_one_row_first_category_wins(self) -> None:
+        """Two items with IDENTICAL claim text → exactly 1 row; category = first item's category."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap_dedupe(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            shared_claim = "Guard removed from dedupe_func."
+            client = _FakeClient(response=[
+                {
+                    "claim": shared_claim,
+                    "cause_line": 2,
+                    "consequence": "Callers may pass None.",
+                    "negative_check": "No check A.",
+                    "category": "guard_removal",   # first item's category — must win
+                },
+                {
+                    "claim": shared_claim,          # IDENTICAL claim text
+                    "cause_line": 3,
+                    "consequence": "Data loss possible.",
+                    "negative_check": "No check B.",
+                    "category": "ownership_moved",  # second item's category — must be dropped
+                },
+            ])
+
+            rows, _status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+
+            self.assertEqual(
+                len(rows), 1,
+                f"identical claims must produce exactly 1 row; got {len(rows)}",
+            )
+            self.assertEqual(
+                rows[0].get("category"), "guard_removal",
+                f"first item's category must win; got {rows[0].get('category')!r}",
+            )
+
+    def test_different_claims_produce_two_rows(self) -> None:
+        """Inversion: two items with DIFFERENT claim texts → 2 rows (up to _MAX_HYPS_PER_SYMBOL=2)."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap_dedupe(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _FakeClient(response=[
+                {
+                    "claim": "Guard removed from dedupe_func.",
+                    "cause_line": 2,
+                    "consequence": "Callers may pass None.",
+                    "negative_check": "No check.",
+                    "category": "guard_removal",
+                },
+                {
+                    "claim": "Return type widened to include None.",  # different claim
+                    "cause_line": 3,
+                    "consequence": "Callers expecting non-None may crash.",
+                    "negative_check": "No check.",
+                    "category": "return_type_widened",
+                },
+            ])
+
+            rows, _status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,
+            )
+
+            self.assertEqual(
+                len(rows), 2,
+                f"different claims must produce exactly 2 rows (_MAX_HYPS_PER_SYMBOL=2); got {len(rows)}",
+            )
+
 
 # ---------------------------------------------------------------------------
 # 5. Prefilter-before-cap tests
