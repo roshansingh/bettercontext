@@ -8978,80 +8978,192 @@ class TestSpliceFamilyRoundRobin(unittest.TestCase):
 # FW2: Problem A — trust-tier ordering in _splice_semantic_diff_hypotheses
 # ---------------------------------------------------------------------------
 
+class _TierFakeClient:
+    """Minimal fake LLM client for tier-ordering tests."""
+
+    def __init__(self, items_per_call: int = 1) -> None:
+        self._items_per_call = items_per_call
+        self.call_count = 0
+
+    def complete_json(self, prompt: str) -> list:
+        self.call_count += 1
+        return [
+            {
+                "claim": f"Claim {j} from call {self.call_count}",
+                "cause_line": 2,
+                "consequence": "Consequence text.",
+                "negative_check": "Negative check text.",
+                "category": "guard_removal",
+            }
+            for j in range(self._items_per_call)
+        ]
+
+
 class TestSemanticSpliceTrustTierOrdering(unittest.TestCase):
-    """Problem A: deterministic_static rows must come before inferred_llm rows after splice."""
+    """Problem A: deterministic_static rows must come before inferred_llm rows after splice.
+
+    Uses the REAL _splice_semantic_diff_hypotheses via _client= seam. No merge reimplementation.
+    """
+
+    def _make_tier_kg_pair(self, root: Path, num_symbols: int = 1) -> tuple[Path, Path, Path, Path]:
+        """Build a minimal KG pair with num_symbols differing CodeSymbol entities."""
+        entities = []
+        for i in range(num_symbols):
+            entities.append(Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "tier_repo",
+                    "module": "tier_mod",
+                    "qualname": f"tier_func_{i}",
+                    "symbol_kind": "function",
+                },
+                properties={"path": f"tier_{i}.py", "line": 1, "end_line": 4},
+            ))
+        snap_dir = root / "snap_tier"
+        JsonlKgStore(snap_dir).write(
+            entities=entities, facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": "default"},
+        )
+
+        base_dir = root / "base_tier"
+        base_dir.mkdir()
+        head_dir = root / "head_tier"
+        head_dir.mkdir()
+        for i in range(num_symbols):
+            (base_dir / f"tier_{i}.py").write_text(
+                f"def tier_func_{i}():\n    if x: raise\n    return {i}\n"
+            )
+            (head_dir / f"tier_{i}.py").write_text(
+                f"def tier_func_{i}():\n    return {i}\n"
+            )
+
+        return snap_dir, snap_dir, base_dir, head_dir
 
     def test_deterministic_rows_before_semantic_rows_after_splice(self) -> None:
-        """3 deterministic + 3 semantic rows → after [:5] cap, deterministic rows first.
+        """3 deterministic + splice with 1 semantic → deterministic rows precede semantic.
 
-        Tests the ordering logic directly: given existing hypotheses with 3 deterministic-static
-        rows and 3 pre-spliced semantic rows, the merge must produce det_rows + semantic + llm_rows.
+        Calls the REAL _splice_semantic_diff_hypotheses with _client=fake so the actual
+        merge logic is tested, not a re-implementation in the test body.
         """
-        from source.kg.product.mcp_tools import PLANNING_CONTEXT_SECTION_LIMIT
+        from source.kg.product.mcp_tools import (
+            _splice_semantic_diff_hypotheses,
+            PLANNING_CONTEXT_SECTION_LIMIT,
+        )
+        from source.kg.query.snapshot import KgSnapshot
 
-        # Pre-existing hypotheses: 3 deterministic (derivation != inferred_llm)
-        existing_hyps = [
-            {
-                "hypothesis_id": f"det-{i}",
-                "risk_type": "guard_call_removed_drift",
-                "specificity": "high",
-                "derivation": "deterministic_static",
-            }
-            for i in range(3)
-        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap_dir, base_snap_dir, base_dir, head_dir = self._make_tier_kg_pair(root, num_symbols=1)
+            head_kg = KgSnapshot(snap_dir)
 
-        # Fake semantic rows (would come from _splice_semantic_diff_hypotheses)
-        semantic_rows = [
-            {
-                "hypothesis_id": f"sem-{i}",
-                "risk_type": "contract_semantic_diff",
-                "specificity": "high",
-                "derivation": "inferred_llm",
-            }
-            for i in range(3)
-        ]
+            # 3 pre-existing deterministic hypotheses
+            existing_hyps = [
+                {
+                    "hypothesis_id": f"det-{i}",
+                    "risk_type": "guard_call_removed_drift",
+                    "specificity": "high",
+                    "derivation": "deterministic_static",
+                }
+                for i in range(3)
+            ]
 
-        # Replicate the trust-tier merge logic from _splice_semantic_diff_hypotheses
-        det_rows = [h for h in existing_hyps if h.get("derivation") != "inferred_llm"]
-        llm_rows = [h for h in existing_hyps if h.get("derivation") == "inferred_llm"]
-        merged = det_rows + semantic_rows + llm_rows
+            fake_client = _TierFakeClient(items_per_call=1)
+            # changed_symbols must carry top-level qualname for entity matching
+            changed_symbols = [{"qualname": "tier_func_0"}]
 
-        # After [:5] cap: all 3 det + 2 sem (det rows must come first)
-        capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
-        self.assertEqual(len(capped), 5)
-        # First 3 must be deterministic
-        for i in range(3):
-            self.assertEqual(
-                capped[i].get("derivation"), "deterministic_static",
-                f"row {i} must be deterministic_static; got {capped[i].get('derivation')}",
+            merged, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(base_snap_dir),
+                head_kg=head_kg,
+                base_checkout=str(base_dir),
+                head_checkout=str(head_dir),
+                changed_symbols=changed_symbols,
+                review_hypotheses=existing_hyps,
+                _client=fake_client,
             )
-        # Rows 3-4 must be semantic
-        for i in range(3, 5):
-            self.assertEqual(
-                capped[i].get("derivation"), "inferred_llm",
-                f"row {i} must be inferred_llm; got {capped[i].get('derivation')}",
+
+            # Inversion evidence: real splice called fake client
+            self.assertGreaterEqual(
+                fake_client.call_count, 1,
+                f"real splice must call LLM client; call_count={fake_client.call_count}",
             )
+
+            semantic_rows = [h for h in merged if h.get("risk_type") == "contract_semantic_diff"]
+            self.assertTrue(semantic_rows, f"expected >=1 semantic row; merged={[h.get('risk_type') for h in merged]}")
+
+            # Deterministic rows must all precede the first semantic row
+            first_sem_idx = next(
+                i for i, h in enumerate(merged) if h.get("risk_type") == "contract_semantic_diff"
+            )
+            det_rows_in_merged = [h for h in merged if h.get("derivation") == "deterministic_static"]
+            self.assertEqual(len(det_rows_in_merged), 3, f"all 3 deterministic rows must survive; got {len(det_rows_in_merged)}")
+            for i, h in enumerate(merged[:first_sem_idx]):
+                self.assertEqual(
+                    h.get("derivation"), "deterministic_static",
+                    f"row {i} before first semantic must be deterministic_static; got {h.get('derivation')}",
+                )
+
+            # After PLANNING_CONTEXT_SECTION_LIMIT cap, deterministic rows survive first
+            capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+            first_capped_sem = next(
+                (i for i, h in enumerate(capped) if h.get("risk_type") == "contract_semantic_diff"), None
+            )
+            if first_capped_sem is not None:
+                for i in range(first_capped_sem):
+                    self.assertEqual(
+                        capped[i].get("derivation"), "deterministic_static",
+                        f"capped row {i} must be deterministic_static; got {capped[i].get('derivation')}",
+                    )
 
     def test_existing_llm_rows_pushed_after_semantic_rows(self) -> None:
-        """Existing inferred_llm rows are placed AFTER new semantic rows in the merged list."""
-        # Pre-existing: 2 deterministic + 1 existing LLM row
-        existing_hyps = [
-            {"hypothesis_id": "det-0", "risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
-            {"hypothesis_id": "det-1", "risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
-            {"hypothesis_id": "old-llm-0", "risk_type": "swallowed_exception", "derivation": "inferred_llm"},
-        ]
-        new_semantic = [
-            {"hypothesis_id": "sem-0", "risk_type": "contract_semantic_diff", "derivation": "inferred_llm"},
-        ]
-        det_rows = [h for h in existing_hyps if h.get("derivation") != "inferred_llm"]
-        llm_rows = [h for h in existing_hyps if h.get("derivation") == "inferred_llm"]
-        merged = det_rows + new_semantic + llm_rows
+        """Existing inferred_llm rows appear AFTER new semantic rows from splice.
 
-        # Order: det-0, det-1, sem-0, old-llm-0
-        self.assertEqual(merged[0]["hypothesis_id"], "det-0")
-        self.assertEqual(merged[1]["hypothesis_id"], "det-1")
-        self.assertEqual(merged[2]["hypothesis_id"], "sem-0")
-        self.assertEqual(merged[3]["hypothesis_id"], "old-llm-0")
+        Calls the REAL _splice_semantic_diff_hypotheses with _client=fake.
+        """
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+        from source.kg.query.snapshot import KgSnapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap_dir, base_snap_dir, base_dir, head_dir = self._make_tier_kg_pair(root, num_symbols=1)
+            head_kg = KgSnapshot(snap_dir)
+
+            # 2 deterministic + 1 existing inferred_llm row
+            existing_hyps = [
+                {"hypothesis_id": "det-0", "risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
+                {"hypothesis_id": "det-1", "risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
+                {"hypothesis_id": "old-llm-0", "risk_type": "swallowed_exception", "derivation": "inferred_llm"},
+            ]
+
+            fake_client = _TierFakeClient(items_per_call=1)
+            changed_symbols = [{"qualname": "tier_func_0"}]
+
+            merged, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(base_snap_dir),
+                head_kg=head_kg,
+                base_checkout=str(base_dir),
+                head_checkout=str(head_dir),
+                changed_symbols=changed_symbols,
+                review_hypotheses=existing_hyps,
+                _client=fake_client,
+            )
+
+            # Inversion evidence
+            self.assertGreaterEqual(fake_client.call_count, 1,
+                f"real splice must call client; call_count={fake_client.call_count}")
+
+            semantic_hyps = [h for h in merged if h.get("risk_type") == "contract_semantic_diff"]
+            self.assertTrue(semantic_hyps, "expected >=1 semantic row after splice")
+
+            # The old inferred_llm row must come AFTER all new semantic rows
+            sem_indices = [i for i, h in enumerate(merged) if h.get("risk_type") == "contract_semantic_diff"]
+            old_llm_indices = [i for i, h in enumerate(merged) if h.get("hypothesis_id") == "old-llm-0"]
+            self.assertTrue(old_llm_indices, "old-llm-0 must survive in merged list")
+            self.assertGreater(
+                old_llm_indices[0], max(sem_indices),
+                f"old inferred_llm row must come after all semantic rows; "
+                f"old_llm_idx={old_llm_indices[0]} sem_indices={sem_indices}",
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,10 @@ from source.kg.query.snapshot import KgSnapshot
 
 TENANT = "default"
 
+# Real repo names assigned by build_kg — the svc directory name, not the tenant ID.
+_SVC2_REPO = "svc2"      # _build_two_snapshot_pair
+_SVC_TWO_REPO = "svc_two"  # _build_two_symbol_snapshot_pair
+
 _FAKE_RESPONSE = [
     {
         "claim": "Function no longer validates input before processing",
@@ -168,25 +172,76 @@ def _make_minimal_kg(root: Path, tenant_id: str = "default") -> KgSnapshot:
 # 1. End-to-end with mocked client and real build_kg fixture
 # ---------------------------------------------------------------------------
 
-class TestSemanticDiffEndToEnd(unittest.TestCase):
-    """Mocked client: end-to-end call_tool on real two-commit fixture pair."""
+def _call_tool_with_fake_client(
+    fake_client: _FakeClient,
+    head_kg: KgSnapshot,
+    arguments: dict,
+) -> dict:
+    """Call call_tool routing through the REAL _splice_semantic_diff_hypotheses with a fake client.
 
-    def _run_with_mock_client(self, head_kg: KgSnapshot, base_dir: Path, svc_dir: Path) -> dict:
-        from unittest.mock import patch
-        fake_client = _FakeClient()
-        with patch(
-            "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
-            wraps=lambda **kw: _splice_with_fake_client(fake_client, **kw),
-        ):
-            result = call_tool(head_kg, "review_context", {
-                "repo": TENANT,
+    Patches _splice_semantic_diff_hypotheses with a wrapper that passes _client=fake_client,
+    so the real splice logic runs but uses the fake client instead of a live LLM.
+    """
+    from unittest.mock import patch
+    from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses as _real_splice
+
+    def _with_fake(**kw: object) -> tuple:
+        return _real_splice(**kw, _client=fake_client)  # type: ignore[arg-type]
+
+    with patch(
+        "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
+        side_effect=lambda **kw: _with_fake(**kw),
+    ):
+        return call_tool(head_kg, "review_context", arguments)
+
+
+class TestSemanticDiffEndToEnd(unittest.TestCase):
+    """Mocked client: end-to-end call_tool on real two-commit fixture pair.
+
+    All tests route through the REAL _splice_semantic_diff_hypotheses via the _client seam.
+    No bypass helpers — real splice logic is exercised in every test.
+    """
+
+    def test_real_splice_calls_fake_client(self) -> None:
+        """Real _splice_semantic_diff_hypotheses exercises fake client (call_count >= 1).
+
+        Inversion evidence: call_count >= 1 proves the real splice path ran, not a bypass.
+        Also asserts >=1 contract_semantic_diff hypothesis in the result.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            # Hard assert: fixture KG must have CodeSymbol entities for the splice to exercise
+            self.assertTrue(
+                any(e.get("kind") == "CodeSymbol" for e in head_kg.entities),
+                "fixture KG must have CodeSymbol entities — check build_kg output",
+            )
+
+            fake_client = _FakeClient()
+            result = _call_tool_with_fake_client(fake_client, head_kg, {
+                "repo": _SVC2_REPO,
                 "changed_files": ["handler.py"],
-                "changed_ranges": [{"path": "handler.py", "start_line": 1, "end_line": 5}],
-                "base_snapshot": str(base_dir),
-                "base_checkout": str(svc_dir),
-                "head_checkout": str(svc_dir),
+                # No changed_ranges: avoids compact-unanchored path stripping hypotheses.
+                "base_snapshot": str(out_base),
+                "base_checkout": str(base_checkout),
+                "head_checkout": str(head_checkout),
             })
-        return result
+
+            # Inversion evidence: the real splice called the fake client
+            self.assertGreaterEqual(
+                fake_client.call_count, 1,
+                f"real splice must call LLM client; call_count={fake_client.call_count}",
+            )
+            # At least 1 semantic hypothesis in result
+            hyps = result.get("review_hypotheses") or []
+            semantic_hyps = [h for h in hyps if h.get("risk_type") == "contract_semantic_diff"]
+            self.assertTrue(
+                semantic_hyps,
+                f"expected >=1 contract_semantic_diff hypothesis via real splice; "
+                f"got risk_types={[h.get('risk_type') for h in hyps]}",
+            )
 
     def test_semantic_diff_hypothesis_in_result(self) -> None:
         """contract_semantic_diff hypothesis present with derivation=inferred_llm.
@@ -201,21 +256,22 @@ class TestSemanticDiffEndToEnd(unittest.TestCase):
             out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
             head_kg = KgSnapshot(out_head)
 
+            # Hard assert: fixture KG must have CodeSymbol entities
+            self.assertTrue(
+                any(e.get("kind") == "CodeSymbol" for e in head_kg.entities),
+                "fixture KG must have CodeSymbol entities — check build_kg output",
+            )
+
             fake_client = _FakeClient()
-            from unittest.mock import patch
-            with patch(
-                "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
-                side_effect=lambda **kw: _direct_splice(fake_client, **kw),
-            ):
-                result = call_tool(head_kg, "review_context", {
-                    "repo": TENANT,
-                    "changed_files": ["handler.py"],
-                    # No changed_ranges: avoids the zero-anchor compact-unanchored path
-                    # so review_hypotheses are retained in the full result.
-                    "base_snapshot": str(out_base),
-                    "base_checkout": str(base_checkout),
-                    "head_checkout": str(head_checkout),
-                })
+            result = _call_tool_with_fake_client(fake_client, head_kg, {
+                "repo": _SVC2_REPO,
+                "changed_files": ["handler.py"],
+                # No changed_ranges: avoids the zero-anchor compact-unanchored path
+                # so review_hypotheses are retained in the full result.
+                "base_snapshot": str(out_base),
+                "base_checkout": str(base_checkout),
+                "head_checkout": str(head_checkout),
+            })
 
             hyps = result.get("review_hypotheses") or []
             semantic_hyps = [h for h in hyps if h.get("risk_type") == "contract_semantic_diff"]
@@ -241,18 +297,13 @@ class TestSemanticDiffEndToEnd(unittest.TestCase):
             head_kg = KgSnapshot(out_head)
 
             fake_client = _FakeClient()
-            from unittest.mock import patch
-            with patch(
-                "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
-                side_effect=lambda **kw: _direct_splice(fake_client, **kw),
-            ):
-                result = call_tool(head_kg, "review_context", {
-                    "repo": TENANT,
-                    "changed_files": ["handler.py"],
-                    "base_snapshot": str(out_base),
-                    "base_checkout": str(base_checkout),
-                    "head_checkout": str(head_checkout),
-                })
+            result = _call_tool_with_fake_client(fake_client, head_kg, {
+                "repo": _SVC2_REPO,
+                "changed_files": ["handler.py"],
+                "base_snapshot": str(out_base),
+                "base_checkout": str(base_checkout),
+                "head_checkout": str(head_checkout),
+            })
 
             rqs = result.get("review_quality_status") or {}
             self.assertEqual(
@@ -273,19 +324,14 @@ class TestSemanticDiffEndToEnd(unittest.TestCase):
             head_kg = KgSnapshot(out_head)
 
             fake_client = _FakeClient()
-            from unittest.mock import patch
-            with patch(
-                "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
-                side_effect=lambda **kw: _direct_splice(fake_client, **kw),
-            ):
-                result = call_tool(head_kg, "review_context", {
-                    "repo": TENANT,
-                    "changed_files": ["handler.py"],
-                    # No changed_ranges: avoids compact-unanchored path.
-                    "base_snapshot": str(out_base),
-                    "base_checkout": str(base_checkout),
-                    "head_checkout": str(head_checkout),
-                })
+            result = _call_tool_with_fake_client(fake_client, head_kg, {
+                "repo": _SVC2_REPO,
+                "changed_files": ["handler.py"],
+                # No changed_ranges: avoids compact-unanchored path.
+                "base_snapshot": str(out_base),
+                "base_checkout": str(base_checkout),
+                "head_checkout": str(head_checkout),
+            })
 
             hyps = result.get("review_hypotheses") or []
             semantic_hyps = [h for h in hyps if h.get("risk_type") == "contract_semantic_diff"]
@@ -295,39 +341,6 @@ class TestSemanticDiffEndToEnd(unittest.TestCase):
             # cause/consequence are conditional on cause_line being in-range (Problem C fix).
             for field in ("negative_checks", "source_checks", "confidence", "why"):
                 self.assertIn(field, h, f"field {field!r} must be present; keys={list(h.keys())}")
-
-
-def _direct_splice(fake_client: _FakeClient, **kw) -> tuple[list[JsonObject], str]:
-    """Calls the real semantic_contract_diff with a fake LLM client."""
-    from pathlib import Path
-    from source.kg.query.semantic_contract_diff import semantic_contract_diff
-    from source.kg.query.snapshot import KgSnapshot as _KgSnap
-
-    base_snapshot_dir = kw["base_snapshot_dir"]
-    head_kg = kw["head_kg"]
-    base_checkout = kw["base_checkout"]
-    head_checkout = kw["head_checkout"]
-    review_hypotheses = kw["review_hypotheses"]
-
-    head_entities = [e for e in head_kg.entities if e.get("kind") == "CodeSymbol"]
-    if not head_entities:
-        return review_hypotheses, "active"
-
-    try:
-        base_snap = _KgSnap(base_snapshot_dir)
-        raw_rows, status = semantic_contract_diff(
-            base_snapshot=base_snap,
-            head_snapshot=head_kg,
-            base_root=Path(base_checkout),
-            head_root=Path(head_checkout),
-            changed_symbols=head_entities,
-            client=fake_client,
-        )
-    except Exception:  # noqa: BLE001
-        return review_hypotheses, "failed:test"
-
-    spliced = [r for r in raw_rows if isinstance(r, dict) and r.get("hypothesis_id")][:3]
-    return spliced + review_hypotheses, status
 
 
 # ---------------------------------------------------------------------------
@@ -345,19 +358,13 @@ class TestSemanticDiffFailures(unittest.TestCase):
             head_kg = KgSnapshot(out_head)
 
             malformed_client = _FakeClient(return_malformed=True)
-
-            from unittest.mock import patch
-            with patch(
-                "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
-                side_effect=lambda **kw: _direct_splice(malformed_client, **kw),
-            ):
-                result = call_tool(head_kg, "review_context", {
-                    "repo": TENANT,
-                    "changed_files": ["handler.py"],
-                    "base_snapshot": str(out_base),
-                    "base_checkout": str(base_checkout),
-                    "head_checkout": str(head_checkout),
-                })
+            result = _call_tool_with_fake_client(malformed_client, head_kg, {
+                "repo": _SVC2_REPO,
+                "changed_files": ["handler.py"],
+                "base_snapshot": str(out_base),
+                "base_checkout": str(base_checkout),
+                "head_checkout": str(head_checkout),
+            })
 
             # No exception raised; result is a dict
             self.assertIsInstance(result, dict)
@@ -431,7 +438,6 @@ class TestSemanticDiffFailures(unittest.TestCase):
     def test_all_llm_calls_fail_produces_llm_error_status(self) -> None:
         """All LLM calls failing → status == 'llm_error' (exact)."""
         from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
-        from source.kg.query.snapshot import KgSnapshot as _KgSnap
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -443,16 +449,15 @@ class TestSemanticDiffFailures(unittest.TestCase):
             # changed_symbols must carry top-level qualname so _splice can match head_entities
             changed_symbols = [{"qualname": "process"}]
 
-            from unittest.mock import patch
-            with patch("source.kg.integrations.semantic_llm.SemanticDiffLlmClient", return_value=failing_client):
-                _, status = _splice_semantic_diff_hypotheses(
-                    base_snapshot_dir=str(out_base),
-                    head_kg=head_kg,
-                    base_checkout=str(base_checkout),
-                    head_checkout=str(head_checkout),
-                    changed_symbols=changed_symbols,
-                    review_hypotheses=[],
-                )
+            _, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(out_base),
+                head_kg=head_kg,
+                base_checkout=str(base_checkout),
+                head_checkout=str(head_checkout),
+                changed_symbols=changed_symbols,
+                review_hypotheses=[],
+                _client=failing_client,
+            )
             self.assertEqual(status, "llm_error", f"expected 'llm_error'; got {status!r}")
 
     def test_auth_failure_produces_no_api_key_status(self) -> None:
@@ -469,16 +474,15 @@ class TestSemanticDiffFailures(unittest.TestCase):
             # changed_symbols must carry top-level qualname so _splice can match head_entities
             changed_symbols = [{"qualname": "process"}]
 
-            from unittest.mock import patch
-            with patch("source.kg.integrations.semantic_llm.SemanticDiffLlmClient", return_value=auth_client):
-                _, status = _splice_semantic_diff_hypotheses(
-                    base_snapshot_dir=str(out_base),
-                    head_kg=head_kg,
-                    base_checkout=str(base_checkout),
-                    head_checkout=str(head_checkout),
-                    changed_symbols=changed_symbols,
-                    review_hypotheses=[],
-                )
+            _, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(out_base),
+                head_kg=head_kg,
+                base_checkout=str(base_checkout),
+                head_checkout=str(head_checkout),
+                changed_symbols=changed_symbols,
+                review_hypotheses=[],
+                _client=auth_client,
+            )
             self.assertEqual(status, "no_api_key", f"expected 'no_api_key'; got {status!r}")
 
     def test_partial_failure_produces_partial_status(self) -> None:
@@ -495,16 +499,15 @@ class TestSemanticDiffFailures(unittest.TestCase):
             # Pass both differing symbol qnames so head_entities matching finds them
             changed_symbols = [{"qualname": "func_a"}, {"qualname": "func_b"}]
 
-            from unittest.mock import patch
-            with patch("source.kg.integrations.semantic_llm.SemanticDiffLlmClient", return_value=partial_client):
-                _, status = _splice_semantic_diff_hypotheses(
-                    base_snapshot_dir=str(out_base),
-                    head_kg=head_kg,
-                    base_checkout=str(base_checkout),
-                    head_checkout=str(head_checkout),
-                    changed_symbols=changed_symbols,
-                    review_hypotheses=[],
-                )
+            _, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(out_base),
+                head_kg=head_kg,
+                base_checkout=str(base_checkout),
+                head_checkout=str(head_checkout),
+                changed_symbols=changed_symbols,
+                review_hypotheses=[],
+                _client=partial_client,
+            )
             # Only "partial" if at least 2 differing symbols exist (>=2 LLM calls attempted)
             if partial_client.call_count >= 2:
                 self.assertEqual(status, "partial", f"expected 'partial'; got {status!r}")

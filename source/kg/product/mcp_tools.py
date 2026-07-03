@@ -3485,6 +3485,7 @@ def _splice_semantic_diff_hypotheses(
     head_checkout: str,
     changed_symbols: list[JsonObject],
     review_hypotheses: list[JsonObject],
+    _client: "SemanticDiffLlmClient | None" = None,  # injection seam for tests
 ) -> tuple[list[JsonObject], str]:
     """Run semantic_contract_diff and splice inferred_llm hypothesis rows.
 
@@ -3492,6 +3493,9 @@ def _splice_semantic_diff_hypotheses(
     semantic_diff_status: "active" | "unavailable" | "no_api_key" | "llm_error" | "partial".
     High-specificity rows are inserted at front of review_hypotheses.
     Failure is honest: never raises, always returns a status string.
+
+    _client: optional SemanticDiffLlmClient instance; if None, a real client is constructed.
+    Pass a fake client in tests to exercise the real splice logic without LLM calls.
     """
     from pathlib import Path
 
@@ -3523,7 +3527,7 @@ def _splice_semantic_diff_hypotheses(
 
     try:
         base_snap = _KgSnap(base_snapshot_dir)
-        client = SemanticDiffLlmClient()
+        client = _client if _client is not None else SemanticDiffLlmClient()
         raw_rows, inner_status = semantic_contract_diff(
             base_snapshot=base_snap,
             head_snapshot=head_kg,
