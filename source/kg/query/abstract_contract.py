@@ -25,13 +25,17 @@ Mechanism (pure ``ast`` + KG structure; NO regex, NO name/keyword lists):
      ``@property`` + ``@abstractmethod``). Collect the required abstract member
      names (functions + properties).
   5. ``unimplemented`` = abstract members with no same-name def/assignment in the
-     changed subclass body AND not concretely supplied by any OTHER base in the MRO.
-     Every other head base (mixin or concrete parent) is resolved + parsed; its
-     concrete members (def/assign not decorated abstractmethod) are subtracted. If
-     ANY other base cannot be resolved or parsed, the row is SUPPRESSED — an unseen
-     base could satisfy the contract, so a high-confidence claim must not survive that
-     uncertainty. Single-base reparenting (no other bases) is never suppressed. Emit a
-     row ONLY when ``unimplemented`` is non-empty. An empty subclass body (only
+     changed subclass body AND not concretely supplied by a PRECEDING base in the MRO.
+     Only head bases listed BEFORE the abstract base can satisfy its contract:
+     ``getattr`` walks the MRO left-to-right, so for ``class W(Base, Mixin)`` the
+     abstract member on ``Base`` resolves to ``Base`` — a later ``Mixin`` does NOT
+     satisfy it. Each preceding base (mixin or concrete parent) is resolved + parsed;
+     its concrete members (def/assign not decorated abstractmethod) are subtracted. If
+     ANY preceding base cannot be resolved or parsed, the row is SUPPRESSED — an unseen
+     preceding base could satisfy the contract, so a high-confidence claim must not
+     survive that uncertainty. Bases listed AFTER the abstract base are irrelevant to it
+     and never suppress the row. Reparenting with no preceding base is never suppressed.
+     Emit a row ONLY when ``unimplemented`` is non-empty. An empty subclass body (only
      ``pass``/``...``/docstring) is a strengthening signal included in the claim.
   6. Best-effort instantiation evidence: scan head-snapshot CALLS facts whose
      callee is the subclass symbol; if found, the first referencing coordinate is
@@ -212,10 +216,22 @@ def _has_abstractmethod_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) 
 def _base_is_abstract_and_members(class_def: ast.ClassDef) -> tuple[bool, tuple[str, ...]]:
     """Return (is_abstract, required_member_names) for a base ClassDef.
 
-    is_abstract when the class's own bases include ``ABC``/``abc.ABC``, OR a
-    ``metaclass=ABCMeta`` keyword is present, OR any member carries an
-    ``abstractmethod`` decorator. required_member_names are the names of members
-    (functions + properties) decorated ``abstractmethod``.
+    A base blocks instantiation only when BOTH hold: (a) it declares one or more
+    ``abstractmethod``-decorated members, AND (b) it is governed by ``ABCMeta`` —
+    i.e. its own bases include ``ABC``/``abc.ABC`` or a ``metaclass=ABCMeta``
+    keyword is present. This mirrors Python semantics: ``@abstractmethod`` is inert
+    under the default ``type`` metaclass; a plain class with an abstractmethod-
+    decorated member is still instantiable. Conversely an ABC with zero abstract
+    members is instantiable too, so the abstract-member requirement is also load-
+    bearing (the caller further guards on a non-empty member set).
+
+    Known conservative limitation: a base that inherits ``ABCMeta`` transitively
+    (its own parent is ``ABC``) but carries no LOCAL ``ABC``/``metaclass`` marker is
+    reported non-abstract here — a false negative in the safe direction, since only
+    the DIRECT base def is inspected.
+
+    required_member_names are the names of members (functions + properties)
+    decorated ``abstractmethod``.
     """
     abstract_members: list[str] = []
     for stmt in class_def.body:
@@ -230,7 +246,7 @@ def _base_is_abstract_and_members(class_def: ast.ClassDef) -> tuple[bool, tuple[
         for kw in class_def.keywords
     )
 
-    is_abstract = bool(abstract_members) or base_marks_abc or metaclass_is_abcmeta
+    is_abstract = bool(abstract_members) and (base_marks_abc or metaclass_is_abcmeta)
     return is_abstract, tuple(dict.fromkeys(abstract_members))
 
 
@@ -533,14 +549,16 @@ def abstract_contract_diff(
             if abstract_base is None:
                 continue
 
-            # MRO fail-closed: any OTHER base (mixin or concrete parent) can supply the
-            # abstract members via the MRO. Resolve every other head base and subtract its
-            # concrete members. If ANY other base cannot be resolved or parsed, an
-            # unseen implementation could exist — suppress the row entirely.
-            other_bases = [b for b in head_bases if b != base_name]
+            # MRO fail-closed, order-sensitive: getattr walks the MRO left-to-right, so
+            # only bases listed BEFORE this abstract base can supply its members. Resolve
+            # each preceding head base and subtract its concrete members. If ANY preceding
+            # base cannot be resolved or parsed, an unseen implementation could exist —
+            # suppress the row. Bases listed AFTER the abstract base are irrelevant to it.
+            base_index = head_bases.index(base_name)
+            preceding_bases = head_bases[:base_index]
             mro_supplied: set[str] = set()
             suppressed = False
-            for other_name in other_bases:
+            for other_name in preceding_bases:
                 other_entity = _resolve_base_entity(other_name, head_snapshot, subclass_repo)
                 if other_entity is None:
                     suppressed = True

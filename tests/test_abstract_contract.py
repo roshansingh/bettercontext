@@ -13,9 +13,12 @@ Cases:
   * negative_concrete— new base is NOT abstract → no row
   * negative_same    — base list unchanged → no row
   * ambiguity        — two same-named base candidates, bare name → skip, no row
-  * mro_all          — mixin implements ALL abstract members → no row
+  * plain_abstractmethod — @abstractmethod base without ABC/ABCMeta → no row
+  * mro_all          — mixin BEFORE abstract base implements ALL → no row
+  * mro_order        — abstract base BEFORE mixin → row still emitted (MRO order)
   * mro_some         — mixin implements SOME → row lists only the remainder
-  * mro_unresolvable — an unresolvable second base → suppress (fail closed)
+  * mro_pre_unres    — unresolvable PRECEDING base → suppress (fail closed)
+  * mro_post_unres   — unresolvable LATER base → row still emitted (irrelevant)
   * leaf_collision   — same-leaf nested classes disambiguated by line / fail closed
 """
 from __future__ import annotations
@@ -54,6 +57,19 @@ _CONCRETE_BASE = (
     "class Concrete:\n"
     "    def evaluate(self):\n"
     "        return 1\n"
+)
+
+# Plain class (default ``type`` metaclass) carrying an @abc.abstractmethod-decorated
+# member but NO ABC base and NO metaclass=ABCMeta. Python does NOT block instantiation
+# of its subclasses here — @abstractmethod is inert without ABCMeta.
+_PLAIN_ABSTRACTMETHOD_BASE = (
+    "import abc\n"
+    "\n"
+    "\n"
+    "class PlainBase:\n"
+    "    @abc.abstractmethod\n"
+    "    def build_it(self, x):\n"
+    "        ...\n"
 )
 
 # Mixin that CONCRETELY implements BOTH abstract members of BaseThing.
@@ -248,6 +264,27 @@ class TestAbstractContractNegatives(unittest.TestCase):
         rows = self._run(base_core, head_core)
         self.assertEqual(rows, [], f"unchanged base list → no row; got {rows}")
 
+    def test_plain_abstractmethod_base_not_abcmeta_no_row(self) -> None:
+        """Reparent onto a plain class with @abc.abstractmethod but no ABC/ABCMeta → no row.
+
+        Python only blocks instantiation of subclasses of an ABCMeta-governed base.
+        PlainBase uses the default ``type`` metaclass, so Widget(PlainBase) with an
+        empty body is INSTANTIABLE — no TypeError, no high-confidence row.
+        Inversion: swapping PlainBase for BaseThing (abc.ABC) is the positive case and
+        emits a row.
+        """
+        base_core = _PLAIN_ABSTRACTMETHOD_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _PLAIN_ABSTRACTMETHOD_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(PlainBase):\n"
+            "    pass\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(rows, [], f"plain @abstractmethod base (no ABCMeta) → no row; got {rows}")
+
     def test_ambiguous_bare_base_name_skipped(self) -> None:
         """Two class candidates share the bare base name → fail-closed skip, no row.
 
@@ -350,13 +387,37 @@ class TestAbstractContractMro(unittest.TestCase):
             f"build_it is supplied by the mixin and must NOT be claimed unimplemented; got {claim!r}",
         )
 
-    def test_unresolvable_second_base_suppresses_row(self) -> None:
-        """Widget(Unknown, BaseThing) where Unknown is not a KG class → SUPPRESS (fail closed).
+    def test_abstract_base_before_full_mixin_still_flagged(self) -> None:
+        """Widget(BaseThing, FullMixin): abstract base PRECEDES the satisfying mixin.
 
-        Unknown is a name with no resolvable class entity (an external/unparseable base
-        could supply the abstract members), so a high-confidence deterministic row must
-        not survive. Inversion: the same fixture WITHOUT the Unknown base is the positive
-        case and emits a row.
+        MRO walks left-to-right, so getattr(Widget, 'build_it') resolves to BaseThing's
+        abstract method — FullMixin (listed AFTER) does NOT satisfy the contract and
+        Widget stays abstract. Row STILL emitted naming BOTH members. Inversion vs
+        test_mixin_implements_all_abstract_members_no_row: the ONLY difference is base
+        ORDER, and it flips the outcome from no-row to row.
+        """
+        base_core = _ABSTRACT_BASE + _FULL_MIXIN + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _FULL_MIXIN + _CONCRETE_BASE + (
+            "\n\nclass Widget(BaseThing, FullMixin):\n"
+            "    pass\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(len(rows), 1, f"abstract base before mixin → exactly one row; got {rows}")
+        claim = str(rows[0].get("postable_claim") or "")
+        self.assertIn("counter_names", claim, f"claim must name counter_names; got {claim!r}")
+        self.assertIn("build_it", claim, f"claim must name build_it; got {claim!r}")
+
+    def test_unresolvable_preceding_base_suppresses_row(self) -> None:
+        """Widget(Unknown, BaseThing): Unknown PRECEDES the abstract base → SUPPRESS.
+
+        Unknown has no resolvable class entity and is listed before BaseThing, so it
+        could supply the abstract members via the MRO — a high-confidence deterministic
+        row must not survive. Inversion: the same fixture WITHOUT the Unknown base is the
+        positive case and emits a row.
         """
         base_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
             "\n\nclass Widget(Concrete):\n"
@@ -368,7 +429,30 @@ class TestAbstractContractMro(unittest.TestCase):
             "    pass\n"
         )
         rows = self._run(base_core, head_core)
-        self.assertEqual(rows, [], f"unresolvable second base → suppress row; got {rows}")
+        self.assertEqual(rows, [], f"unresolvable preceding base → suppress row; got {rows}")
+
+    def test_unresolvable_later_base_does_not_suppress_row(self) -> None:
+        """Widget(BaseThing, Unknown): Unknown is AFTER the abstract base → row STILL emitted.
+
+        A base listed after BaseThing cannot satisfy BaseThing's abstract members (MRO
+        order), so its unresolvability is irrelevant and must NOT suppress the row.
+        Inversion vs test_unresolvable_preceding_base_suppresses_row: moving Unknown from
+        before to after BaseThing flips suppression back to a row.
+        """
+        base_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(BaseThing, Unknown):\n"
+            "    pass\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(len(rows), 1, f"unresolvable later base → row still emitted; got {rows}")
+        claim = str(rows[0].get("postable_claim") or "")
+        self.assertIn("counter_names", claim, f"claim must name counter_names; got {claim!r}")
+        self.assertIn("build_it", claim, f"claim must name build_it; got {claim!r}")
 
 
 class TestClassDefLeafCollision(unittest.TestCase):
