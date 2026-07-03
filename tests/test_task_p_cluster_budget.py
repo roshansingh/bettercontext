@@ -201,10 +201,12 @@ class TestClusterCoverageMultiFile(unittest.TestCase):
 
     def test_every_cluster_retains_at_least_one_changed_symbol(self):
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
-        # Verify it starts over budget
+        # Verify it starts over budget (broad context included in raw packet)
         self.assertGreater(len(canonical_json(packet)), 40_000, "fixture must start over budget")
 
-        result = enforce_review_context_budget(packet)
+        # include_broad_context=True: tests the 40K broad-path budgeter (the fixture uses
+        # application_impact bulk to create pressure, which is stripped in compact profile).
+        result = enforce_review_context_budget(packet, include_broad_context=True)
 
         review_leads = result.get("review_leads")
         self.assertIsInstance(review_leads, dict, "review_leads must be present")
@@ -227,7 +229,8 @@ class TestClusterCoverageMultiFile(unittest.TestCase):
 
     def test_returned_counts_match_review_leads_rows(self):
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
-        result = enforce_review_context_budget(packet)
+        # include_broad_context=True: tests the 40K broad-path counts.
+        result = enforce_review_context_budget(packet, include_broad_context=True)
 
         lead_status = result.get("review_lead_status")
         self.assertIsInstance(lead_status, dict)
@@ -245,9 +248,58 @@ class TestClusterCoverageMultiFile(unittest.TestCase):
 
     def test_cap_never_exceeded(self):
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
-        result = enforce_review_context_budget(packet)
+        # include_broad_context=True: broad-path 40K cap assertion.
+        result = enforce_review_context_budget(packet, include_broad_context=True)
         size = len(canonical_json(result))
         self.assertLessEqual(size, 40_000, f"packet size {size} exceeds 40000 cap")
+
+
+class TestClusterCoverageCompactProfile(unittest.TestCase):
+    """B4: P1 cluster coverage and cap must hold on the default compact (15K) profile.
+
+    Pressure comes from lead mass (many changed symbols/callers), not broad-context
+    bulk — the compact profile strips broad sections, so a broad-bulk fixture would
+    test nothing here.
+    """
+
+    def _make_compact_pressure_packet(self, file_count: int = 5) -> dict:
+        packet = _make_over_budget_packet(file_count=file_count, symbols_per_file=60)
+        from source.kg.product.output_budget import _strip_broad_context
+        stripped_size = len(canonical_json(_strip_broad_context(packet)))
+        self.assertGreater(
+            stripped_size,
+            15_000,
+            "fixture must exceed the compact cap without broad-context mass",
+        )
+        return packet
+
+    def test_cap_held_at_15k_compact_default(self):
+        packet = self._make_compact_pressure_packet()
+        result = enforce_review_context_budget(packet)
+        size = len(canonical_json(result))
+        self.assertLessEqual(size, 15_000, f"packet size {size} exceeds the 15000 compact cap")
+
+    def test_every_cluster_retains_anchor_at_15k_compact_default(self):
+        file_count = 5
+        packet = self._make_compact_pressure_packet(file_count=file_count)
+        result = enforce_review_context_budget(packet)
+        self.assertLessEqual(len(canonical_json(result)), 15_000)
+        review_leads = result.get("review_leads") or {}
+        changed_symbols = [r for r in (review_leads.get("changed_symbols") or []) if isinstance(r, dict)]
+        self.assertTrue(changed_symbols, "no changed_symbols retained; cluster assertions did not execute")
+        retained_paths = {r.get("path") for r in changed_symbols}
+        for i in range(file_count):
+            path = f"src/module_{i}.py"
+            self.assertIn(
+                path,
+                retained_paths,
+                f"cluster {path} has no changed-symbol anchor at the 15K compact cap; retained: {retained_paths}",
+            )
+
+    def test_broad_sections_absent_on_compact_default(self):
+        packet = self._make_compact_pressure_packet()
+        result = enforce_review_context_budget(packet)
+        self.assertNotIn("application_impact", result, "broad context must be stripped on compact profile")
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +351,9 @@ class TestExtremePressureClusterDrop(unittest.TestCase):
         lowest-ranked clusters drop whole — the exact contract from the brief.
         """
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=9_000)
+        # include_broad_context=True: fixture uses application_impact bulk to create cluster-drop
+        # pressure at 9K; stripping broad context (compact profile) removes that pressure.
+        result = enforce_review_context_budget(packet, max_chars=9_000, include_broad_context=True)
         self.assertLessEqual(len(canonical_json(result)), 9_000)
 
         retained_paths = self._retained_paths(result)
@@ -328,7 +382,9 @@ class TestExtremePressureClusterDrop(unittest.TestCase):
         """At an extreme cap not all dropped clusters fit; the recorded ones must be the
         highest-ranked dropped clusters, in rank order, and all must really be omitted."""
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=8_000)
+        # include_broad_context=True: fixture uses application_impact bulk for 8K
+        # cluster-drop pressure; the compact composer keeps all anchors (no drops).
+        result = enforce_review_context_budget(packet, max_chars=8_000, include_broad_context=True)
         self.assertLessEqual(len(canonical_json(result)), 8_000)
         retained_paths = self._retained_paths(result)
         omitted_paths = self._ORIGINAL_PATHS - retained_paths
@@ -351,7 +407,8 @@ class TestExtremePressureClusterDrop(unittest.TestCase):
         """Retained clusters must come from the hypothesis-referenced set when fewer
         clusters survive than were referenced (rank: referenced first)."""
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=8_000)
+        # include_broad_context=True: broad-bulk fixture; see note on the sibling 8K test.
+        result = enforce_review_context_budget(packet, max_chars=8_000, include_broad_context=True)
         retained_paths = self._retained_paths(result)
         # Non-vacuous: something must be retained and something dropped.
         self.assertTrue(retained_paths, "no changed_symbols retained at all")
@@ -370,7 +427,8 @@ class TestExtremePressureClusterDrop(unittest.TestCase):
         so the ``if uncovered`` branch fires and the assertion is non-vacuous.
         """
         packet = self._make_extreme_packet()
-        result = enforce_review_context_budget(packet, max_chars=9_000)
+        # include_broad_context=True: broad bulk is required to create 9K cluster-drop pressure.
+        result = enforce_review_context_budget(packet, max_chars=9_000, include_broad_context=True)
         self.assertLessEqual(len(canonical_json(result)), 9_000)
         review_leads = result.get("review_leads") or {}
         changed_symbols = [r for r in (review_leads.get("changed_symbols") or []) if isinstance(r, dict)]
@@ -460,12 +518,13 @@ class TestTruncationSummaryShape(unittest.TestCase):
     def test_no_truncation_summary_broad_bulk_only(self):
         """Broad-bulk-only truncation (no lead rows omitted) must not produce a summary.
 
-        The 3-file x 8-symbol fixture at the default 40k cap keeps all lead rows
+        The 3-file x 8-symbol fixture at the 40k broad cap keeps all lead rows
         (only application_impact bulk is evicted), so the summary would be all-zero
-        and is suppressed.
+        and is suppressed. include_broad_context=True: fixture relies on broad bulk;
+        compact profile strips it entirely so no budget pressure arises there.
         """
         packet = _make_over_budget_packet(file_count=3, symbols_per_file=8)
-        result = enforce_review_context_budget(packet)
+        result = enforce_review_context_budget(packet, include_broad_context=True)
         ob = result.get("output_budget") or {}
         # Packet must be truncated (bulk evicted) but have no omitted lead rows.
         self.assertTrue(ob.get("truncated"), "fixture should be truncated at default cap")
@@ -697,7 +756,10 @@ class TestTopLevelChangedSymbolsMirror(unittest.TestCase):
             symbols_per_file=10,
             hyp_cluster_paths=["src/module_0.py", "src/module_1.py"],
         )
-        result = enforce_review_context_budget(packet, max_chars=9_000)
+        # include_broad_context=True: the desync path under test (repair de-alias +
+        # post-repair eviction + re-mirror) exists only on the broad ladder; the
+        # compact composer has no top-level changed_symbols mirror by design.
+        result = enforce_review_context_budget(packet, max_chars=9_000, include_broad_context=True)
         self.assertLessEqual(len(canonical_json(result)), 9_000)
 
         review_leads = result.get("review_leads") or {}
@@ -725,7 +787,8 @@ class TestTopLevelChangedSymbolsMirror(unittest.TestCase):
             symbols_per_file=10,
             hyp_cluster_paths=["src/module_0.py", "src/module_1.py"],
         )
-        result = enforce_review_context_budget(packet, max_chars=8_000)
+        # include_broad_context=True: broad-ladder desync path; see sibling test note.
+        result = enforce_review_context_budget(packet, max_chars=8_000, include_broad_context=True)
         self.assertLessEqual(len(canonical_json(result)), 8_000)
 
         review_leads = result.get("review_leads") or {}
@@ -742,6 +805,107 @@ class TestTopLevelChangedSymbolsMirror(unittest.TestCase):
             f"review_leads.changed_symbols ({len(rl_cs)} rows) != "
             f"top-level changed_symbols ({len(top_cs)} rows) at extreme pressure",
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression: tier-2 funded anchor repair (R1b)
+# ---------------------------------------------------------------------------
+
+class ClusterAnchorTier2FundingTest(unittest.TestCase):
+    """Regression: anchor repair must consume tier-2 victims when no swap donors exist.
+
+    Geometry: 8 clusters (one symbol each = no multi-row donors) plus bulky
+    claim_contract/scope_contract/changed_surface/surface_status sections that push
+    the packet over budget. After enforcement every cluster must have >= 1 anchor,
+    proving the tier-2 funding path in _repair_cluster_coverage.
+    """
+
+    def _make_packet(self) -> dict:
+        files = [f"src/router_{i}.ts" for i in range(8)]
+        changed_symbols = [
+            _make_changed_symbol(f"lead:cs:{i}", files[i], f"handler_{i}")
+            for i in range(8)
+        ]
+        bulky_item = {"key": "x" * 300, "value": "y" * 300, "meta": {"a": 1, "b": 2}}
+        changed_surface = {
+            "symbols": [dict(bulky_item, path=f) for f in files],
+            "files": [{"path": f, "size": 9999} for f in files],
+        }
+        surface_status = [dict(bulky_item, path=f) for f in files for _ in range(4)]
+        changed_file_symbols = [dict(bulky_item, path=f) for f in files for _ in range(4)]
+        claim_contract = {"fields": ["x" * 50] * 20}
+        scope_contract = {"repos": ["r" * 50] * 20}
+        answer_packet = {
+            "status": "ok",
+            "claim_contract": claim_contract,
+            "scope_contract": scope_contract,
+            "top_changed_symbols": [
+                _make_changed_symbol(f"lead:cs:{i}", files[i], f"handler_{i}")
+                for i in range(8)
+            ],
+        }
+        review_leads = {
+            "changed_symbols": list(changed_symbols),
+            "changed_files": list(files),
+        }
+        review_lead_status = {
+            "changed_symbol_count": 8,
+            "changed_anchor_count": 8,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+            "coverage_status": "ok",
+            "available": {
+                "changed_symbol_count": 8,
+                "direct_caller_count": 0,
+                "direct_callee_count": 0,
+                "transitive_caller_count": 0,
+                "source_coordinate_count": 0,
+            },
+        }
+        packet = {
+            "tool": "review_context",
+            "status": "ok",
+            "repo": "repo-a",
+            "summary": {"changed_symbol_count": 8},
+            "review_leads": review_leads,
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": answer_packet,
+            "changed_symbols": list(changed_symbols),
+            "changed_surface": changed_surface,
+            "surface_status": surface_status,
+            "changed_file_symbols": changed_file_symbols,
+            "claim_contract": claim_contract,
+            "scope_contract": scope_contract,
+            "output_budget": {"engine_version": "test"},
+        }
+        return add_review_lead_ids(packet)
+
+    def test_tier2_funding_restores_all_cluster_anchors(self) -> None:
+        from source.kg.product.output_budget import REVIEW_CONTEXT_MAX_CHARS
+        packet = self._make_packet()
+        self.assertGreater(
+            len(canonical_json(packet)), REVIEW_CONTEXT_MAX_CHARS,
+            "fixture must be over budget",
+        )
+        result = enforce_review_context_budget(packet)
+        self.assertLessEqual(
+            len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS,
+            "result must fit within budget",
+        )
+        rl = result.get("review_leads", {})
+        retained = rl.get("changed_symbols", [])
+        paths_with_anchor = {r["path"] for r in retained if isinstance(r, dict) and r.get("path")}
+        expected_paths = {f"src/router_{i}.ts" for i in range(8)}
+        self.assertEqual(
+            paths_with_anchor,
+            expected_paths,
+            f"missing anchors for: {expected_paths - paths_with_anchor}",
+        )
+        rls = result.get("review_lead_status", {})
+        returned = rls.get("returned", {})
+        self.assertGreaterEqual(returned.get("changed_symbol_count", 0), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +949,102 @@ class TestSnapshotEdgeCountsForRanking(unittest.TestCase):
                 "src/module_2.py", retained_paths,
                 "module_2.py (lowest-path non-referenced cluster) must be the 3rd retained cluster",
             )
+
+
+class TestContractDedupPresenceGuard(unittest.TestCase):
+    """Fix 2: contract-dedup must only delete review_answer_packet.claim_contract /
+    scope_contract when the top-level copy exists and is a dict.  When the top-level
+    copy is absent, the answer-packet entry is the only copy and must be retained.
+    """
+
+    def _make_over_budget_packet_no_top_level_contract(self) -> dict:
+        """Packet where review_answer_packet has claim_contract but top-level does NOT."""
+        files = [f"src/mod_{i}.py" for i in range(4)]
+        changed_symbols = [
+            _make_changed_symbol(f"lead:cs:{i}", files[i], f"fn_{i}")
+            for i in range(4)
+        ]
+        # Bulky broad-context to push over budget
+        bulky = [{"k": "x" * 200, "v": "y" * 200} for _ in range(50)]
+        answer_packet = {
+            "status": "ok",
+            # claim_contract present only in the answer-packet, NOT at top-level
+            "claim_contract": {"fields": ["field_" + "x" * 20] * 10},
+            "scope_contract": {"repos": ["repo_" + "r" * 20] * 10},
+            "top_changed_symbols": list(changed_symbols),
+        }
+        review_leads = {
+            "changed_symbols": list(changed_symbols),
+            "changed_files": list(files),
+        }
+        review_lead_status = {
+            "changed_symbol_count": 4,
+            "changed_anchor_count": 4,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+            "coverage_status": "ok",
+            "available": {
+                "changed_symbol_count": 4,
+                "direct_caller_count": 0,
+                "direct_callee_count": 0,
+                "transitive_caller_count": 0,
+                "source_coordinate_count": 0,
+            },
+        }
+        packet = {
+            "tool": "review_context",
+            "status": "ok",
+            "repo": "repo-a",
+            "summary": {"changed_symbol_count": 4},
+            "review_leads": review_leads,
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": answer_packet,
+            "changed_symbols": list(changed_symbols),
+            # No top-level claim_contract / scope_contract
+            "application_impact": {"direct_callers": bulky},
+            "output_budget": {"engine_version": "test"},
+        }
+        return add_review_lead_ids(packet)
+
+    def test_answer_packet_contract_retained_when_top_level_absent(self) -> None:
+        """When top-level claim_contract is absent, answer-packet copy must not be deleted."""
+        from source.kg.product.output_budget import REVIEW_CONTEXT_MAX_CHARS, enforce_review_context_budget
+        packet = self._make_over_budget_packet_no_top_level_contract()
+        # Confirm top-level contract is absent in fixture
+        self.assertNotIn("claim_contract", packet, "fixture must not have top-level claim_contract")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        answer_packet = result.get("review_answer_packet") or {}
+        # answer-packet entry must be retained since there's no top-level duplicate
+        self.assertIn(
+            "claim_contract",
+            answer_packet,
+            "review_answer_packet.claim_contract must be retained when top-level copy is absent",
+        )
+
+    def test_answer_packet_contract_removed_when_top_level_present(self) -> None:
+        """When top-level claim_contract is a dict, answer-packet duplicate may be evicted."""
+        from source.kg.product.output_budget import enforce_review_context_budget
+        packet = self._make_over_budget_packet_no_top_level_contract()
+        # Add top-level copies so the dedup guard allows removal
+        packet["claim_contract"] = {"fields": ["field_" + "x" * 20] * 10}
+        packet["scope_contract"] = {"repos": ["repo_" + "r" * 20] * 10}
+        # Push well over budget so tier-2 is reached
+        max_chars = 3_000
+        if len(canonical_json(packet)) <= max_chars:
+            self.skipTest("fixture does not exceed small cap; adjust test geometry")
+        result = enforce_review_context_budget(packet, max_chars=max_chars)
+        # After eviction the answer-packet duplicate should have been removed
+        answer_packet = result.get("review_answer_packet") or {}
+        # At least one of the two contract keys should be gone (the loop removes one per iteration)
+        both_present = (
+            "claim_contract" in answer_packet and "scope_contract" in answer_packet
+        )
+        self.assertFalse(
+            both_present,
+            "at least one answer-packet contract key must be removed when top-level copy exists",
+        )
 
 
 if __name__ == "__main__":

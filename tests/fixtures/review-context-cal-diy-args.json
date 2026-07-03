@@ -1,0 +1,228 @@
+{
+ "changed_files": [
+  "packages/features/bookings/lib/handleCancelBooking.ts",
+  "packages/features/bookings/lib/handleNewBooking.ts",
+  "packages/features/ee/workflows/api/scheduleEmailReminders.ts",
+  "packages/features/ee/workflows/components/WorkflowStepContainer.tsx",
+  "packages/features/ee/workflows/lib/reminders/emailReminderManager.ts",
+  "packages/features/ee/workflows/lib/reminders/smsReminderManager.ts",
+  "packages/prisma/migrations/20230217230604_add_cancelled_to_workflow_reminder/migration.sql",
+  "packages/prisma/schema.prisma",
+  "packages/trpc/server/routers/viewer/bookings.tsx",
+  "packages/trpc/server/routers/viewer/workflows.tsx"
+ ],
+ "changed_ranges": [
+  {
+   "end_line": 484,
+   "path": "packages/features/bookings/lib/handleCancelBooking.ts",
+   "start_line": 484
+  },
+  {
+   "end_line": 490,
+   "path": "packages/features/bookings/lib/handleCancelBooking.ts",
+   "start_line": 487
+  },
+  {
+   "end_line": 495,
+   "path": "packages/features/bookings/lib/handleCancelBooking.ts",
+   "start_line": 495
+  },
+  {
+   "end_line": 10,
+   "path": "packages/features/bookings/lib/handleNewBooking.ts",
+   "start_line": 1
+  },
+  {
+   "end_line": 39,
+   "path": "packages/features/bookings/lib/handleNewBooking.ts",
+   "start_line": 39
+  },
+  {
+   "end_line": 41,
+   "path": "packages/features/bookings/lib/handleNewBooking.ts",
+   "start_line": 41
+  },
+  {
+   "end_line": 772,
+   "path": "packages/features/bookings/lib/handleNewBooking.ts",
+   "start_line": 772
+  },
+  {
+   "end_line": 976,
+   "path": "packages/features/bookings/lib/handleNewBooking.ts",
+   "start_line": 964
+  },
+  {
+   "end_line": 10,
+   "path": "packages/features/ee/workflows/api/scheduleEmailReminders.ts",
+   "start_line": 10
+  },
+  {
+   "end_line": 78,
+   "path": "packages/features/ee/workflows/api/scheduleEmailReminders.ts",
+   "start_line": 43
+  },
+  {
+   "end_line": 390,
+   "path": "packages/features/ee/workflows/components/WorkflowStepContainer.tsx",
+   "start_line": 390
+  },
+  {
+   "end_line": 434,
+   "path": "packages/features/ee/workflows/components/WorkflowStepContainer.tsx",
+   "start_line": 392
+  },
+  {
+   "end_line": 442,
+   "path": "packages/features/ee/workflows/components/WorkflowStepContainer.tsx",
+   "start_line": 436
+  },
+  {
+   "end_line": 444,
+   "path": "packages/features/ee/workflows/components/WorkflowStepContainer.tsx",
+   "start_line": 444
+  },
+  {
+   "end_line": 451,
+   "path": "packages/features/ee/workflows/components/WorkflowStepContainer.tsx",
+   "start_line": 448
+  },
+  {
+   "end_line": 456,
+   "path": "packages/features/ee/workflows/components/WorkflowStepContainer.tsx",
+   "start_line": 453
+  },
+  {
+   "end_line": 201,
+   "path": "packages/features/ee/workflows/lib/reminders/emailReminderManager.ts",
+   "start_line": 197
+  },
+  {
+   "end_line": 211,
+   "path": "packages/features/ee/workflows/lib/reminders/emailReminderManager.ts",
+   "start_line": 203
+  },
+  {
+   "end_line": 231,
+   "path": "packages/features/ee/workflows/lib/reminders/emailReminderManager.ts",
+   "start_line": 213
+  },
+  {
+   "end_line": 177,
+   "path": "packages/features/ee/workflows/lib/reminders/smsReminderManager.ts",
+   "start_line": 177
+  },
+  {
+   "end_line": 186,
+   "path": "packages/features/ee/workflows/lib/reminders/smsReminderManager.ts",
+   "start_line": 179
+  },
+  {
+   "end_line": 2,
+   "path": "packages/prisma/migrations/20230217230604_add_cancelled_to_workflow_reminder/migration.sql",
+   "start_line": 1
+  },
+  {
+   "end_line": 644,
+   "path": "packages/prisma/schema.prisma",
+   "start_line": 644
+  },
+  {
+   "end_line": 484,
+   "path": "packages/trpc/server/routers/viewer/bookings.tsx",
+   "start_line": 484
+  },
+  {
+   "end_line": 487,
+   "path": "packages/trpc/server/routers/viewer/bookings.tsx",
+   "start_line": 487
+  },
+  {
+   "end_line": 492,
+   "path": "packages/trpc/server/routers/viewer/bookings.tsx",
+   "start_line": 489
+  },
+  {
+   "end_line": 2,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 2
+  },
+  {
+   "end_line": 9,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 9
+  },
+  {
+   "end_line": 211,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 211
+  },
+  {
+   "end_line": 216,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 213
+  },
+  {
+   "end_line": 375,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 375
+  },
+  {
+   "end_line": 380,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 377
+  },
+  {
+   "end_line": 517,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 517
+  },
+  {
+   "end_line": 523,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 520
+  },
+  {
+   "end_line": 573,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 572
+  },
+  {
+   "end_line": 578,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 575
+  },
+  {
+   "end_line": 904,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 904
+  },
+  {
+   "end_line": 910,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 910
+  },
+  {
+   "end_line": 913,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 913
+  },
+  {
+   "end_line": 917,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 916
+  },
+  {
+   "end_line": 942,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 924
+  },
+  {
+   "end_line": 960,
+   "path": "packages/trpc/server/routers/viewer/workflows.tsx",
+   "start_line": 947
+  }
+ ],
+ "limit": 25,
+ "repo": "calcom/cal.diy"
+}

@@ -23,7 +23,7 @@ class PythonTypeScriptWrapperTest(unittest.TestCase):
 
         self.assertEqual(
             [adapter.capability.name for adapter in PYTHON_SUPPORT.adapters()],
-            ["python-ast", "python-boto3-transport"],
+            ["python-ast", "python-boto3-transport", "python-swallowed-exception"],
         )
         self.assertEqual(PYTHON_SUPPORT.source_roots(_repo_snapshot(), ctx), {"python": {"flask"}})
         self.assertEqual(PYTHON_SUPPORT.parse_repo(_repo_snapshot(), ctx), {})
@@ -46,7 +46,7 @@ class PythonTypeScriptWrapperTest(unittest.TestCase):
 
         self.assertEqual(
             [adapter.capability.name for adapter in TYPESCRIPT_SUPPORT.adapters()],
-            ["typescript-express-routes", "typescript-message-transport", "typescript-compiler-api"],
+            ["typescript-express-routes", "typescript-message-transport", "typescript-compiler-api", "typescript-async-lifecycle", "typescript-call-result-identity-comparison"],
         )
         self.assertEqual(TYPESCRIPT_SUPPORT.source_roots(_repo_snapshot(), ctx), {"javascript": {"express"}})
         self.assertEqual(TYPESCRIPT_SUPPORT.parse_repo(_repo_snapshot(), ctx), {})

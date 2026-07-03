@@ -2944,10 +2944,16 @@ function collectSymbols(sourceFile) {
 }
 
 function collectCallsForSymbol(sourceFile, symbol) {
+  // Prune subtrees that do not overlap the symbol range, but keep descending
+  // through containers that extend beyond it (e.g. the VariableStatement
+  // wrapping `export const fn = async () => {...}` starts before the
+  // VariableDeclaration that defines the symbol range).  The previous guard
+  // (node.pos < symbol.pos || node.end > symbol.end) pruned those containers
+  // outright, so variable-declared functions never produced any calls.
   const calls = [];
   function visit(node) {
-    if (node !== sourceFile && (node.pos < symbol.pos || node.end > symbol.end)) return;
-    if (ts.isCallExpression(node)) {
+    if (node !== sourceFile && (node.end <= symbol.pos || node.pos >= symbol.end)) return;
+    if (ts.isCallExpression(node) && node.pos >= symbol.pos && node.end <= symbol.end) {
       const name = callName(node.expression, sourceFile);
       if (name) {
         calls.push({ name, line: lineOf(sourceFile, node.expression.getStart(sourceFile)) });
@@ -3247,6 +3253,285 @@ function collectKafkaEvents(sourceFile) {
   return events;
 }
 
+// ---------------------------------------------------------------------------
+// Async-lifecycle risk signal collector
+// ---------------------------------------------------------------------------
+// Signal 1: async_callback_in_iteration
+//   Fires when .forEach() receives an async function/arrow as its first argument.
+//   Conservative: only matches the identifier `forEach` on a call expression.
+//
+// Signal 2: unawaited_async_call
+//   Fires when a call to a same-file async-declared function appears in a
+//   position where the result is not awaited, not returned, not .then/.catch
+//   chained, and not assigned to a variable.  Cross-file calls emit nothing
+//   (documented limitation).
+//
+// Both signals carry { signal, qualname, callee, line } and are capped at 20
+// per file (lowest line first). Per-subject retrieval bound of 3 is enforced
+// at query time in _review_context_risk_signals.
+//
+// Limitation: collectAsyncFunctionNames only captures top-level async function
+// declarations and top-level async arrow/function-expression variable bindings;
+// async methods on classes and async functions nested inside other functions are
+// not captured, so unawaited_async_call will not fire for those callees.
+
+function collectAsyncFunctionNames(sourceFile) {
+  // Return a Set of top-level async function names declared in this file.
+  const names = new Set();
+  for (const statement of sourceFile.statements) {
+    if (
+      ts.isFunctionDeclaration(statement) &&
+      statement.name &&
+      nodeHasModifier(statement, ts.SyntaxKind.AsyncKeyword)
+    ) {
+      names.add(statement.name.text);
+    }
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        const init = declaration.initializer;
+        if (
+          init &&
+          (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) &&
+          nodeHasModifier(init, ts.SyntaxKind.AsyncKeyword) &&
+          ts.isIdentifier(declaration.name)
+        ) {
+          names.add(declaration.name.text);
+        }
+      }
+    }
+  }
+  return names;
+}
+
+function enclosingSymbolName(node, symbols) {
+  // Return the name of the top-level symbol whose [pos, end] range contains node.pos.
+  for (const sym of symbols) {
+    if (node.pos >= sym.pos && node.end <= sym.end) return sym.name;
+  }
+  return null;
+}
+
+function isAsyncFunctionArg(node) {
+  // True if node is an async function expression or arrow function.
+  return (
+    (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) &&
+    nodeHasModifier(node, ts.SyntaxKind.AsyncKeyword)
+  );
+}
+
+function isForEachCall(node) {
+  // True if node is a call expression whose callee ends with `.forEach`.
+  return (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.name.text === "forEach"
+  );
+}
+
+// Walk up through ParenthesizedExpression nodes and return {parent, child} where
+// parent is the first non-paren ancestor and child is the immediate child of that
+// ancestor (i.e. the outermost paren wrapping callNode, or callNode itself if
+// there are no parens).  Used by all four suppression guards so that parenthesized
+// forms — await (f()), return (f()), (f()).then(...), const x = (f()) — are
+// treated identically to their unparenthesized counterparts.
+function effectiveParentSkippingParens(callNode) {
+  let child = callNode;
+  let parent = callNode.parent;
+  while (parent != null && ts.isParenthesizedExpression(parent)) {
+    child = parent;
+    parent = parent.parent;
+  }
+  return { parent, child };
+}
+
+function isAwaitedContext(callNode) {
+  // True if the call expression (possibly wrapped in parens) is awaited.
+  // Handles: await f(), await (f()), await ((f())).
+  const { parent } = effectiveParentSkippingParens(callNode);
+  return parent != null && parent.kind === ts.SyntaxKind.AwaitExpression;
+}
+
+function isReturnedContext(callNode) {
+  // True if the call (possibly wrapped in parens) is directly inside a return statement.
+  // Handles: return f(), return (f()), return ((f())).
+  const { parent } = effectiveParentSkippingParens(callNode);
+  return parent != null && parent.kind === ts.SyntaxKind.ReturnStatement;
+}
+
+function isThenCatchChained(callNode) {
+  // True if the result of the call (possibly wrapped in parens) is immediately
+  // .then()/.catch()/.finally() chained.
+  // Handles: f().then(...), (f()).then(...).
+  // The effective child (outermost paren or callNode itself) must be the
+  // .expression side of the PropertyAccessExpression.
+  const { parent, child } = effectiveParentSkippingParens(callNode);
+  if (!parent) return false;
+  if (
+    ts.isPropertyAccessExpression(parent) &&
+    parent.expression === child &&
+    (parent.name.text === "then" || parent.name.text === "catch" || parent.name.text === "finally") &&
+    parent.parent != null &&
+    ts.isCallExpression(parent.parent) &&
+    parent.parent.expression === parent
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isAssignedContext(callNode) {
+  // True if the call (possibly wrapped in parens) appears on the RHS of a variable
+  // declaration or an assignment expression (simple `=` or compound `+=`, `-=`, etc.).
+  // ts.isBinaryExpression also covers comparisons (===, !==), logical (||, &&),
+  // and arithmetic (+, -, *) — restrict to assignment operators only so that
+  // `ready === saveRecord(id)` and `flag || saveRecord(id)` still emit signals.
+  // ASSIGNMENT_OPERATORS covers SyntaxKind.EqualsToken through the full
+  // compound-assignment range (FirstAssignment..LastAssignment).
+  // Handles: const x = (f()), x = (f()), x += (f()).
+  const { parent, child } = effectiveParentSkippingParens(callNode);
+  if (!parent) return false;
+  // `const x = callNode` or `let x = callNode`
+  if (ts.isVariableDeclaration(parent) && parent.initializer === child) return true;
+  // `x = callNode`, `x += callNode`, etc. — assignment operators only
+  if (
+    ts.isBinaryExpression(parent) &&
+    parent.right === child &&
+    ASSIGNMENT_OPERATORS.has(parent.operatorToken.kind)
+  ) return true;
+  return false;
+}
+
+function isInsidePromiseAll(callNode) {
+  // True if the call is nested inside a Promise.all/allSettled/race/any invocation.
+  // Walk parent chain; cross array literals, arrow functions, and array-method
+  // call expressions (map/flatMap) until we either find Promise.* or hit a hard
+  // boundary (any other call expression, block, or function boundary).
+  // Start from the effective parent (skip any wrapping ParenthesizedExpression nodes)
+  // so that ids.map(id => (processItem(id))) is treated like ids.map(id => processItem(id)).
+  const { child: _child, parent: startParent } = effectiveParentSkippingParens(callNode);
+  let node = startParent;
+  while (node) {
+    if (ts.isCallExpression(node)) {
+      const expr = node.expression;
+      if (
+        ts.isPropertyAccessExpression(expr) &&
+        ts.isIdentifier(expr.expression) &&
+        expr.expression.text === "Promise" &&
+        (expr.name.text === "all" || expr.name.text === "allSettled" || expr.name.text === "race" || expr.name.text === "any")
+      ) {
+        return true;
+      }
+      // Allow map/flatMap calls through (common pattern: Promise.all(arr.map(...)))
+      if (
+        ts.isPropertyAccessExpression(expr) &&
+        (expr.name.text === "map" || expr.name.text === "flatMap")
+      ) {
+        node = node.parent;
+        continue;
+      }
+      // Any other call: stop
+      return false;
+    }
+    if (
+      ts.isArrayLiteralExpression(node) ||
+      ts.isArrowFunction(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isParenthesizedExpression(node)  // parens are transparent anywhere in the walk
+    ) {
+      node = node.parent;
+      continue;
+    }
+    // Anything else (block, statement, etc.) is a hard boundary
+    break;
+  }
+  return false;
+}
+
+function applySignalCap(rawSignals) {
+  // File-level cap: emit at most 20 signals per file (all families combined).
+  // Per-subject retrieval bound (3 signals per enclosing symbol, relevance-first)
+  // is enforced at query time in _review_context_risk_signals.
+  rawSignals.sort((a, b) => a.line - b.line);
+  return rawSignals.slice(0, 20);
+}
+
+function collectAsyncLifecycleSignals(sourceFile, symbols) {
+  const asyncNames = collectAsyncFunctionNames(sourceFile);
+  const rawSignals = [];
+
+  function visit(node) {
+    // Signal 1: forEach(async callback)
+    if (isForEachCall(node) && node.arguments.length > 0 && isAsyncFunctionArg(node.arguments[0])) {
+      const line = lineOf(sourceFile, node.getStart(sourceFile));
+      const qualname = enclosingSymbolName(node, symbols) ?? "<module>";
+      rawSignals.push({
+        signal: "async_callback_in_iteration",
+        qualname,
+        callee: "forEach",
+        line,
+      });
+    }
+
+    // Signal 2: unawaited call to same-file async fn
+    if (ts.isCallExpression(node) && !isForEachCall(node)) {  // forEach handled above
+      const { parent: effectiveParent } = effectiveParentSkippingParens(node);
+      if (
+        !isAwaitedContext(node) &&
+        !isReturnedContext(node) &&
+        !isThenCatchChained(node) &&
+        !isAssignedContext(node) &&
+        !isInsidePromiseAll(node) &&
+        !(effectiveParent != null && ts.isVoidExpression(effectiveParent))  // void (fn()) is intentional discard
+      ) {
+        const name = callName(node.expression, sourceFile);
+        // Only the leaf name for same-file check (no dots = top-level call)
+        const leafName = name && !name.includes(".") ? name : null;
+        if (leafName && asyncNames.has(leafName)) {
+          const line = lineOf(sourceFile, node.getStart(sourceFile));
+          const qualname = enclosingSymbolName(node, symbols) ?? "<module>";
+          rawSignals.push({
+            signal: "unawaited_async_call",
+            qualname,
+            callee: leafName,
+            line,
+          });
+        }
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+
+  return applySignalCap(rawSignals);
+}
+
+function collectCallResultIdentityComparisonSignals(sourceFile, symbols) {
+  const rawSignals = [];
+
+  function visit(node) {
+    if (
+      ts.isBinaryExpression(node) &&
+      (node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken ||
+        node.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken) &&
+      ts.isCallExpression(node.left) &&
+      ts.isCallExpression(node.right)
+    ) {
+      const qualname = enclosingSymbolName(node, symbols);
+      if (qualname != null && qualname !== "<module>") {
+        const callee_left = callName(node.left.expression, sourceFile) ?? "";
+        const callee_right = callName(node.right.expression, sourceFile) ?? "";
+        const line = lineOf(sourceFile, node.getStart(sourceFile));
+        rawSignals.push({ signal: "call_result_identity_comparison", qualname, callee_left, callee_right, line });
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+
+  return applySignalCap(rawSignals);
+}
+
 const output = Object.create(null);
 for (const relativePath of files) {
   const absolutePath = path.join(repoRoot, relativePath);
@@ -3277,6 +3562,8 @@ for (const relativePath of files) {
         line: call.line,
       }))
     ),
+    async_lifecycle_signals: collectAsyncLifecycleSignals(sourceFile, symbols),
+    call_result_identity_comparison_signals: collectCallResultIdentityComparisonSignals(sourceFile, symbols),
   };
 }
 

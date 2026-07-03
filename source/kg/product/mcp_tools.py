@@ -8,6 +8,7 @@ from source.kg.core.display import display_entity
 from source.kg.core.models import JsonObject, canonical_json
 from source.kg.file_formats._shared.common import normalize_endpoint_path_shape
 from source.kg.product.application_impact import application_impact_packet
+from source.kg.product.engine_version import engine_version
 from source.kg.product.authz_surface import authz_surface_packet
 from source.kg.product.framework_impact import framework_impact_packet
 from source.kg.product.ownership_context import ownership_context_packet
@@ -15,17 +16,22 @@ from source.kg.product.output_budget import (
     AUTHZ_COMPACT_LIST_KEYS,
     COMPACT_AUTHZ_INSPECTION_REF_LIMIT,
     PLANNING_CONTEXT_ANCHORED_MAX_CHARS,
+    REVIEW_CONTEXT_BROAD_MAX_CHARS,
     enforce_planning_context_budget,
     enforce_review_context_budget,
     enforce_reverse_impact_budget,
     enforce_service_brief_budget,
 )
+from source.kg.product.edge_role import annotate_edge_roles, build_edge_role_index, rank_by_review_value
 from source.kg.product.review_attribution import (
     add_review_lead_ids,
     review_available_counts,
     review_lead_counts,
 )
-from source.kg.product.review_hypotheses import review_hypotheses_for_context
+from source.kg.product.review_hypotheses import (
+    _FAMILY_SPECIFICITY,
+    review_hypotheses_for_context,
+)
 from source.kg.product.runtime_architecture import ENDPOINT_PATH_SHAPE_MATCH_BASIS, runtime_architecture_packet
 from source.kg.query.call_site import call_site_from_qualifier
 from source.kg.query.snapshot import KgSnapshot
@@ -252,7 +258,9 @@ def call_tool(kg: KgSnapshot, name: str, arguments: JsonObject | None = None) ->
             preserve_planning_sections=True,
         )
     if name == "review_context":
-        return enforce_review_context_budget(payload)
+        payload.setdefault("output_budget", {})["engine_version"] = engine_version()
+        include_broad = _optional_bool(arguments, "include_broad_context", default=False)
+        return enforce_review_context_budget(payload, include_broad_context=include_broad)
     if name == "reverse_impact":
         return enforce_reverse_impact_budget(payload)
     if name == "get_service_brief":
@@ -2337,6 +2345,24 @@ def _review_context_properties() -> JsonObject:
                 "By default, file-anchor-only PR-review packets stay compact and point back to source inspection."
             ),
         },
+        "include_broad_context": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "When true, include broad application/runtime/framework context sections and raise the packet cap to "
+                f"{REVIEW_CONTEXT_BROAD_MAX_CHARS} chars (legacy behavior). "
+                "By default (false), broad sections are suppressed and the cap is 15,000 chars for a hypothesis-first compact packet."
+            ),
+        },
+        "base_snapshot": {
+            "type": "string",
+            "description": (
+                "Optional path to a base KG snapshot directory. When provided and loadable, runs a contract-diff "
+                "against the current snapshot and splices guard_call_removed_drift / responsibility_moved_drift / "
+                "test_reference_removed_drift hypotheses (specificity=high) into the review_hypotheses pipeline. "
+                "Tenant mismatch or unloadable base snapshot is reported in review_quality_status.reason, never an error."
+            ),
+        },
     }
 
 
@@ -2703,6 +2729,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     requested_review_sections = _optional_review_section_aliases(arguments, "requested_surfaces")
     include_deploy_blockers = _optional_bool(arguments, "include_deploy_blockers", default=False)
     include_unlinked_leads = _optional_bool(arguments, "include_unlinked_leads", default=False)
+    base_snapshot_dir = _optional_string(arguments, "base_snapshot")
 
     changed_symbols: list[JsonObject] = []
     range_filters = _changed_ranges_by_path(changed_ranges)
@@ -2780,12 +2807,24 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         direct_callees.extend(callees.get("callees", []))
     repo_dependency_result = kg.repo_dependencies(repo, limit=detail_limit)
     repo_dependencies = list(repo_dependency_result.get("dependencies", []))
-    direct_callers = _review_context_dedupe_rows(direct_callers)[:detail_limit]
-    direct_callees = _review_context_dedupe_rows(direct_callees)[:detail_limit]
+    # Annotate and rank on a wider internal collection (4×detail_limit) so semantic rows
+    # beyond the first detail_limit positions survive role-based ranking before the public
+    # slice is applied. Without this, a persistence or external_side_effect callee beyond
+    # position detail_limit is irrecoverably dropped before rank_by_review_value runs.
+    _rank_limit = detail_limit * 4
+    direct_callers = _review_context_dedupe_rows(direct_callers)[:_rank_limit]
+    direct_callees = _review_context_dedupe_rows(direct_callees)[:_rank_limit]
     transitive_callers = _review_context_transitive_callers(
         kg, changed_symbols=changed_symbols, depth=3, limit=detail_limit
     )
     repo_dependencies = _review_context_dedupe_rows(repo_dependencies)[:detail_limit]
+    _edge_index = build_edge_role_index(kg)
+    annotate_edge_roles(direct_callers, _edge_index, caller_perspective=True)
+    annotate_edge_roles(direct_callees, _edge_index, caller_perspective=False)
+    annotate_edge_roles(transitive_callers, _edge_index, caller_perspective=True)
+    direct_callers = rank_by_review_value(direct_callers)[:detail_limit]
+    direct_callees = rank_by_review_value(direct_callees)[:detail_limit]
+    transitive_callers = rank_by_review_value(transitive_callers)
     runtime_surfaces = _review_context_runtime_surfaces(
         kg, repo=repo, changed_symbols=changed_symbols, limit=detail_limit
     )
@@ -2801,6 +2840,14 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         changed_files=changed_files,
         changed_symbols=changed_symbols,
         limit=detail_limit,
+    )
+    risk_signals = _review_context_risk_signals(
+        kg,
+        repo=repo,
+        changed_symbols=changed_symbols,
+        changed_files=changed_files,
+        range_filters=range_filters,
+        limit=12,
     )
     endpoint_rows = runtime_surfaces["endpoints"]
     endpoint_consumer_rows = runtime_surfaces["endpoint_consumers"]
@@ -2976,8 +3023,26 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         runtime_surfaces=runtime_surfaces,
         review_leads=review_lead_packet["review_leads"],
         review_lead_status=review_lead_packet["review_lead_status"],
+        risk_signals=risk_signals,
     )
+    contract_diff_note: str | None = None
+    if base_snapshot_dir:
+        review_hypotheses, contract_diff_note = _splice_contract_diff_hypotheses(
+            base_snapshot_dir=base_snapshot_dir,
+            head_kg=kg,
+            changed_files=changed_files,
+            review_hypotheses=review_hypotheses,
+        )
+    # Cap the top-level list to PLANNING_CONTEXT_SECTION_LIMIT (5). The splice
+    # inserts high-specificity rows at the front so the specifics-first partition is
+    # already correct; slicing here preserves that order while bounding the list.
+    review_hypotheses = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
+    review_quality_status = _build_review_quality_status(
+        review_hypotheses=review_hypotheses,
+        coverage_status=review_lead_packet["review_lead_status"].get("coverage_status", ""),
+        contract_diff_note=contract_diff_note,
+    )
     result = {
         "status": status,
         "repo": repo,
@@ -2986,6 +3051,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         "summary": summary,
         "review_answer_packet": review_answer_packet,
         "review_lead_status": review_lead_packet["review_lead_status"],
+        "review_quality_status": review_quality_status,
         "review_leads": review_lead_packet["review_leads"],
         "diff_anchors": diff_anchors,
         "changed_symbols": changed_symbols_in_scope,
@@ -3055,6 +3121,223 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     ):
         return _review_context_compact_unanchored_result(result)
     return result
+
+
+_SPECIFICITY_RANK: dict[str, int] = {"high": 2, "medium": 1, "low": 0}
+
+
+def _build_review_quality_status(
+    *,
+    review_hypotheses: list[JsonObject],
+    coverage_status: str,
+    contract_diff_note: str | None = None,
+) -> JsonObject:
+    """Build the review_quality_status scalar object emitted alongside review_lead_status.
+
+    Fields:
+      coverage_status — copied from review_lead_status
+      specific_hypothesis_count — count of high+medium specificity hypotheses
+      generic_hypothesis_count — count of low specificity hypotheses
+      specificity — "high" | "medium" | "low" (max class present; "low" when none generated)
+      recommended_action — "use_supercontext_packet" when high or medium, else "use_live_followups_or_plain_review"
+      reason — short explanation
+      contract_diff_note — present only when a base_snapshot was provided; carries load/tenant status
+    """
+    specific_count = 0
+    generic_count = 0
+    max_spec = "low"
+    for h in review_hypotheses:
+        if not isinstance(h, dict):
+            continue
+        # Contract-diff families always injected as "high" specificity; other families use _FAMILY_SPECIFICITY
+        spec = h.get("specificity") or _FAMILY_SPECIFICITY.get(str(h.get("risk_type") or ""), "low")
+        if spec in ("high", "medium"):
+            specific_count += 1
+        else:
+            generic_count += 1
+        if _SPECIFICITY_RANK.get(spec, 0) > _SPECIFICITY_RANK.get(max_spec, 0):
+            max_spec = spec
+    if max_spec in ("high", "medium"):
+        recommended_action = "use_supercontext_packet"
+        reason = (
+            f"Packet contains {specific_count} specific hypothesis/es (specificity={max_spec}) "
+            "backed by signal or convention evidence."
+        )
+    else:
+        recommended_action = "use_live_followups_or_plain_review"
+        reason = (
+            "All generated hypotheses are generic (no signal/delta or convention-specific evidence); "
+            "live source inspection will yield higher precision."
+        )
+    if contract_diff_note:
+        # Coverage-honest: base_snapshot problems surface in the reason, never as errors.
+        reason = f"{reason} {contract_diff_note}"
+    status: JsonObject = {
+        "coverage_status": coverage_status,
+        "specific_hypothesis_count": specific_count,
+        "generic_hypothesis_count": generic_count,
+        "specificity": max_spec,
+        "recommended_action": recommended_action,
+        "reason": reason,
+    }
+    if contract_diff_note is not None:
+        status["contract_diff_note"] = contract_diff_note
+    return status
+
+
+# Contract-diff families treated as "high" specificity when spliced into review_hypotheses.
+_CONTRACT_DIFF_FAMILIES = frozenset(
+    {"guard_call_removed_drift", "responsibility_moved_drift", "test_reference_removed_drift"}
+)
+# Maximum contract-diff hypotheses to splice per family (avoid packet explosion).
+_CONTRACT_DIFF_SPLICE_CAP = 3
+
+
+def _splice_contract_diff_hypotheses(
+    *,
+    base_snapshot_dir: str,
+    head_kg: KgSnapshot,
+    changed_files: list[str],
+    review_hypotheses: list[JsonObject],
+) -> tuple[list[JsonObject], str | None]:
+    """Run contract_diff against base_snapshot_dir and splice high-specificity rows.
+
+    Returns (merged_hypotheses, note_string).
+    note_string is None on success; a coverage-honest message on tenant mismatch or
+    load failure (never raises).
+
+    Spliced rows carry:
+      specificity = "high"
+      cause = first before_ref (path + line_start)
+      consequence = first after_ref (path + line_start)
+      source_spans = up to 4 evidence refs (before_refs + after_refs capped)
+      evidence_refs = same as source_spans
+    High-specificity rows are inserted at the front of review_hypotheses so they rank
+    before generic families; existing hypothesis order is preserved after them.
+    """
+    try:
+        from source.kg.query.contract_diff import contract_diff_packet
+        from source.kg.query.snapshot import KgSnapshot
+    except ImportError as exc:
+        return review_hypotheses, f"contract_diff unavailable: {exc}"
+
+    try:
+        head_tenant = head_kg.manifest.get("tenant_id") or "default"
+        base_snap = KgSnapshot(base_snapshot_dir)
+        base_tenant = base_snap.manifest.get("tenant_id") or "default"
+        if head_tenant != base_tenant:
+            return review_hypotheses, (
+                f"base_snapshot tenant '{base_tenant}' does not match head tenant '{head_tenant}'; "
+                "contract-diff skipped — provide a base snapshot from the same tenant."
+            )
+        head_snapshot_dir = str(head_kg.root)
+        packet = contract_diff_packet(
+            base_snapshot_dir,
+            head_snapshot_dir,
+            changed_paths=changed_files,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return review_hypotheses, f"base_snapshot load failed: {exc}"
+
+    raw_hypotheses = packet.get("contract_diff_packet", {}).get("hypotheses", [])
+    if not raw_hypotheses:
+        return review_hypotheses, None
+
+    # Group rows by family; preserve within-family order (deterministic).
+    rows_by_family: dict[str, list[JsonObject]] = {}
+    family_counts: dict[str, int] = {}
+    for h in raw_hypotheses:
+        if not isinstance(h, dict):
+            continue
+        risk_type = str(h.get("risk_type") or "")
+        if risk_type not in _CONTRACT_DIFF_FAMILIES:
+            continue
+        if family_counts.get(risk_type, 0) >= _CONTRACT_DIFF_SPLICE_CAP:
+            continue
+        family_counts[risk_type] = family_counts.get(risk_type, 0) + 1
+        before_refs = [r for r in (h.get("before_refs") or []) if isinstance(r, dict)]
+        after_refs = [r for r in (h.get("after_refs") or []) if isinstance(r, dict)]
+        source_spans = (before_refs + after_refs)[:4]
+        cause: JsonObject | None = None
+        if before_refs:
+            br = before_refs[0]
+            cause = {k: br[k] for k in ("path", "line_start", "repo") if k in br}
+        consequence: JsonObject | None = None
+        if after_refs:
+            ar = after_refs[0]
+            consequence = {k: ar[k] for k in ("path", "line_start", "repo") if k in ar}
+        hypothesis_id = h.get("hypothesis_id")
+        if not hypothesis_id:
+            # hypothesis_id is required for mirror pairing; skip rows missing it.
+            continue
+        if risk_type == "guard_call_removed_drift":
+            negative_checks: list[str] = [
+                "Verify the removed call's effect is performed elsewhere or intentionally dropped; if the guarded invariant is enforced by another path or the call was dead code, this risk does not apply.",
+            ]
+        elif risk_type == "responsibility_moved_drift":
+            negative_checks = [
+                f"Check that {h.get('from_symbol', 'the original symbol')} survives in the head snapshot under the same or a new name; if the symbol is renamed and callers are updated consistently, this risk does not apply.",
+            ]
+        else:
+            # test_reference_removed_drift
+            negative_checks = [
+                "Verify the removed test reference was superseded by a broader or renamed test that still covers the same invariant; if coverage is maintained, this risk does not apply.",
+            ]
+        spliced_row: JsonObject = {
+            "hypothesis_id": hypothesis_id,
+            "risk_type": risk_type,
+            "specificity": "high",
+            "confidence": "medium",
+            "concrete_invariant": h.get("concrete_invariant", ""),
+            "why": h.get("why", ""),
+            "source_checks": (h.get("source_checks") or [])[:2],
+            "negative_checks": negative_checks,
+            "supporting_lead_ids": [],
+            "evidence_refs": source_spans,
+            "source_spans": source_spans,
+        }
+        if cause is not None:
+            spliced_row["cause"] = cause
+        if consequence is not None:
+            spliced_row["consequence"] = consequence
+        rows_by_family.setdefault(risk_type, []).append(spliced_row)
+
+    if not rows_by_family:
+        return review_hypotheses, None
+
+    # Round-robin across populated families: one row from each, then seconds, then thirds.
+    # Deterministic family order = sorted family names (stable across runs).
+    populated_families = sorted(rows_by_family)
+    max_per_family = max(len(rows_by_family[f]) for f in populated_families)
+    spliced: list[JsonObject] = []
+    for slot in range(max_per_family):
+        for family in populated_families:
+            rows = rows_by_family[family]
+            if slot < len(rows):
+                spliced.append(rows[slot])
+
+    # When the merged list exceeds the top-level cap, some family rows at the tail
+    # of the spliced prefix will be omitted by the [:PLANNING_CONTEXT_SECTION_LIMIT]
+    # slice in _review_context. Annotate the last included row of each affected family
+    # with a per-family omitted count so the omission is visible (mirrors
+    # omitted_removed_call_count in contract_diff_packet).
+    if len(spliced) > PLANNING_CONTEXT_SECTION_LIMIT:
+        # Identify which rows survive the cap.
+        surviving = set(id(r) for r in spliced[:PLANNING_CONTEXT_SECTION_LIMIT])
+        # For each family, count rows that don't survive.
+        for family in populated_families:
+            omitted_count = sum(1 for r in rows_by_family[family] if id(r) not in surviving)
+            if omitted_count == 0:
+                continue
+            # Annotate the last surviving row of this family.
+            last_surviving = next(
+                (r for r in reversed(spliced[:PLANNING_CONTEXT_SECTION_LIMIT]) if r.get("risk_type") == family),
+                None,
+            )
+            if last_surviving is not None:
+                last_surviving["omitted_contract_diff_family_count"] = omitted_count
+
+    return spliced + review_hypotheses, None
 
 
 def _review_context_lead_packet(
@@ -3197,6 +3480,7 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
         "summary": summary,
         "review_answer_packet": compact_packet,
         "review_lead_status": review_lead_status,
+        "review_quality_status": result.get("review_quality_status", {}),
         "review_leads": review_leads,
         "diff_anchors": diff_anchors,
         "changed_symbols": [],
@@ -3305,6 +3589,212 @@ def _review_context_diff_anchor_source_coordinates(diff_anchors: list[JsonObject
             if len(coordinates) >= COMPACT_REVIEW_SOURCE_COORDINATE_LIMIT:
                 return coordinates
     return coordinates
+
+
+_RISK_SIGNAL_PREDICATE = "code_risk_signal"
+
+
+def _cap_risk_signals_per_subject(
+    signals: list[JsonObject],
+    *,
+    range_filters: dict[str, list[tuple[int, int]]],
+    limit_per_subject: int,
+) -> list[JsonObject]:
+    """Keep at most limit_per_subject signals per enclosing subject_id.
+
+    Relevance order within each subject:
+      1. Evidence overlaps a changed range (overlap first).
+      2. Lowest evidence line (ascending).
+    """
+    def _signal_sort_key(sig: JsonObject) -> tuple[int, int]:
+        overlaps_range = 0
+        min_line = 999_999
+        for ev in (sig.get("_evidence") or []):
+            br = ev.get("bytes_ref") if isinstance(ev, dict) else None
+            if not isinstance(br, dict):
+                continue
+            ev_line_start = br.get("line_start")
+            ev_line_end = br.get("line_end")
+            if isinstance(ev_line_start, int) and isinstance(ev_line_end, int):
+                min_line = min(min_line, ev_line_start)
+                p = br.get("path")
+                if isinstance(p, str):
+                    p_norm = _planning_context_normalize_path(p)
+                    path_ranges = range_filters.get(p_norm, [])
+                    if path_ranges and any(
+                        ev_line_start <= rng_end and rng_start <= ev_line_end
+                        for rng_start, rng_end in path_ranges
+                    ):
+                        overlaps_range = 1
+        return (1 - overlaps_range, min_line)
+
+    by_subject: dict[str, list[JsonObject]] = {}
+    for sig in signals:
+        subj = sig.get("subject_id") or ""
+        by_subject.setdefault(subj, []).append(sig)
+
+    result: list[JsonObject] = []
+    for subj_sigs in by_subject.values():
+        subj_sigs.sort(key=_signal_sort_key)
+        result.extend(subj_sigs[:limit_per_subject])
+    return result
+
+
+def _review_context_risk_signals(
+    kg: KgSnapshot,
+    *,
+    repo: str,
+    changed_symbols: list[JsonObject],
+    changed_files: list[str],
+    range_filters: dict[str, list[tuple[int, int]]],
+    limit: int = 12,
+) -> list[JsonObject]:
+    """Retrieve code_risk_signal support facts for changed symbols and files.
+
+    Returns up to *limit* signal rows (default 12), each augmented with a
+    ``_evidence`` list containing the evidence rows that carry ``bytes_ref``
+    coordinates (so the hypothesis builder can extract paths without a separate
+    KG lookup).
+
+    Two bounds are applied in sequence:
+      1. Per-subject cap (3): at most 3 signals per subject_id, ordered by
+         range-overlap first then lowest evidence line.
+      2. Total retrieval bound (*limit*, default 12): the post-cap list is
+         sorted deterministically — range-overlap signals first, then
+         subject-matched signals, then by (evidence path, evidence line) —
+         and truncated to *limit*.  With 6 subjects × 3 = 18 possible rows
+         after step 1, this bound is the enforced global ceiling.
+
+    Scoping rules:
+      1. subject_id directly matches the symbol_id of a changed-symbol row
+         (symbol_id = entity["entity_id"] from _symbol_result; matched_by_subject)
+         → included regardless of range filters.
+      2. evidence bytes_ref.repo must equal *repo* (case-insensitive suffix
+         match, same logic as _review_context_repo_matches).
+      3. evidence bytes_ref.path must match a normalized changed file path.
+      4. When range_filters contains ranges for that path, at least one
+         evidence line (line_start..line_end) must overlap a supplied range.
+         If range_filters is empty or has no entry for this path, the path
+         match alone is sufficient (no range filter applied).
+    """
+    # Index changed context.
+    # _symbol_result rows carry symbol_id (= entity["entity_id"]); not entity_id.
+    changed_entity_ids: set[str] = set()
+    for sym in changed_symbols:
+        eid = sym.get("symbol_id")
+        if isinstance(eid, str) and eid:
+            changed_entity_ids.add(eid)
+
+    normalized_changed_files: set[str] = set()
+    for f in changed_files:
+        normalized = _planning_context_normalize_path(f)
+        if normalized:
+            normalized_changed_files.add(normalized)
+
+    results: list[JsonObject] = []
+    seen_fact_ids: set[str] = set()
+
+    for fact in kg.support_facts:
+        if fact.get("predicate") != _RISK_SIGNAL_PREDICATE:
+            continue
+        fact_id = fact.get("fact_id")
+        if isinstance(fact_id, str) and fact_id in seen_fact_ids:
+            continue
+
+        subject_id = fact.get("subject_id")
+        matched_by_subject = isinstance(subject_id, str) and subject_id in changed_entity_ids
+
+        # Attach evidence rows for coordinate extraction.
+        evidence_rows: list[JsonObject] = []
+        if isinstance(fact_id, str):
+            for ev in kg.evidence_by_target.get(fact_id, []):
+                evidence_rows.append(ev)
+
+        matched = matched_by_subject
+        if not matched:
+            # Try evidence path matching, scoped to the effective repo and
+            # changed ranges when supplied.
+            for ev in evidence_rows:
+                br = ev.get("bytes_ref")
+                if not isinstance(br, dict):
+                    continue
+                # Repo scope: evidence must belong to the effective repo.
+                ev_repo = br.get("repo")
+                if not isinstance(ev_repo, str):
+                    continue
+                if not _review_context_repo_matches(ev_repo, repo):
+                    continue
+                p = br.get("path")
+                if not isinstance(p, str):
+                    continue
+                p_norm = _planning_context_normalize_path(p)
+                if p_norm not in normalized_changed_files:
+                    continue
+                # Range scope: when ranges are supplied for this path, the
+                # evidence line interval must overlap at least one range.
+                path_ranges = range_filters.get(p_norm, [])
+                if path_ranges:
+                    line_start = br.get("line_start")
+                    line_end = br.get("line_end")
+                    if not (isinstance(line_start, int) and isinstance(line_end, int)):
+                        continue
+                    overlaps = any(
+                        line_start <= rng_end and rng_start <= line_end
+                        for rng_start, rng_end in path_ranges
+                    )
+                    if not overlaps:
+                        continue
+                matched = True
+                break
+
+        if not matched:
+            continue
+
+        if isinstance(fact_id, str):
+            seen_fact_ids.add(fact_id)
+
+        enriched: JsonObject = dict(fact)
+        enriched["_evidence"] = evidence_rows
+        results.append(enriched)
+
+    # Per-subject retrieval cap: keep at most 3 signals per enclosing subject,
+    # selected by relevance: changed-range overlap first, then lowest evidence line.
+    results = _cap_risk_signals_per_subject(results, range_filters=range_filters, limit_per_subject=3)
+
+    # Total retrieval bound: apply deterministic order so the strongest *limit*
+    # rows survive.  Priority: range-overlap signals first, then subject-matched
+    # signals, then by (evidence path, evidence line) for stable ordering.
+    def _total_sort_key(sig: JsonObject) -> tuple[int, int, str, int]:
+        overlaps_range = 0
+        matched_by_subj = 1
+        min_path = ""
+        min_line = 999_999
+        sid = sig.get("subject_id")
+        if isinstance(sid, str) and sid in changed_entity_ids:
+            matched_by_subj = 0
+        for ev in (sig.get("_evidence") or []):
+            br = ev.get("bytes_ref") if isinstance(ev, dict) else None
+            if not isinstance(br, dict):
+                continue
+            ev_ls = br.get("line_start")
+            ev_le = br.get("line_end")
+            ev_path = br.get("path") or ""
+            if isinstance(ev_ls, int):
+                if not min_path or ev_path < min_path or (ev_path == min_path and ev_ls < min_line):
+                    min_path = ev_path
+                    min_line = ev_ls
+            if isinstance(ev_ls, int) and isinstance(ev_le, int):
+                p_norm = _planning_context_normalize_path(ev_path)
+                path_ranges = range_filters.get(p_norm, [])
+                if path_ranges and any(
+                    ev_ls <= rng_end and rng_start <= ev_le
+                    for rng_start, rng_end in path_ranges
+                ):
+                    overlaps_range = 1
+        return (1 - overlaps_range, matched_by_subj, min_path, min_line)
+
+    results.sort(key=_total_sort_key)
+    return results[:limit]
 
 
 def _planning_context_from_query(kg: KgSnapshot, *, query: str, limit: int) -> JsonObject:
@@ -3715,7 +4205,12 @@ def _planning_context_value_matches(anchor: str, *candidates: object) -> bool:
 
 
 def _planning_context_normalize_path(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./")
+    # Strip only literal "./" prefixes; lstrip("./") is a char-class strip that
+    # would corrupt "../x" and "/abs/x".
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
 
 
 def _changed_ranges_by_path(changed_ranges: list[JsonObject]) -> dict[str, list[tuple[int, int]]]:

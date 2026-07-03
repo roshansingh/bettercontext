@@ -79,6 +79,7 @@ class PythonDjangoFrameworkExtractionTest(unittest.TestCase):
                 "repo": "orders",
                 "changed_files": ["orders/models.py"],
                 "changed_ranges": [{"path": "orders/models.py", "start_line": 6, "end_line": 8}],
+                "include_broad_context": True,
             },
         )
 
@@ -99,6 +100,7 @@ class PythonDjangoFrameworkExtractionTest(unittest.TestCase):
                 "changed_files": ["orders/models.py"],
                 "changed_ranges": [{"path": "orders/models.py", "start_line": 6, "end_line": 8}],
                 "limit": 1,
+                "include_broad_context": True,
             },
         )
         self.assertEqual(limited["summary"]["framework_model_count"], 1)
@@ -112,6 +114,7 @@ class PythonDjangoFrameworkExtractionTest(unittest.TestCase):
                 "repo": "orders",
                 "changed_files": ["orders/serializers.py"],
                 "changed_ranges": [{"path": "orders/serializers.py", "start_line": 4, "end_line": 7}],
+                "include_broad_context": True,
             },
         )
         self.assertEqual(serializer_change["framework_impact"]["status"], "found")
@@ -363,6 +366,7 @@ class PythonDjangoFrameworkExtractionTest(unittest.TestCase):
                 "repo": "orders",
                 "changed_files": ["settings_reader.py"],
                 "changed_ranges": [{"path": "settings_reader.py", "start_line": 3, "end_line": 4}],
+                "include_broad_context": True,
             },
         )
         self.assertEqual(review["framework_impact"]["status"], "empty")
@@ -443,6 +447,7 @@ class PythonDjangoFrameworkExtractionTest(unittest.TestCase):
                 "repo": "orders",
                 "changed_files": ["orders/models.py"],
                 "changed_ranges": [{"path": "orders/models.py", "start_line": 3, "end_line": 5}],
+                "include_broad_context": True,
             },
         )
 
@@ -480,6 +485,7 @@ class PythonDjangoFrameworkExtractionTest(unittest.TestCase):
                 "changed_files": ["orders/models.py"],
                 "changed_ranges": [{"path": "orders/models.py", "start_line": 11, "end_line": 12}],
                 "limit": 10,
+                "include_broad_context": True,
             },
         )
 

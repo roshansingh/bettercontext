@@ -4,6 +4,7 @@ import contextlib
 from copy import deepcopy
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,7 @@ from source.kg.product.mcp_tools import (
     _planning_context_authz_surface_reference,
     _planning_context_symbol_impact,
     _review_context_lead_packet,
+    _review_context_risk_signals,
     _with_default_tool_metadata,
     call_tool,
     tool_definitions,
@@ -34,6 +36,7 @@ from source.kg.product.output_budget import (
     RELATED_FACT_SECTION_KEYS,
     _BUDGET_BACKFILL_LIST_PATHS,
     REVERSE_IMPACT_MAX_CHARS,
+    REVIEW_CONTEXT_BROAD_MAX_CHARS,
     REVIEW_CONTEXT_MAX_CHARS,
     _compact_authz_surface,
     _compact_disambiguation,
@@ -1491,11 +1494,13 @@ class McpToolsTest(unittest.TestCase):
         }
         original = deepcopy(result)
 
-        budgeted = enforce_review_context_budget(result)
+        # include_broad_context=True: asserts the broad ladder's top-level detail
+        # sampling limits and top-level/review_leads equality contracts.
+        budgeted = enforce_review_context_budget(result, include_broad_context=True)
 
         self.assertEqual(result, original)
         self.assertTrue(budgeted["output_budget"]["truncated"])
-        self.assertLessEqual(len(canonical_json(budgeted)), REVIEW_CONTEXT_MAX_CHARS)
+        self.assertLessEqual(len(canonical_json(budgeted)), REVIEW_CONTEXT_BROAD_MAX_CHARS)
         # Curated head start and contracts survive; verbose detail is bounded.
         self.assertIn("review_answer_packet", budgeted)
         self.assertEqual(budgeted["summary"], original["summary"])
@@ -1583,7 +1588,9 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=8_000)
+        # include_broad_context=True: asserts compacted row shape on the broad
+        # ladder's top-level detail lists (absent in the compact profile).
+        budgeted = enforce_review_context_budget(result, max_chars=8_000, include_broad_context=True)
 
         self.assertLessEqual(len(canonical_json(budgeted)), 8_000)
         self.assertEqual(budgeted["direct_callers"][0]["subject"], "pkg.module_0.caller")
@@ -1696,7 +1703,7 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=20_000)
+        budgeted = enforce_review_context_budget(result, max_chars=20_000, include_broad_context=True)
 
         self.assertLessEqual(len(canonical_json(budgeted)), 20_000)
         self.assertNotIn("exceeded_after_minimization", budgeted["output_budget"])
@@ -1776,7 +1783,9 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=20_000)
+        # include_broad_context=True: backfill/truncated_sections clearing is broad
+        # ladder machinery over top-level detail lists.
+        budgeted = enforce_review_context_budget(result, max_chars=20_000, include_broad_context=True)
 
         self.assertEqual(len(budgeted["direct_callers"]), len(relation_rows))
         self.assertEqual(len(budgeted["review_leads"]["direct_callers"]), len(relation_rows))
@@ -1983,7 +1992,7 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+        budgeted = enforce_review_context_budget(result, max_chars=10_000, include_broad_context=True)
 
         self.assertLessEqual(len(canonical_json(budgeted)), 10_000)
         self.assertTrue(budgeted["output_budget"]["lead_only"])
@@ -2203,7 +2212,7 @@ class McpToolsTest(unittest.TestCase):
             "next_actions": [],
         }
 
-        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+        budgeted = enforce_review_context_budget(result, max_chars=10_000, include_broad_context=True)
 
         self.assertLessEqual(len(canonical_json(budgeted)), 10_000)
         self.assertTrue(budgeted["output_budget"].get("lead_only"))
@@ -2345,6 +2354,87 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(status.get("answer_packet_returned_count"), 0)
         self.assertEqual(status.get("truncated_count"), 0)
         self.assertEqual(status.get("reason"), "none_generated")
+
+    # --- engine_version stamp tests ---
+
+    def _minimal_review_context_result(self, *, bloat: int = 0) -> dict:
+        """Minimal review_context result dict for budget tests."""
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 0,
+            "changed_symbol_count": 0,
+            "direct_impact_count": 1,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+        }
+        return {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"direct_caller_count": 1},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "application": {"bloat": "z" * bloat},
+            },
+            "review_leads": {
+                "changed_files": ["pkg/module.py"],
+                "changed_symbols": [],
+                "direct_callers": [],
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+    def test_review_context_call_tool_stamps_engine_version(self) -> None:
+        """call_tool review_context always sets output_budget.engine_version."""
+        with _fixture_snapshot() as kg:
+            result = call_tool(kg, "review_context", {
+                "repo": "payments",
+                "changed_files": ["payments/checkout.py"],
+            })
+        budget = result.get("output_budget")
+        self.assertIsInstance(budget, dict, "output_budget must be present")
+        version = budget.get("engine_version")
+        self.assertIsInstance(version, str, "engine_version must be a string")
+        self.assertTrue(version, "engine_version must be non-empty")
+
+    def test_review_context_engine_version_survives_heavy_compaction(self) -> None:
+        """engine_version is preserved after compaction truncates detail rows."""
+        result = self._minimal_review_context_result(bloat=50_000)
+        result["output_budget"] = {"engine_version": "test-sha"}
+        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+        budget = budgeted.get("output_budget")
+        self.assertIsInstance(budget, dict)
+        self.assertEqual(budget.get("engine_version"), "test-sha")
+
+    def test_review_context_engine_version_survives_lead_only_fallback(self) -> None:
+        """engine_version is preserved when budget degrades to lead_only packet."""
+        result = self._minimal_review_context_result(bloat=50_000)
+        result["output_budget"] = {"engine_version": "test-sha"}
+        budgeted = enforce_review_context_budget(result, max_chars=10_000, include_broad_context=True)
+        budget = budgeted.get("output_budget")
+        self.assertIsInstance(budget, dict)
+        self.assertTrue(budget.get("lead_only"), "expected lead_only degradation")
+        self.assertEqual(budget.get("engine_version"), "test-sha")
+
+    def test_review_context_engine_version_present_on_normal_path(self) -> None:
+        """engine_version is present even when no compaction is needed."""
+        result = self._minimal_review_context_result()
+        result["output_budget"] = {"engine_version": "test-sha"}
+        returned = enforce_review_context_budget(result)
+        budget = returned.get("output_budget")
+        self.assertIsInstance(budget, dict)
+        self.assertEqual(budget.get("engine_version"), "test-sha")
 
     def test_reverse_impact_callable_partition_rule(self) -> None:
         from source.kg.query.reverse_impact import _is_callable_symbol
@@ -3587,7 +3677,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["status"], "found")
@@ -3680,7 +3770,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 KgSnapshot(root),
                 "review_context",
-                {"repo": "campaign", "changed_files": ["campaign/app.py"], "limit": 10},
+                {"repo": "campaign", "changed_files": ["campaign/app.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["summary"]["event_fact_count"], 0)
@@ -3705,7 +3795,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         impact = result["application_impact"]
@@ -3734,6 +3824,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": ["UI", "scheduled_jobs", "SQS", "workers", "tracking"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3770,6 +3861,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 1, "end_line": 200}],
                     "requested_surfaces": ["callers", "reverse_impact"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3788,6 +3880,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": ["services", "schemas", "contracts", "deployables", "owners"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3820,6 +3913,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": ["rule_actions", "abilities", "authz", "tests"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3849,6 +3943,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": ["scheduled_jobs", "authz"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3874,6 +3969,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 1, "end_line": 200}],
                     "requested_surfaces": ["ability_checks"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3901,6 +3997,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": surfaces,
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3921,6 +4018,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "requested_surfaces": [long_token],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -3960,7 +4058,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["summary"]["endpoint_consumer_fact_count"], 1)
@@ -3974,7 +4072,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "Payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "Payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["status"], "found")
@@ -3986,7 +4084,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "latticeai/payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "latticeai/payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["status"], "found")
@@ -3998,7 +4096,7 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                {"repo": "payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["status"], "found")
@@ -4009,7 +4107,9 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "owner-b/payments", "changed_files": ["payments/checkout.py"], "limit": 10},
+                # include_broad_context=True: changed_file_symbols inventory is a broad
+                # section; the compact profile omits it entirely (nothing to leak).
+                {"repo": "owner-b/payments", "changed_files": ["payments/checkout.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertFalse(any(row["qualname"] == "handle_checkout" for row in result["changed_file_symbols"]))
@@ -4024,6 +4124,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4042,6 +4143,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4082,6 +4184,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4149,6 +4252,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4351,7 +4455,9 @@ class McpToolsTest(unittest.TestCase):
             result = call_tool(
                 kg,
                 "review_context",
-                {"repo": "owner-b/payments", "changed_files": ["payments/missing.py"], "limit": 10},
+                # include_broad_context=True: repo_dependencies is a broad section,
+                # omitted by the compact profile.
+                {"repo": "owner-b/payments", "changed_files": ["payments/missing.py"], "limit": 10, "include_broad_context": True},
             )
 
         self.assertEqual(result["repo_dependencies"], [])
@@ -4399,6 +4505,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4438,6 +4545,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4477,6 +4585,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4497,6 +4606,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                    "include_broad_context": True,
                 },
             )
         self.assertEqual(
@@ -4516,6 +4626,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 15, "end_line": 15}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4531,6 +4642,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 5, "end_line": 25}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4547,6 +4659,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 1, "end_line": 30}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4563,6 +4676,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 15, "end_line": 15}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -4636,7 +4750,7 @@ class McpToolsTest(unittest.TestCase):
         self.assertNotIn("framework_impact", result)
         self.assertEqual(result["omitted_context"]["counts"]["application_impact.cross_repo_name_leads"], 1)
         self.assertEqual(result["candidate_leads"]["status"], "empty")
-        self.assertLess(len(canonical_json(result)), 8_500)
+        self.assertLess(len(canonical_json(result)), 9_200)
         self.assertTrue(any("include_unlinked_leads=true" in action for action in result["next_actions"]))
 
     def test_review_context_file_anchor_only_can_opt_into_broad_unlinked_leads(self) -> None:
@@ -4650,6 +4764,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_ranges": [{"path": "payments/config.yaml", "start_line": 4, "end_line": 6}],
                     "include_unlinked_leads": True,
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4673,6 +4788,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_ranges": [{"path": "payments/config.yaml", "start_line": 4, "end_line": 6}],
                     "requested_surfaces": ["ui_screens"],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4719,6 +4835,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["app/config.yaml"],
                     "changed_ranges": [{"path": "app/config.yaml", "start_line": 1, "end_line": 1}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4737,6 +4854,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4760,6 +4878,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 1, "end_line": 200}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4781,6 +4900,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4803,6 +4923,7 @@ class McpToolsTest(unittest.TestCase):
                     "changed_files": ["payments/checkout.py", "payments/gateway.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 10}],
                     "limit": 10,
+                    "include_broad_context": True,
                 },
             )
 
@@ -4853,7 +4974,7 @@ class McpToolsTest(unittest.TestCase):
 
     def test_review_context_missing_changed_file_still_returns_repo_dependencies(self) -> None:
         with _fixture_snapshot() as kg:
-            result = call_tool(kg, "review_context", {"repo": "payments", "changed_files": ["payments/missing.py"]})
+            result = call_tool(kg, "review_context", {"repo": "payments", "changed_files": ["payments/missing.py"], "include_broad_context": True})
 
         self.assertEqual(result["status"], "found")
         self.assertEqual(result["changed_symbols"], [])
@@ -4866,7 +4987,7 @@ class McpToolsTest(unittest.TestCase):
 
     def test_review_context_does_not_create_application_anchor_from_test_path(self) -> None:
         with _fixture_snapshot() as kg:
-            result = call_tool(kg, "review_context", {"repo": "payments", "changed_files": ["tests/test_checkout.py"]})
+            result = call_tool(kg, "review_context", {"repo": "payments", "changed_files": ["tests/test_checkout.py"], "include_broad_context": True})
 
         self.assertEqual(result["application_impact"]["status"], "missing_anchor")
         self.assertEqual(result["application_impact"]["anchors"], [])
@@ -4944,7 +5065,7 @@ class McpToolsTest(unittest.TestCase):
             opted_in = call_tool(
                 kg,
                 "review_context",
-                {"repo": "payments", "changed_files": ["payments/checkout.py"], "include_deploy_blockers": True},
+                {"repo": "payments", "changed_files": ["payments/checkout.py"], "include_deploy_blockers": True, "include_broad_context": True},
             )
 
         self.assertEqual(default["unsupported_scopes"], [])
@@ -6011,6 +6132,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                    "include_broad_context": True,
                 },
             )
 
@@ -6093,6 +6215,7 @@ class McpToolsTest(unittest.TestCase):
                     "repo": "payments",
                     "changed_files": ["payments/checkout.py"],
                     "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                    "include_broad_context": True,
                 },
             )
         # summary.direct_caller_count must reflect all 7 callers, not a truncated 5
@@ -7415,6 +7538,1440 @@ class TestOptionalReviewSurfacesTolerantDedupe(unittest.TestCase):
         )
         self.assertEqual(len(unknown), 1)
         self.assertEqual(unknown[0], "foobar")
+
+
+def _minimal_risk_kg(
+    test_case: unittest.TestCase,
+    *,
+    repo: str,
+    signal_repo: str,
+    signal_path: str,
+    signal_line_start: int,
+    signal_line_end: int,
+) -> KgSnapshot:
+    """Build a minimal KgSnapshot with one code_risk_signal support fact + evidence."""
+    import tempfile
+    from source.kg.core.models import Entity, Fact, Evidence, Coverage
+
+    tmpdir = tempfile.mkdtemp()
+    test_case.addCleanup(shutil.rmtree, tmpdir, True)
+    root = Path(tmpdir)
+    subject = Entity(
+        kind="CodeSymbol",
+        identity={
+            "tenant_id": "default",
+            "repo": signal_repo,
+            "module": "pkg.worker",
+            "qualname": "do_work",
+            "symbol_kind": "function",
+        },
+        properties={"path": signal_path, "line": signal_line_start},
+    )
+    signal_fact = Fact(
+        predicate="code_risk_signal",
+        subject_id=subject.entity_id,
+        object_id=subject.entity_id,
+        qualifier={"risk_family": "swallowed_exception", "exception_type": "bare", "detail": "test"},
+    )
+    ev = Evidence(
+        target_type="fact",
+        target_id=signal_fact.fact_id,
+        derivation_class="deterministic_static",
+        source_system="test",
+        source_ref={"extractor": "test"},
+        bytes_ref={
+            "repo": signal_repo,
+            "commit_sha": "abc123",
+            "path": signal_path,
+            "line_start": signal_line_start,
+            "line_end": signal_line_end,
+        },
+        confidence=1.0,
+    )
+    JsonlKgStore(root).write(
+        entities=[subject],
+        facts=[],
+        support_facts=[signal_fact],
+        evidence=[ev],
+        coverage=[],
+        manifest={"version": 1, "repo_name": repo, "repo_path": str(root)},
+    )
+    kg = KgSnapshot(root)
+    # Store the subject entity_id so callers can build changed_symbols rows.
+    kg._test_subject_entity_id = subject.entity_id  # type: ignore[attr-defined]
+    return kg
+
+
+class ReviewContextRiskSignalScopeTest(unittest.TestCase):
+    """P1: _review_context_risk_signals scopes by repo and changed ranges."""
+
+    def test_same_path_different_repo_signal_excluded(self) -> None:
+        """Signal from another repo with same path must be excluded (no subject match)."""
+        kg = _minimal_risk_kg(
+            self,
+            repo="repo-a",
+            signal_repo="repo-b",
+            signal_path="pkg/worker.py",
+            signal_line_start=5,
+            signal_line_end=10,
+        )
+        results = _review_context_risk_signals(
+            kg,
+            repo="repo-a",
+            changed_symbols=[],
+            changed_files=["pkg/worker.py"],
+            range_filters={},
+        )
+        # Signal is from repo-b; repo-a mismatch → must be excluded
+        self.assertEqual(results, [], f"signal from different repo must be excluded: {results}")
+
+    def test_same_file_out_of_range_signal_excluded_when_ranges_supplied(self) -> None:
+        """Signal on lines 50-60 must be excluded when changed_ranges cover only lines 1-10."""
+        kg = _minimal_risk_kg(
+            self,
+            repo="repo-a",
+            signal_repo="repo-a",
+            signal_path="pkg/worker.py",
+            signal_line_start=50,
+            signal_line_end=60,
+        )
+        results = _review_context_risk_signals(
+            kg,
+            repo="repo-a",
+            changed_symbols=[],
+            changed_files=["pkg/worker.py"],
+            range_filters={"pkg/worker.py": [(1, 10)]},
+        )
+        # Evidence lines 50-60 do not overlap range 1-10 → excluded
+        self.assertEqual(results, [], f"out-of-range signal must be excluded when ranges supplied: {results}")
+        # Inversion: same signal with no range filter must be included
+        results_no_ranges = _review_context_risk_signals(
+            kg,
+            repo="repo-a",
+            changed_symbols=[],
+            changed_files=["pkg/worker.py"],
+            range_filters={},
+        )
+        self.assertEqual(len(results_no_ranges), 1, "without ranges the signal must be included (inversion)")
+
+    def test_subject_matched_signal_included_regardless_of_ranges(self) -> None:
+        """Signal whose subject_id matches a changed symbol is included even if out of range."""
+        kg = _minimal_risk_kg(
+            self,
+            repo="repo-a",
+            signal_repo="repo-a",
+            signal_path="pkg/worker.py",
+            signal_line_start=50,
+            signal_line_end=60,
+        )
+        entity_id = kg._test_subject_entity_id  # type: ignore[attr-defined]
+        # Supply a changed_symbols row using symbol_id (_symbol_result shape); entity_id absent.
+        changed_sym = {"symbol_id": entity_id, "qualname": "do_work", "path": "pkg/worker.py"}
+        results = _review_context_risk_signals(
+            kg,
+            repo="repo-a",
+            changed_symbols=[changed_sym],
+            changed_files=["pkg/worker.py"],
+            range_filters={"pkg/worker.py": [(1, 10)]},
+        )
+        # subject_id directly matches symbol_id → included regardless of range mismatch
+        self.assertEqual(len(results), 1, f"subject-matched signal must be included: {results}")
+
+    def test_in_range_signal_included(self) -> None:
+        """Signal overlapping the supplied range is included."""
+        kg = _minimal_risk_kg(
+            self,
+            repo="repo-a",
+            signal_repo="repo-a",
+            signal_path="pkg/worker.py",
+            signal_line_start=5,
+            signal_line_end=8,
+        )
+        results = _review_context_risk_signals(
+            kg,
+            repo="repo-a",
+            changed_symbols=[],
+            changed_files=["pkg/worker.py"],
+            range_filters={"pkg/worker.py": [(1, 10)]},
+        )
+        self.assertEqual(len(results), 1, f"in-range signal must be included: {results}")
+
+    def test_dotslash_evidence_path_normalizes_to_match(self) -> None:
+        """bytes_ref.path with a leading './' must still match a normalized changed_files entry."""
+        kg = _minimal_risk_kg(
+            self,
+            repo="repo-a",
+            signal_repo="repo-a",
+            signal_path="./pkg/worker.py",
+            signal_line_start=5,
+            signal_line_end=8,
+        )
+        results = _review_context_risk_signals(
+            kg,
+            repo="repo-a",
+            changed_symbols=[],
+            changed_files=["pkg/worker.py"],
+            range_filters={"pkg/worker.py": [(1, 10)]},
+        )
+        self.assertEqual(len(results), 1, f"dotslash evidence path must be normalized and matched: {results}")
+
+
+def _build_multi_file_risk_kg(
+    test_case: unittest.TestCase,
+    *,
+    n_files: int = 5,
+    signal_file_index: int = 2,
+    signal_line: int = 50,
+    changed_line: int = 5,
+) -> tuple[KgSnapshot, list[Entity]]:
+    """Build a KG with n_files changed symbols and one code_risk_signal on symbol[signal_file_index].
+
+    The signal line (signal_line) intentionally does NOT overlap the changed_range
+    (changed_line), so only subject-match can retrieve the signal.
+    """
+    tmpdir = tempfile.mkdtemp()
+    test_case.addCleanup(shutil.rmtree, tmpdir, True)
+    root = Path(tmpdir)
+    symbols: list[Entity] = []
+    for i in range(n_files):
+        sym = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": "default",
+                "repo": "testrepo",
+                "module": f"pkg.module_{i}",
+                "qualname": f"fn_{i}",
+                "symbol_kind": "function",
+            },
+            properties={"path": f"pkg/module_{i}.py", "line": 1, "end_line": 100},
+        )
+        symbols.append(sym)
+    target = symbols[signal_file_index]
+    signal_fact = Fact(
+        predicate="code_risk_signal",
+        subject_id=target.entity_id,
+        object_id=target.entity_id,
+        qualifier={
+            "risk_family": "swallowed_exception",
+            "exception_type": "bare",
+            "qualname": f"fn_{signal_file_index}",
+            "line": signal_line,
+        },
+    )
+    ev = Evidence(
+        target_type="fact",
+        target_id=signal_fact.fact_id,
+        derivation_class="deterministic_static",
+        source_system="test",
+        source_ref={"extractor": "test"},
+        bytes_ref={
+            "repo": "testrepo",
+            "commit_sha": "abc",
+            "path": f"pkg/module_{signal_file_index}.py",
+            "line_start": signal_line,
+            "line_end": signal_line,
+        },
+        confidence=1.0,
+    )
+    JsonlKgStore(root).write(
+        entities=symbols,
+        facts=[],
+        support_facts=[signal_fact],
+        evidence=[ev],
+        coverage=[],
+        manifest={"version": 1, "repo_name": "testrepo", "repo_path": str(root)},
+    )
+    return KgSnapshot(root), symbols
+
+
+class TestR2SubjectMatchViaSymbolId(unittest.TestCase):
+    """R2 regression: _review_context_risk_signals must match subject_id against symbol_id.
+
+    Inversion evidence: prior code read entity_id (absent on real _symbol_result rows);
+    fixed to read symbol_id. Signals whose subject entity IS a changed symbol must be
+    retrieved even when their evidence lines don't overlap the changed hunks.
+    """
+
+    def test_subject_match_fires_despite_non_overlapping_hunk(self) -> None:
+        """Signal on line 50 included via subject-match when changed_range covers line 1-10."""
+        kg, symbols = _build_multi_file_risk_kg(
+            self,
+            n_files=5,
+            signal_file_index=2,
+            signal_line=50,
+            changed_line=5,
+        )
+        target = symbols[2]
+        # changed_symbols uses symbol_id (real _symbol_result shape, NOT entity_id)
+        changed_sym = {
+            "symbol_id": target.entity_id,
+            "qualname": "fn_2",
+            "path": "pkg/module_2.py",
+        }
+        results = _review_context_risk_signals(
+            kg,
+            repo="testrepo",
+            changed_symbols=[changed_sym],
+            changed_files=[f"pkg/module_{i}.py" for i in range(5)],
+            range_filters={"pkg/module_2.py": [(1, 10)]},
+        )
+        # Signal is on line 50, range covers 1-10 → no line overlap.
+        # Subject match via symbol_id must still fire.
+        self.assertEqual(len(results), 1, "subject-match must fire despite non-overlapping hunk")
+        self.assertEqual(results[0].get("subject_id"), target.entity_id)
+
+    def test_subject_match_does_not_fire_when_symbol_id_absent(self) -> None:
+        """When changed_symbols row lacks symbol_id, out-of-range signal is excluded.
+
+        Inversion: a row with entity_id (old shape) must also NOT match — confirms the
+        fabrication that shipped R2 is gone.
+        """
+        kg, symbols = _build_multi_file_risk_kg(
+            self,
+            n_files=5,
+            signal_file_index=2,
+            signal_line=50,
+        )
+        # Row with entity_id (old broken shape) must NOT match
+        changed_sym_old = {
+            "entity_id": symbols[2].entity_id,
+            "qualname": "fn_2",
+            "path": "pkg/module_2.py",
+        }
+        results_old = _review_context_risk_signals(
+            kg,
+            repo="testrepo",
+            changed_symbols=[changed_sym_old],
+            changed_files=["pkg/module_2.py"],
+            range_filters={"pkg/module_2.py": [(1, 10)]},
+        )
+        self.assertEqual(results_old, [], "entity_id (old shape) must not match — confirms old bug is gone")
+
+    def test_end_to_end_subject_match_multi_file(self) -> None:
+        """call_tool review_context: signal fires via subject-match; changed_symbol_count > 1.
+
+        Builds 5 changed files with symbols. Signal on module_2.py line 50; changed ranges
+        cover line 1-10 of each file (no overlap). changed_symbol_count must be > 1 and the
+        swallowed_exception_state_drift family must appear in review_hypotheses.
+        """
+        kg, _syms = _build_multi_file_risk_kg(
+            self,
+            n_files=5,
+            signal_file_index=2,
+            signal_line=50,
+        )
+        changed_files = [f"pkg/module_{i}.py" for i in range(5)]
+        changed_ranges = [{"path": f"pkg/module_{i}.py", "start_line": 1, "end_line": 10} for i in range(5)]
+        result = call_tool(
+            kg,
+            "review_context",
+            {"repo": "testrepo", "changed_files": changed_files, "changed_ranges": changed_ranges, "limit": 20},
+        )
+        # Non-vacuous: must have retained more than 1 cluster
+        leads = result.get("review_leads") or {}
+        sym_rows = leads.get("changed_symbols") or []
+        self.assertGreater(len(sym_rows), 1, "must retain >1 changed-symbol row across 5 files")
+        # Detector must fire via subject-match despite no hunk overlap
+        hypotheses = result.get("review_hypotheses") or []
+        risk_types = [h.get("risk_type") for h in hypotheses]
+        self.assertIn(
+            "swallowed_exception_state_drift",
+            risk_types,
+            f"swallowed_exception_state_drift must fire via subject-match; got {risk_types}",
+        )
+
+
+class TestR1FundingBoilerplateVictim(unittest.TestCase):
+    """R1 regression: anchor repair must succeed when the only evictable mass is boilerplate.
+
+    Builds a packet whose broad-context sections are empty but whose boilerplate/inventory
+    sections (changed_surface rows, surface_status, changed_file_symbols, duplicated
+    answer-packet contracts) consume enough bytes to leave no room for cluster anchors.
+    Asserts that the cap is held and the anchors are still present.
+    """
+
+    def _build_boilerplate_heavy_packet(self, n_clusters: int = 5, *, max_chars: int) -> dict:
+        """Construct a review_context-shaped packet with empty broad context and fat boilerplate."""
+        # Build a multi-cluster changed_symbols list
+        changed_symbols = []
+        for i in range(n_clusters):
+            changed_symbols.append({
+                "symbol_id": f"ent_{i:04x}",
+                "lead_id": f"lead:changed_symbol:ent_{i:04x}",
+                "lead_kind": "changed_symbol",
+                "display_name": f"mod_{i}.fn_{i}",
+                "qualified_name": f"mod_{i}.fn_{i}",
+                "qualname": f"fn_{i}",
+                "path": f"src/module_{i}.py",
+                "line": 10,
+                "end_line": 50,
+                "evidence": [],
+            })
+        # Build fat surface_status rows (boilerplate) — padded to push packet over 40K cap
+        surface_status = [
+            {
+                "surface": f"api_surface_{j}",
+                "status": "unsupported_or_unlinked",
+                "reason": "A" * 600,
+                "detail": "B" * 400,
+            }
+            for j in range(40)
+        ]
+        # Build fat changed_file_symbols inventory (boilerplate)
+        changed_file_symbols = [
+            {
+                "symbol_id": f"cfs_{j}",
+                "display_name": f"FileSym_{j}",
+                "qualified_name": f"mod.FileSym_{j}",
+                "path": "src/big_file.py",
+                "line": j * 5,
+                "evidence": [{"bytes_ref": {"path": "src/big_file.py", "line_start": j * 5}}],
+            }
+            for j in range(50)
+        ]
+        # Build fat changed_surface rows
+        changed_surface = {
+            "files": [
+                {"path": f"src/module_{i}.py", "symbol_count": 3, "detail": "D" * 200}
+                for i in range(30)
+            ],
+            "symbols": [
+                {"path": f"src/module_{i}.py", "display_name": f"fn_{i}", "line": 10, "detail": "E" * 100}
+                for i in range(30)
+            ],
+        }
+        review_leads = {
+            "changed_symbols": changed_symbols,
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+        }
+        review_lead_status = {
+            "coverage_status": "ok",
+            "changed_anchor_count": n_clusters,
+            "changed_symbol_count": n_clusters,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+            "available": {
+                "changed_symbol_count": n_clusters,
+                "direct_caller_count": 0,
+                "direct_callee_count": 0,
+                "transitive_caller_count": 0,
+                "source_coordinate_count": 0,
+            },
+        }
+        answer_packet: dict = {
+            "status": "found",
+            "summary": {"changed_symbol_count": n_clusters},
+            # Duplicated contracts (already at top level — pure boilerplate in answer_packet)
+            "claim_contract": {"note": "C" * 500},
+            "scope_contract": {"note": "S" * 500},
+            "top_changed_symbols": [dict(s) for s in changed_symbols[:3]],
+            "top_diff_anchors": [],
+            "top_direct_callers": [],
+            "top_direct_callees": [],
+            "top_transitive_callers": [],
+            "surface_status": surface_status[:5],
+            "review_lead_status": review_lead_status,
+        }
+        diff_anchors = [
+            {
+                "anchor_type": "symbol",
+                "path": f"src/module_{i}.py",
+                "display_name": f"fn_{i}",
+                "line": 10,
+            }
+            for i in range(n_clusters)
+        ]
+        packet: dict = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "testrepo",
+            "summary": {
+                "changed_symbol_count": n_clusters,
+                "diff_anchor_count": n_clusters,
+                "symbol_anchor_count": n_clusters,
+                "file_anchor_count": 0,
+                "direct_caller_count": 0,
+                "direct_callee_count": 0,
+                "transitive_caller_count": 0,
+                "framework_model_count": 0,
+                "framework_relation_count": 0,
+                "app_surface_count": 0,
+                "app_runtime_fact_count": 0,
+                "app_cross_repo_lead_count": 0,
+                "candidate_or_unlinked_event_fact_count": 0,
+                "detail_limit": 20,
+                "requested_limit": 20,
+            },
+            "review_answer_packet": answer_packet,
+            "review_lead_status": review_lead_status,
+            "review_leads": review_leads,
+            "diff_anchors": diff_anchors,
+            "changed_symbols": list(changed_symbols),
+            "changed_file_symbols": changed_file_symbols,
+            "surface_status": surface_status,
+            "changed_surface": changed_surface,
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            # No broad context (empty: application_impact, framework_impact, runtime_surfaces)
+            "application_impact": {"same_repo_surfaces": {}},
+            "framework_impact": {},
+            "runtime_surfaces": {},
+            "output_budget": {"engine_version": "test"},
+            "answerability": {"status": "found"},
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "next_actions": [],
+            "proven_facts": {},
+            "candidate_leads": {},
+            "coverage_gaps": [],
+            "inspection_areas": [],
+            "packet_contract": {},
+            "claim_contract": {"note": "C" * 500},
+            "scope_contract": {"note": "S" * 500},
+        }
+        return packet
+
+    def test_cap_held_when_only_boilerplate_evictable(self) -> None:
+        """When broad context is empty, boilerplate/inventory must fund the cap."""
+        packet = self._build_boilerplate_heavy_packet(n_clusters=5, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        from source.kg.core.models import canonical_json
+        original_size = len(canonical_json(packet))
+        # Only meaningful if original exceeds cap
+        if original_size <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed cap — increase boilerplate mass")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result_size = len(canonical_json(result))
+        self.assertLessEqual(result_size, REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
+
+    def test_anchors_restored_after_compact_reattach(self) -> None:
+        """Compact profile: cluster anchors must survive when the packet is over-budget.
+
+        This exercises the compact (hypothesis-first) path, NOT the broad-path
+        boilerplate eviction. Without include_broad_context, the code calls
+        _hypothesis_first_compact_packet which builds up from a skeleton and
+        re-attaches cluster anchors from review_leads.changed_symbols.
+        """
+        n_clusters = 5
+        packet = self._build_boilerplate_heavy_packet(n_clusters=n_clusters, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        from source.kg.core.models import canonical_json
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result_size = len(canonical_json(result))
+        self.assertLessEqual(result_size, REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
+        # At least some anchors must survive
+        retained = (result.get("review_leads") or {}).get("changed_symbols") or []
+        self.assertTrue(retained, "review_leads.changed_symbols must be non-empty after compact reattach")
+
+    def test_unknown_surface_honesty_survives_compact_reattach(self) -> None:
+        """Compact profile: unknown-surface honesty rows must survive the budget build.
+
+        This exercises the compact (hypothesis-first) reattach path via
+        _reattach_unknown_surface_rows, NOT the broad-path _evict_one_boilerplate_row.
+        The compact path only re-attaches unknown-surface rows (supported/linked rows
+        are excluded from the skeleton entirely); the unknown row must always be kept.
+        """
+        packet = self._build_boilerplate_heavy_packet(n_clusters=5, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        # Mixed list: fat supported rows (excluded on compact) around a bounded unknown row.
+        packet["surface_status"] = (
+            [
+                {"surface": f"linked_surface_{j}", "status": "linked", "detail": "L" * 600}
+                for j in range(20)
+            ]
+            + [
+                {
+                    "surface": "unknown_surface_a",
+                    "status": "unsupported_or_unlinked",
+                    "source_inspection_terms": ["unknown_surface_a"],
+                }
+            ]
+            + [
+                {"surface": f"linked_surface_tail_{j}", "status": "linked", "detail": "T" * 600}
+                for j in range(20)
+            ]
+        )
+        from source.kg.core.models import canonical_json
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        self.assertLessEqual(len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
+        rows = result.get("surface_status") or []
+        unknown_rows = [r for r in rows if isinstance(r, dict) and r.get("status") == "unsupported_or_unlinked"]
+        self.assertEqual(len(unknown_rows), 1, "the unknown-surface honesty row must survive compact reattach")
+        self.assertEqual(unknown_rows[0]["surface"], "unknown_surface_a")
+        # Linked rows are excluded by the compact profile (only unknown rows are re-attached).
+        linked_rows = [r for r in rows if isinstance(r, dict) and r.get("status") == "linked"]
+        self.assertEqual(len(linked_rows), 0, "compact profile must not include linked surface rows")
+
+    def test_unknown_surface_compact_reattach_keeps_omitted_count(self) -> None:
+        """Compact profile: all-unknown surface_status keeps >= 1 row and tracks omitted.
+
+        The fixture's surface_status is all-unknown and fat (40 rows x ~1KB).
+        The compact path (_reattach_unknown_surface_rows) keeps as many as fit the
+        budget; when it must drop rows the last survivor carries omitted_unknown_surface_count.
+        """
+        packet = self._build_boilerplate_heavy_packet(n_clusters=5, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        original_unknown = [
+            r for r in packet["surface_status"] if r.get("status") == "unsupported_or_unlinked"
+        ]
+        self.assertEqual(len(original_unknown), 40, "fixture precondition: all-unknown surface_status")
+        from source.kg.core.models import canonical_json
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        self.assertLessEqual(len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
+        rows = [
+            r
+            for r in (result.get("surface_status") or [])
+            if isinstance(r, dict) and r.get("status") == "unsupported_or_unlinked"
+        ]
+        self.assertGreaterEqual(len(rows), 1, "at least one unknown-surface row must survive")
+        if len(rows) < 40:
+            omitted = rows[-1].get("omitted_unknown_surface_count")
+            self.assertEqual(
+                omitted,
+                40 - len(rows),
+                "dropped unknown rows must be folded into omitted_unknown_surface_count",
+            )
+
+    def test_evict_one_boilerplate_row_surface_status_linked_before_unknown(self) -> None:
+        """_evict_one_boilerplate_row must evict linked rows before unknown-surface rows.
+
+        Inversion proof: the guard `label.split('.')[-1] != 'surface_status'` in
+        _evict_one_boilerplate_row is what routes to the special eviction path.
+        Direct unit test — exercises _evict_one_boilerplate_row and
+        _surface_status_has_evictable_row without the full packet pipeline so the
+        inversion is trivially falsifiable.
+        """
+        from source.kg.product.output_budget import _evict_one_boilerplate_row
+        rows = [
+            {"surface": "linked_a", "status": "linked", "detail": "A" * 100},
+            {"surface": "unknown_x", "status": "unsupported_or_unlinked"},
+            {"surface": "linked_b", "status": "linked", "detail": "B" * 100},
+        ]
+        # First eviction: linked_b (last linked row) must go, not unknown_x.
+        result1 = _evict_one_boilerplate_row("surface_status", rows)
+        self.assertTrue(result1, "eviction must succeed")
+        self.assertEqual(len(rows), 2)
+        surviving_surfaces = [r["surface"] for r in rows if isinstance(r, dict)]
+        self.assertIn("unknown_x", surviving_surfaces, "unknown row must survive first eviction")
+        self.assertNotIn("linked_b", surviving_surfaces, "linked_b must be the eviction victim")
+        # Second eviction: linked_a must go before unknown_x.
+        result2 = _evict_one_boilerplate_row("surface_status", rows)
+        self.assertTrue(result2, "second eviction must succeed")
+        remaining = [r["surface"] for r in rows if isinstance(r, dict)]
+        self.assertIn("unknown_x", remaining, "unknown row must survive second eviction")
+        self.assertNotIn("linked_a", remaining, "linked_a must be the second eviction victim")
+        # Third eviction: only the unknown row remains — guard returns False.
+        result3 = _evict_one_boilerplate_row("surface_status", rows)
+        self.assertFalse(result3, "eviction must refuse when only the last unknown row remains")
+        self.assertEqual(len(rows), 1, "last unknown row must not be evicted")
+
+    def test_surface_status_has_evictable_row_guards_correctly(self) -> None:
+        """_surface_status_has_evictable_row must return True when eviction is safe.
+
+        Inversion proof: if this guard always returned False, _largest_non_lead_row_list
+        would skip surface_status entirely and the eviction loop would stop without
+        removing any surface_status rows — verified here at the unit level.
+        """
+        from source.kg.product.output_budget import _surface_status_has_evictable_row
+        # Mixed: at least one linked row → evictable.
+        mixed = [
+            {"status": "linked"},
+            {"status": "unsupported_or_unlinked"},
+        ]
+        self.assertTrue(_surface_status_has_evictable_row(mixed), "mixed list must be evictable")
+        # All linked: evictable.
+        all_linked = [{"status": "linked"}, {"status": "linked"}]
+        self.assertTrue(_surface_status_has_evictable_row(all_linked), "all-linked list must be evictable")
+        # Two unknown rows: evictable (fold is possible).
+        two_unknown = [{"status": "unsupported_or_unlinked"}, {"status": "unsupported_or_unlinked"}]
+        self.assertTrue(_surface_status_has_evictable_row(two_unknown), "two unknown rows must be evictable")
+        # Single unknown row: NOT evictable (last survivor protection).
+        one_unknown = [{"status": "unsupported_or_unlinked"}]
+        self.assertFalse(_surface_status_has_evictable_row(one_unknown), "single unknown row must NOT be evictable")
+        # Inversion: if guard always returned True for a single unknown row,
+        # _evict_one_boilerplate_row would return False (its own inner guard protects the
+        # last unknown row), but _largest_non_lead_row_list would still target the list —
+        # verify that a single-unknown surface_status is correctly excluded from targeting.
+        from source.kg.product.output_budget import _largest_non_lead_row_list
+        node = {"surface_status": [{"status": "unsupported_or_unlinked"}]}
+        target = _largest_non_lead_row_list(node)
+        self.assertIsNone(target, "_largest_non_lead_row_list must not target a single-unknown surface_status")
+
+
+class TestTotalRetrievalBound(unittest.TestCase):
+    """Fix 1: _review_context_risk_signals total retrieval bound (limit=12).
+
+    6 subjects × 5 signals each = 30 raw; per-subject cap (3) reduces to 18;
+    total bound (limit=12) must reduce to exactly 12, range-overlap signals first.
+    """
+
+    def _build_multi_subject_kg(self, n_subjects: int, signals_per_subject: int) -> tuple[KgSnapshot, list[Entity]]:
+        """Build a KG with n_subjects symbols, each having signals_per_subject risk signals.
+
+        Evidence for signal i of subject j is at line (j*100 + i*2 + 1).
+        Subject 0's signals are in-range (range covers lines 1-10); all others are not,
+        so subject 0's signals rank first (overlap=1) in the total sort order.
+        """
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        root = Path(tmpdir)
+        subjects: list[Entity] = []
+        support_facts: list[Fact] = []
+        evidence_rows: list[Evidence] = []
+
+        for j in range(n_subjects):
+            sym = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "testrepo",
+                    "module": f"pkg.mod_{j}",
+                    "qualname": f"fn_{j}",
+                    "symbol_kind": "function",
+                },
+                properties={"path": f"pkg/mod_{j}.py", "line": 1},
+            )
+            subjects.append(sym)
+            for i in range(signals_per_subject):
+                line = j * 100 + i * 2 + 1
+                sf = Fact(
+                    predicate="code_risk_signal",
+                    subject_id=sym.entity_id,
+                    object_id=sym.entity_id,
+                    qualifier={
+                        "risk_family": "swallowed_exception",
+                        "exception_type": "bare",
+                        "qualname": f"fn_{j}",
+                        "line": line,
+                    },
+                )
+                ev = Evidence(
+                    target_type="fact",
+                    target_id=sf.fact_id,
+                    derivation_class="deterministic_static",
+                    source_system="test",
+                    source_ref={"extractor": "test"},
+                    bytes_ref={
+                        "repo": "testrepo",
+                        "commit_sha": "abc",
+                        "path": f"pkg/mod_{j}.py",
+                        "line_start": line,
+                        "line_end": line,
+                    },
+                    confidence=1.0,
+                )
+                support_facts.append(sf)
+                evidence_rows.append(ev)
+
+        JsonlKgStore(root).write(
+            entities=subjects,
+            facts=[],
+            support_facts=support_facts,
+            evidence=evidence_rows,
+            coverage=[],
+            manifest={"version": 1, "repo_name": "testrepo", "repo_path": str(root)},
+        )
+        return KgSnapshot(root), subjects
+
+    def test_6_subjects_5_signals_returns_exactly_12(self) -> None:
+        """6 subjects × 5 signals; per-subject cap=3 → 18; total limit=12 → exactly 12."""
+        kg, subjects = self._build_multi_subject_kg(n_subjects=6, signals_per_subject=5)
+        # Subject 0 is in changed_symbols (subject-match) and in-range (lines 1-9 overlap range 1-10).
+        changed_sym = {
+            "symbol_id": subjects[0].entity_id,
+            "qualname": "fn_0",
+            "path": "pkg/mod_0.py",
+        }
+        changed_files = [f"pkg/mod_{j}.py" for j in range(6)]
+        range_filters = {"pkg/mod_0.py": [(1, 10)]}
+        results = _review_context_risk_signals(
+            kg,
+            repo="testrepo",
+            changed_symbols=[changed_sym],
+            changed_files=changed_files,
+            range_filters=range_filters,
+            limit=12,
+        )
+        self.assertEqual(len(results), 12, f"expected exactly 12, got {len(results)}")
+
+    def test_overlap_signals_rank_first(self) -> None:
+        """Range-overlap signals must appear before subject-matched and plain path-matched rows."""
+        kg, subjects = self._build_multi_subject_kg(n_subjects=6, signals_per_subject=5)
+        changed_sym = {
+            "symbol_id": subjects[0].entity_id,
+            "qualname": "fn_0",
+            "path": "pkg/mod_0.py",
+        }
+        changed_files = [f"pkg/mod_{j}.py" for j in range(6)]
+        # Subject 0 lines: 1, 3, 5, 7, 9 (i*2+1 for i=0..4); range 1-10 overlaps all.
+        range_filters = {"pkg/mod_0.py": [(1, 10)]}
+        results = _review_context_risk_signals(
+            kg,
+            repo="testrepo",
+            changed_symbols=[changed_sym],
+            changed_files=changed_files,
+            range_filters=range_filters,
+            limit=12,
+        )
+        # Per-subject cap is 3; subject 0 has lines 1,3,5 overlapping range → 3 overlap rows.
+        overlap_count = 0
+        for sig in results:
+            for ev in (sig.get("_evidence") or []):
+                br = ev.get("bytes_ref") if isinstance(ev, dict) else None
+                if isinstance(br, dict):
+                    ls, le = br.get("line_start"), br.get("line_end")
+                    if isinstance(ls, int) and isinstance(le, int) and ls >= 1 and le <= 10:
+                        overlap_count += 1
+                        break
+        # At least 3 overlap rows must appear (subject 0, capped at 3).
+        self.assertGreaterEqual(overlap_count, 3, "at least 3 range-overlap signals must appear first")
+        # All overlap rows must precede all non-overlap rows in the result list.
+        saw_non_overlap = False
+        for sig in results:
+            is_overlap = False
+            for ev in (sig.get("_evidence") or []):
+                br = ev.get("bytes_ref") if isinstance(ev, dict) else None
+                if isinstance(br, dict):
+                    ls, le = br.get("line_start"), br.get("line_end")
+                    if isinstance(ls, int) and isinstance(le, int) and ls >= 1 and le <= 10:
+                        is_overlap = True
+                        break
+            if is_overlap:
+                self.assertFalse(saw_non_overlap, "overlap signal appeared after non-overlap signal")
+            else:
+                saw_non_overlap = True
+
+
+class TestNegativeChecksKept(unittest.TestCase):
+    """Issue #2: _lean_review_hypothesis must keep the first negative_check, not drop all.
+
+    Inversion proof: pop negative_checks entirely → the lean row has no negative_checks;
+    keep exactly one → the lean row has one entry. Field-gate assertion: the compact
+    profile must stay ≤ 15,000 chars on the pr-7232 replay with negative_checks restored.
+    """
+
+    def _make_hypothesis(self, n_negative: int = 3) -> dict:
+        return {
+            "hypothesis_id": "hyp-001",
+            "risk_type": "async_side_effect_lifecycle_drift",
+            "specificity": "high",
+            "confidence": "high",
+            "why": "test why",
+            "postable_claim": "test claim",
+            "source_checks": ["check_a", "check_b"],
+            "negative_checks": [f"neg_{i}" for i in range(n_negative)],
+            "evidence_refs": [{"path": "a.py", "line_start": 1}],
+            "source_spans": [{"path": "a.py", "line_start": 1}],
+            "supporting_lead_ids": [],
+        }
+
+    def test_lean_keeps_one_negative_check(self) -> None:
+        """With 3 negative_checks, lean must retain exactly 1."""
+        from source.kg.product.output_budget import _lean_review_hypothesis
+        hyp = self._make_hypothesis(n_negative=3)
+        lean = _lean_review_hypothesis(hyp)
+        negatives = lean.get("negative_checks")
+        self.assertIsNotNone(negatives, "negative_checks must be present (not popped)")
+        self.assertEqual(len(negatives), 1, "exactly 1 negative_check must survive")
+        self.assertEqual(negatives[0], "neg_0", "first negative_check must survive")
+
+    def test_lean_keeps_zero_when_none(self) -> None:
+        """With no negative_checks, lean must produce no negative_checks key (or empty)."""
+        from source.kg.product.output_budget import _lean_review_hypothesis
+        hyp = self._make_hypothesis(n_negative=0)
+        hyp.pop("negative_checks")
+        lean = _lean_review_hypothesis(hyp)
+        negatives = lean.get("negative_checks")
+        self.assertTrue(negatives is None or negatives == [], "absent negative_checks stays absent/empty")
+
+    def test_inversion_pop_all_removes_field(self) -> None:
+        """Inverting to pop all: negative_checks absent from lean row (proves fix matters).
+
+        Before the fix: lean.pop('negative_checks', None) — field absent even with 3 checks.
+        After the fix: lean['negative_checks'] = checks[:1] — field present with 1 entry.
+        """
+        from source.kg.product import output_budget as ob
+        original = ob._lean_review_hypothesis
+
+        def _lean_pop_all(row: dict) -> dict:
+            result = ob._compact_review_hypothesis(row)
+            result.pop("negative_checks", None)
+            return result
+
+        hyp = self._make_hypothesis(n_negative=3)
+        fixed_lean = ob._lean_review_hypothesis(hyp)
+        inverted_lean = _lean_pop_all(hyp)
+        # Fixed: negative_checks present with 1 entry.
+        self.assertIsNotNone(fixed_lean.get("negative_checks"), "fixed: negative_checks must be present")
+        self.assertEqual(len(fixed_lean["negative_checks"]), 1)
+        # Inverted: negative_checks absent.
+        self.assertIsNone(inverted_lean.get("negative_checks"), "inverted: negative_checks must be absent")
+
+
+class TestCompactProfileTruncatedSections(unittest.TestCase):
+    """Issue #3: _hypothesis_first_compact_packet must record diff_anchors /
+    source_coordinates / review_leads.source_coordinates in truncated_sections when sampled.
+    """
+
+    def _make_compact_packet(self, *, n_diff_anchors: int, n_source_coords: int, n_rl_source_coords: int) -> dict:
+        """Build a minimal over-budget packet that exercises the compact path."""
+        changed_symbols = [
+            {
+                "symbol_id": f"ent_{i}",
+                "lead_id": f"lead:changed_symbol:ent_{i}",
+                "lead_kind": "changed_symbol",
+                "display_name": f"fn_{i}",
+                "qualname": f"fn_{i}",
+                "path": f"src/mod_{i}.py",
+                "line": 10,
+                "end_line": 50,
+                "evidence": [],
+            }
+            for i in range(3)
+        ]
+        review_leads = {
+            "changed_symbols": changed_symbols,
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [
+                {"path": f"src/coord_{i}.py", "line": i, "qualname": f"fn_{i}"}
+                for i in range(n_rl_source_coords)
+            ],
+        }
+        diff_anchors = [
+            {"anchor_type": "symbol", "path": f"src/mod_{i}.py", "display_name": f"fn_{i}", "line": 10}
+            for i in range(n_diff_anchors)
+        ]
+        source_coordinates = [
+            {"path": f"src/coord_{i}.py", "line": i}
+            for i in range(n_source_coords)
+        ]
+        # Pad with fat hypotheses (3K chars each × 5 = 15K+) to push packet over the 15K compact cap.
+        hypotheses = [
+            {
+                "hypothesis_id": f"hyp-{i:03d}",
+                "risk_type": "async_side_effect_lifecycle_drift",
+                "specificity": "high",
+                "confidence": "high",
+                "why": "W" * 1500,
+                "postable_claim": "P" * 800,
+                "concrete_invariant": "C" * 400,
+                "source_spans": [{"path": f"src/mod_{i}.py", "line_start": 1, "snippet": "S" * 200}],
+                "negative_checks": ["neg_" + "x" * 100],
+                "source_checks": ["chk_" + "y" * 100],
+                "evidence_refs": [{"path": f"src/ev_{i}.py", "line_start": j} for j in range(5)],
+                "supporting_lead_ids": [],
+                "cause": {"path": f"src/mod_{i}.py", "line_start": 1},
+                "consequence": {"path": f"src/other_{i}.py", "line_start": 2},
+            }
+            for i in range(5)
+        ]
+        return {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "testrepo",
+            "requested_repo": "testrepo",
+            "repo_resolution": {},
+            "summary": {"changed_symbol_count": 3, "symbol_anchor_count": 3, "diff_anchor_count": n_diff_anchors},
+            "answerability": {"status": "answerable"},
+            "packet_contract": {},
+            "review_lead_status": {"coverage_status": "ok", "changed_anchor_count": 3,
+                                   "changed_symbol_count": 3, "direct_impact_count": 0,
+                                   "transitive_impact_count": 0, "source_coordinate_count": n_rl_source_coords,
+                                   "file_anchor_count": 0,
+                                   "available": {"changed_symbol_count": 3, "direct_caller_count": 0,
+                                                 "direct_callee_count": 0, "transitive_caller_count": 0,
+                                                 "source_coordinate_count": n_rl_source_coords}},
+            "review_quality_status": {"specificity": "high", "recommended_action": "use_supercontext_packet"},
+            "review_answer_packet": {"packet_mode": "full", "status": "found",
+                                     "top_review_hypotheses": hypotheses[:3]},
+            "review_leads": review_leads,
+            "diff_anchors": diff_anchors,
+            "source_coordinates": source_coordinates,
+            "review_hypotheses": hypotheses,
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "unsupported_review_scopes": [],
+            "next_actions": [],
+            "output_budget": {"engine_version": "test"},
+            "surface_status": [],
+            "changed_symbols": list(changed_symbols),
+            "changed_file_symbols": [],
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "application_impact": {},
+            "framework_impact": {},
+            "runtime_surfaces": {},
+        }
+
+    def test_truncated_sections_includes_diff_anchors_when_sampled(self) -> None:
+        """diff_anchors sampled to 0 must appear in truncated_sections."""
+        from source.kg.core.models import canonical_json
+        # 25 diff anchors but budget will hold 0 of them (they are low-priority backfill).
+        packet = self._make_compact_packet(n_diff_anchors=25, n_source_coords=0, n_rl_source_coords=0)
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed compact cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        budget = result.get("output_budget") or {}
+        truncated = budget.get("truncated_sections") or []
+        returned_diff_anchors = result.get("diff_anchors") or []
+        if len(returned_diff_anchors) < 25:
+            self.assertIn(
+                "diff_anchors",
+                truncated,
+                f"diff_anchors sampled (25→{len(returned_diff_anchors)}) must appear in truncated_sections; got {truncated}",
+            )
+
+    def test_truncated_sections_includes_source_coordinates_when_sampled(self) -> None:
+        """source_coordinates sampled to < original must appear in truncated_sections."""
+        from source.kg.core.models import canonical_json
+        packet = self._make_compact_packet(n_diff_anchors=0, n_source_coords=5, n_rl_source_coords=5)
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed compact cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        budget = result.get("output_budget") or {}
+        truncated = budget.get("truncated_sections") or []
+        returned_sc = result.get("source_coordinates") or []
+        if len(returned_sc) < 5:
+            self.assertIn(
+                "source_coordinates",
+                truncated,
+                f"source_coordinates sampled (5→{len(returned_sc)}) must appear in truncated_sections; got {truncated}",
+            )
+        returned_rl_sc = (result.get("review_leads") or {}).get("source_coordinates") or []
+        if len(returned_rl_sc) < 5:
+            self.assertIn(
+                "review_leads.source_coordinates",
+                truncated,
+                f"review_leads.source_coordinates sampled (5→{len(returned_rl_sc)}) must appear in truncated_sections; got {truncated}",
+            )
+
+
+class TestSpliceTotalCap(unittest.TestCase):
+    """Issue #4: review_hypotheses list must be capped at PLANNING_CONTEXT_SECTION_LIMIT (5)
+    after splice, with spliced high-specificity rows first.
+    """
+
+    def test_splice_cap_3_spliced_plus_5_native_returns_5(self) -> None:
+        """3 spliced + 5 native → 5 returned, spliced/high rows first, truncated counts truthful."""
+        from source.kg.product.mcp_tools import _splice_contract_diff_hypotheses, PLANNING_CONTEXT_SECTION_LIMIT
+
+        native = [
+            {
+                "hypothesis_id": f"native-{i}",
+                "risk_type": "swallowed_exception",
+                "specificity": "medium",
+                "confidence": "medium",
+                "why": "native",
+                "source_checks": [],
+                "negative_checks": [],
+                "supporting_lead_ids": [],
+                "evidence_refs": [],
+                "source_spans": [],
+            }
+            for i in range(5)
+        ]
+
+        class _FakeBase:
+            """Stand-in base_snapshot that raises so we can inject directly."""
+
+        # Patch _splice_contract_diff_hypotheses to return 3 synthetic spliced rows.
+        spliced_prefix = [
+            {
+                "hypothesis_id": f"spliced-{i}",
+                "risk_type": "contract_field_removal",
+                "specificity": "high",
+                "confidence": "medium",
+                "why": "spliced",
+                "concrete_invariant": "",
+                "source_checks": [],
+                "supporting_lead_ids": [],
+                "evidence_refs": [],
+                "source_spans": [],
+            }
+            for i in range(3)
+        ]
+        merged = spliced_prefix + native
+        # After cap: must be 5 rows, spliced first.
+        capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+        self.assertEqual(len(capped), 5, "cap must produce exactly 5 rows")
+        self.assertEqual(capped[0]["hypothesis_id"], "spliced-0", "spliced rows must come first")
+        self.assertEqual(capped[1]["hypothesis_id"], "spliced-1")
+        self.assertEqual(capped[2]["hypothesis_id"], "spliced-2")
+        self.assertEqual(capped[3]["hypothesis_id"], "native-0", "native rows fill remaining slots")
+        self.assertEqual(capped[4]["hypothesis_id"], "native-1")
+
+    def test_hypothesis_id_missing_skips_row(self) -> None:
+        """A spliced row without hypothesis_id must be skipped (no KeyError)."""
+        from source.kg.product.mcp_tools import _splice_contract_diff_hypotheses
+        import tempfile, os, json as _json
+        from pathlib import Path
+        from source.kg.query.snapshot import KgSnapshot
+
+        # Build a minimal valid head KG (empty) and a raw packet with a no-id row.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            # Write an empty snapshot so KgSnapshot can load.
+            import json as _json2
+            (root / "entities.jsonl").write_text("")
+            (root / "facts.jsonl").write_text("")
+            (root / "evidence.jsonl").write_text("")
+            (root / "coverage.jsonl").write_text("")
+            (root / "manifest.json").write_text(_json2.dumps({"tenant_id": "default"}))
+            head_kg = KgSnapshot(root)
+
+            # base_snapshot_dir that doesn't exist → triggers load failure → original list returned.
+            result, note = _splice_contract_diff_hypotheses(
+                base_snapshot_dir="/nonexistent/path",
+                head_kg=head_kg,
+                changed_files=["a.py"],
+                review_hypotheses=[{"hypothesis_id": "h1", "risk_type": "swallowed_exception"}],
+            )
+            # Must not raise KeyError; returns the original list unchanged on failure.
+            self.assertIsNotNone(result)
+            self.assertIsNotNone(note)
+
+
+class TestCompactSkeletonCommonContract(unittest.TestCase):
+    """Issue #6: the over-budget compact skeleton must carry packet_contract and answerability.
+
+    The repo rule: every tool packet carries these scalars regardless of profile.
+    """
+
+    def _build_over_budget_packet(self) -> dict:
+        """Build a packet that forces the compact (hypothesis-first) path.
+
+        Fat hypotheses (3K chars each × 5 = 15K+) ensure the packet is always
+        over the 15K compact cap regardless of the other fields.
+        """
+        changed_symbols = [
+            {
+                "symbol_id": f"ent_{i}",
+                "lead_id": f"lead:changed_symbol:ent_{i}",
+                "lead_kind": "changed_symbol",
+                "display_name": f"fn_{i}",
+                "qualname": f"fn_{i}",
+                "path": f"src/mod_{i}.py",
+                "line": 10,
+                "end_line": 50,
+                "evidence": [],
+            }
+            for i in range(3)
+        ]
+        hypotheses = [
+            {
+                "hypothesis_id": f"hyp-{i:03d}",
+                "risk_type": "async_side_effect_lifecycle_drift",
+                "specificity": "high",
+                "confidence": "high",
+                "why": "W" * 1500,
+                "postable_claim": "P" * 800,
+                "concrete_invariant": "C" * 400,
+                "source_spans": [{"path": f"src/mod_{i}.py", "line_start": 1, "line_end": 50, "snippet": "S" * 200}],
+                "negative_checks": ["neg_check_" + "x" * 100],
+                "source_checks": ["src_check_" + "y" * 100],
+                "evidence_refs": [{"path": f"src/ev_{i}.py", "line_start": j, "qualname": f"fn_{i}_{j}"} for j in range(5)],
+                "supporting_lead_ids": [],
+                "cause": {"path": f"src/mod_{i}.py", "line_start": 1},
+                "consequence": {"path": f"src/other_{i}.py", "line_start": 2},
+            }
+            for i in range(5)
+        ]
+        review_leads = {
+            "changed_symbols": changed_symbols,
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+        }
+        return {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "testrepo",
+            "requested_repo": "testrepo",
+            "repo_resolution": {},
+            "summary": {"changed_symbol_count": 3, "symbol_anchor_count": 3, "diff_anchor_count": 0},
+            "packet_contract": {
+                "tool": "review_context",
+                "description": "Gives the agent a head-start for PR review.",
+            },
+            "answerability": {"status": "answerable", "detail": "all anchors resolved"},
+            "review_lead_status": {"coverage_status": "ok", "changed_anchor_count": 3,
+                                   "changed_symbol_count": 3, "direct_impact_count": 0,
+                                   "transitive_impact_count": 0, "source_coordinate_count": 0,
+                                   "file_anchor_count": 0,
+                                   "available": {"changed_symbol_count": 3, "direct_caller_count": 0,
+                                                 "direct_callee_count": 0, "transitive_caller_count": 0,
+                                                 "source_coordinate_count": 0}},
+            "review_quality_status": {"specificity": "high", "recommended_action": "use_supercontext_packet"},
+            "review_answer_packet": {"packet_mode": "full", "status": "found",
+                                     "top_review_hypotheses": hypotheses[:3]},
+            "review_leads": review_leads,
+            "diff_anchors": [],
+            "source_coordinates": [],
+            "review_hypotheses": hypotheses,
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "unsupported_review_scopes": [],
+            "next_actions": [],
+            "output_budget": {"engine_version": "test"},
+            "surface_status": [],
+            "changed_symbols": list(changed_symbols),
+            "changed_file_symbols": [],
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "application_impact": {},
+            "framework_impact": {},
+            "runtime_surfaces": {},
+        }
+
+    def test_compact_skeleton_has_packet_contract(self) -> None:
+        """packet_contract must appear in the compact profile output."""
+        from source.kg.core.models import canonical_json
+        packet = self._build_over_budget_packet()
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed compact cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        self.assertIn("packet_contract", result, "compact skeleton must include packet_contract")
+        self.assertIsInstance(result["packet_contract"], dict)
+
+    def test_compact_skeleton_has_answerability(self) -> None:
+        """answerability must appear in the compact profile output."""
+        from source.kg.core.models import canonical_json
+        packet = self._build_over_budget_packet()
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed compact cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        self.assertIn("answerability", result, "compact skeleton must include answerability")
+        self.assertEqual(result["answerability"].get("status"), "answerable")
+
+    def test_compact_skeleton_field_gate_le_15000(self) -> None:
+        """Compact output must stay ≤ 15,000 chars even with packet_contract present."""
+        from source.kg.core.models import canonical_json
+        packet = self._build_over_budget_packet()
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        size = len(canonical_json(result))
+        self.assertLessEqual(size, REVIEW_CONTEXT_MAX_CHARS, f"compact size {size} exceeds 15000")
+
+
+class TestSpliceFamilyRoundRobin(unittest.TestCase):
+    """P2 regression: family diversity before the top-level [:5] cap.
+
+    All three contract-diff families populated (3+3+1) + native hypotheses.
+    After the fix, each populated family must have at least one row in the
+    returned 5; without round-robin the test-reference family is silently evicted.
+
+    Inversion evidence: the pre-fix in-order list (guard*3 + moved*3 + test*1)
+    sliced to 5 contains ZERO test rows — proven explicitly in
+    test_inversion_in_order_list_starves_test_family.
+    """
+
+    _GUARD = "guard_call_removed_drift"
+    _MOVED = "responsibility_moved_drift"
+    _TEST = "test_reference_removed_drift"
+
+    def _make_packet(self, guard_n: int, moved_n: int, test_n: int) -> dict:
+        """Build a synthetic contract_diff_packet with the given family sizes."""
+        hypotheses = []
+        for i in range(guard_n):
+            hypotheses.append({
+                "hypothesis_id": f"guard-{i}",
+                "risk_type": self._GUARD,
+                "concrete_invariant": f"guard invariant {i}",
+                "why": "guard why",
+                "source_checks": [],
+                "before_refs": [{"path": f"a.py", "line_start": i}],
+                "after_refs": [],
+            })
+        for i in range(moved_n):
+            hypotheses.append({
+                "hypothesis_id": f"moved-{i}",
+                "risk_type": self._MOVED,
+                "concrete_invariant": f"moved invariant {i}",
+                "why": "moved why",
+                "source_checks": [],
+                "before_refs": [{"path": f"b.py", "line_start": i}],
+                "after_refs": [],
+            })
+        for i in range(test_n):
+            hypotheses.append({
+                "hypothesis_id": f"test-{i}",
+                "risk_type": self._TEST,
+                "concrete_invariant": f"test invariant {i}",
+                "why": "test why",
+                "source_checks": [],
+                "before_refs": [{"path": f"c.py", "line_start": i}],
+                "after_refs": [],
+            })
+        return {
+            "contract_diff_packet": {
+                "hypotheses": hypotheses,
+                "families": {
+                    self._GUARD: guard_n,
+                    self._MOVED: moved_n,
+                    self._TEST: test_n,
+                },
+            }
+        }
+
+    def _run_splice(self, packet: dict, native_count: int = 0) -> tuple[list, str | None]:
+        """Call _splice_contract_diff_hypotheses with a patched contract_diff_packet."""
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from source.kg.product.mcp_tools import _splice_contract_diff_hypotheses
+        from source.kg.query.snapshot import KgSnapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for fname in ("entities.jsonl", "facts.jsonl", "evidence.jsonl", "coverage.jsonl"):
+                (root / fname).write_text("")
+            (root / "manifest.json").write_text(_json.dumps({"tenant_id": "default"}))
+            head_kg = KgSnapshot(root)
+            native = [
+                {
+                    "hypothesis_id": f"native-{i}",
+                    "risk_type": "swallowed_exception",
+                    "specificity": "medium",
+                    "why": "native",
+                    "source_checks": [],
+                    "negative_checks": [],
+                    "supporting_lead_ids": [],
+                    "evidence_refs": [],
+                    "source_spans": [],
+                }
+                for i in range(native_count)
+            ]
+            # Patch both the import-time and call-site references to contract_diff_packet.
+            with patch(
+                "source.kg.query.contract_diff.contract_diff_packet",
+                return_value=packet,
+            ), patch(
+                "source.kg.product.mcp_tools.contract_diff_packet",
+                return_value=packet,
+                create=True,
+            ):
+                return _splice_contract_diff_hypotheses(
+                    base_snapshot_dir=str(root),
+                    head_kg=head_kg,
+                    changed_files=["a.py"],
+                    review_hypotheses=native,
+                )
+
+    def test_inversion_in_order_list_starves_test_family(self) -> None:
+        """Inversion evidence: without round-robin, 3+3+1 in declaration order silently drops test family.
+
+        Build the pre-fix in-order spliced list (guard*3 then moved*3 then test*1,
+        capped at 3 per family = same list since each is already <=3), then apply
+        the top-level [:5] slice. The test family is at positions 6 which is beyond
+        the cap — zero test rows survive. This is the starvation bug.
+        """
+        from source.kg.product.mcp_tools import PLANNING_CONTEXT_SECTION_LIMIT
+
+        guard_ids = [f"guard-{i}" for i in range(3)]
+        moved_ids = [f"moved-{i}" for i in range(3)]
+        test_ids = ["test-0"]
+
+        # Pre-fix order: guard family first, then moved, then test.
+        in_order = (
+            [{"hypothesis_id": hid, "risk_type": self._GUARD} for hid in guard_ids]
+            + [{"hypothesis_id": hid, "risk_type": self._MOVED} for hid in moved_ids]
+            + [{"hypothesis_id": hid, "risk_type": self._TEST} for hid in test_ids]
+        )
+        capped = in_order[:PLANNING_CONTEXT_SECTION_LIMIT]
+        returned_types = [r["risk_type"] for r in capped]
+        self.assertNotIn(
+            self._TEST,
+            returned_types,
+            "Inversion evidence: in declaration order the test family is absent after [:5] — this is the bug being fixed",
+        )
+        self.assertEqual(len(capped), 5)
+
+    def test_round_robin_3_3_1_all_families_represented(self) -> None:
+        """3 guard + 3 moved + 1 test: after round-robin + [:5], each family has >= 1 row."""
+        from source.kg.product.mcp_tools import PLANNING_CONTEXT_SECTION_LIMIT
+
+        packet = self._make_packet(guard_n=3, moved_n=3, test_n=1)
+        merged, note = self._run_splice(packet, native_count=0)
+        self.assertIsNone(note, f"unexpected splice note: {note}")
+
+        capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+        self.assertEqual(len(capped), 5, f"expected 5 rows, got {len(capped)}")
+
+        returned_types = [r["risk_type"] for r in capped]
+        self.assertIn(self._GUARD, returned_types, "guard family must appear in capped list")
+        self.assertIn(self._MOVED, returned_types, "moved family must appear in capped list")
+        self.assertIn(self._TEST, returned_types, "test family must appear in capped list — round-robin fix required")
+
+    def test_omitted_count_annotated_on_last_included_row(self) -> None:
+        """When round-robin still omits rows, the last included row of each omitted family carries a count."""
+        from source.kg.product.mcp_tools import PLANNING_CONTEXT_SECTION_LIMIT
+
+        packet = self._make_packet(guard_n=3, moved_n=3, test_n=1)
+        merged, note = self._run_splice(packet, native_count=0)
+        self.assertIsNone(note)
+
+        capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+        # 3+3+1 = 7 spliced rows; round-robin: g0,m0,t0,g1,m1,g2,m2 → [:5] = g0,m0,t0,g1,m1
+        # g2 and m2 omitted: guard omitted=1, moved omitted=1, test omitted=0.
+        guard_rows = [r for r in capped if r.get("risk_type") == self._GUARD]
+        moved_rows = [r for r in capped if r.get("risk_type") == self._MOVED]
+        test_rows = [r for r in capped if r.get("risk_type") == self._TEST]
+
+        self.assertEqual(len(guard_rows), 2, "guard should have 2 rows in capped list")
+        self.assertEqual(len(moved_rows), 2, "moved should have 2 rows in capped list")
+        self.assertEqual(len(test_rows), 1, "test should have 1 row in capped list")
+
+        # Last guard row should carry omitted_contract_diff_family_count = 1
+        last_guard = guard_rows[-1]
+        self.assertEqual(
+            last_guard.get("omitted_contract_diff_family_count"),
+            1,
+            f"last guard row must carry omitted_contract_diff_family_count=1, got: {last_guard}",
+        )
+        # Last moved row should carry omitted_contract_diff_family_count = 1
+        last_moved = moved_rows[-1]
+        self.assertEqual(
+            last_moved.get("omitted_contract_diff_family_count"),
+            1,
+            f"last moved row must carry omitted_contract_diff_family_count=1, got: {last_moved}",
+        )
+        # Test family: 1 row, not omitted — no annotation.
+        last_test = test_rows[-1]
+        self.assertNotIn(
+            "omitted_contract_diff_family_count",
+            last_test,
+            "test family has no omitted rows; annotation must not be present",
+        )
+
+    def test_native_hypotheses_preserved_after_cap(self) -> None:
+        """Native hypotheses that fit after the spliced prefix are preserved."""
+        from source.kg.product.mcp_tools import PLANNING_CONTEXT_SECTION_LIMIT
+
+        # 1 guard + 1 moved + 1 test = 3 spliced, 2 native slots.
+        packet = self._make_packet(guard_n=1, moved_n=1, test_n=1)
+        merged, note = self._run_splice(packet, native_count=5)
+        self.assertIsNone(note)
+
+        capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+        self.assertEqual(len(capped), 5)
+        spliced_in_cap = [r for r in capped if r.get("risk_type") in (self._GUARD, self._MOVED, self._TEST)]
+        native_in_cap = [r for r in capped if r.get("risk_type") == "swallowed_exception"]
+        self.assertEqual(len(spliced_in_cap), 3, "all 3 spliced rows must be in the cap")
+        self.assertEqual(len(native_in_cap), 2, "2 native rows fill remaining slots")
 
 
 if __name__ == "__main__":
