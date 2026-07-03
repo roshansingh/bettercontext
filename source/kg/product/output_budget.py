@@ -999,15 +999,19 @@ def _lean_review_hypothesis(row: JsonObject) -> JsonObject:
 
     Keeps risk_type/confidence/specificity/why/postable_claim/cause/consequence/
     concrete_invariant/source_spans/supporting_lead_ids intact. Per-family prose
-    shrinks to the first source_check (negative_checks are dropped), and
-    evidence_refs shrink to 2 when source_spans already carries the coordinate
+    shrinks to the first source_check and the first negative_check (~150 chars each),
+    and evidence_refs shrink to 2 when source_spans already carries the coordinate
     rows — coordinates are never lost, lead linkage stays in supporting_lead_ids.
     """
     lean = _compact_review_hypothesis(row)
     checks = lean.get("source_checks")
     if isinstance(checks, list):
         lean["source_checks"] = checks[:1]
-    lean.pop("negative_checks", None)
+    negatives = lean.get("negative_checks")
+    if isinstance(negatives, list):
+        lean["negative_checks"] = negatives[:1]
+    else:
+        lean.pop("negative_checks", None)
     refs = lean.get("evidence_refs")
     if isinstance(refs, list) and lean.get("source_spans"):
         lean["evidence_refs"] = refs[:2]
@@ -1063,6 +1067,8 @@ def _hypothesis_first_compact_packet(
     # edges live in review_leads, hypotheses at top level, the answer packet carries
     # only the slim mirror. The broad path's top-level detail copies are the main
     # reason its packets cannot be hypothesis-first at 15K.
+    # packet_contract and answerability are part of the common packet contract
+    # (repo rule: every tool packet carries these scalars regardless of profile).
     packet: JsonObject = {
         "tool": result.get("tool", "review_context"),
         "status": result.get("status"),
@@ -1070,6 +1076,7 @@ def _hypothesis_first_compact_packet(
         "requested_repo": result.get("requested_repo"),
         "repo_resolution": result.get("repo_resolution", {}),
         "summary": result.get("summary", {}),
+        "packet_contract": result.get("packet_contract", {}),
         "answerability": result.get("answerability", {}),
         "review_lead_status": deepcopy(lead_status),
         "review_quality_status": result.get("review_quality_status"),
@@ -1196,6 +1203,21 @@ def _hypothesis_first_compact_packet(
         original = len(_list_value(review_leads.get(field)))
         kept = len(_list_value(packet["review_leads"].get(field)))
         _record_truncated(truncated_sections, f"review_leads.{field}", original=original, kept=kept)
+    # review_leads.source_coordinates: sampled to fit the budget.
+    _record_truncated(
+        truncated_sections,
+        "review_leads.source_coordinates",
+        original=len(_list_value(review_leads.get("source_coordinates"))),
+        kept=len(_list_value(packet["review_leads"].get("source_coordinates"))),
+    )
+    # Top-level backfill fields: diff_anchors and source_coordinates.
+    for field in ("diff_anchors", "source_coordinates"):
+        _record_truncated(
+            truncated_sections,
+            field,
+            original=len(_list_value(result.get(field))),
+            kept=len(_list_value(packet.get(field))),
+        )
     _record_truncated(
         truncated_sections,
         "review_hypotheses",

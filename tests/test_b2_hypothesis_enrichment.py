@@ -841,12 +841,22 @@ _FIELD_REPLAY_KG = os.path.expanduser(
     "6048e2a86b50e81e1e3b1b467dfea5a895add3dc/"
     "kg-9d96b838e487301b/kg"
 )
-_FIELD_REPLAY_ARGS = "/tmp/sc-7232-args.json"
+# Checked-in args file (repo-local, always available).  The KG snapshot itself is
+# machine-local, so the skip guard covers only the KG dependency — not the args.
+_FIELD_REPLAY_ARGS_CHECKED_IN = os.path.join(
+    os.path.dirname(__file__), "fixtures", "review-context-cal-diy-args.json"
+)
+# Legacy /tmp path kept as fallback so existing local setups continue to work.
+_FIELD_REPLAY_ARGS = (
+    _FIELD_REPLAY_ARGS_CHECKED_IN
+    if os.path.isfile(_FIELD_REPLAY_ARGS_CHECKED_IN)
+    else "/tmp/sc-7232-args.json"
+)
 
 
 @unittest.skipUnless(
     os.path.isdir(_FIELD_REPLAY_KG) and os.path.isfile(_FIELD_REPLAY_ARGS),
-    "field replay KG or args not available",
+    "field replay KG not available (args are checked in under tests/fixtures/)",
 )
 class TestFieldReplayCalDiy7232(unittest.TestCase):
 
@@ -905,7 +915,7 @@ class TestFieldReplayCalDiy7232(unittest.TestCase):
 
 @unittest.skipUnless(
     os.path.isdir(_FIELD_REPLAY_KG) and os.path.isfile(_FIELD_REPLAY_ARGS),
-    "field replay KG or args not available",
+    "field replay KG not available (args are checked in under tests/fixtures/)",
 )
 class TestFieldReplayCalDiy7232Compact(unittest.TestCase):
     """B4 field gate: pr-7232 replay on the default compact (hypothesis-first) profile."""

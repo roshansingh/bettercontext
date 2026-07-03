@@ -3028,6 +3028,10 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
             changed_files=changed_files,
             review_hypotheses=review_hypotheses,
         )
+    # Cap the top-level list to PLANNING_CONTEXT_SECTION_LIMIT (5). The splice
+    # inserts high-specificity rows at the front so the specifics-first partition is
+    # already correct; slicing here preserves that order while bounding the list.
+    review_hypotheses = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     review_quality_status = _build_review_quality_status(
         review_hypotheses=review_hypotheses,
@@ -3256,8 +3260,12 @@ def _splice_contract_diff_hypotheses(
         if after_refs:
             ar = after_refs[0]
             consequence = {k: ar[k] for k in ("path", "line_start", "repo") if k in ar}
+        hypothesis_id = h.get("hypothesis_id")
+        if not hypothesis_id:
+            # hypothesis_id is required for mirror pairing; skip rows missing it.
+            continue
         spliced_row: JsonObject = {
-            "hypothesis_id": h["hypothesis_id"],
+            "hypothesis_id": hypothesis_id,
             "risk_type": risk_type,
             "specificity": "high",
             "confidence": "medium",

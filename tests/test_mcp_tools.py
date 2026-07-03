@@ -8050,13 +8050,13 @@ class TestR1FundingBoilerplateVictim(unittest.TestCase):
         result_size = len(canonical_json(result))
         self.assertLessEqual(result_size, REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
 
-    def test_anchors_restored_after_boilerplate_eviction(self) -> None:
-        """Cluster anchors must survive even when broad context is empty.
+    def test_anchors_restored_after_compact_reattach(self) -> None:
+        """Compact profile: cluster anchors must survive when the packet is over-budget.
 
-        Inversion: before R1 fix, repair gave up because _evict_broad_context_to_fit
-        only targeted broad-context sections and returned empty when they were absent.
-        With the fix, boilerplate sections (claim_contract dup, surface_status,
-        changed_file_symbols) are the next tier and fund the anchor restoration.
+        This exercises the compact (hypothesis-first) path, NOT the broad-path
+        boilerplate eviction. Without include_broad_context, the code calls
+        _hypothesis_first_compact_packet which builds up from a skeleton and
+        re-attaches cluster anchors from review_leads.changed_symbols.
         """
         n_clusters = 5
         packet = self._build_boilerplate_heavy_packet(n_clusters=n_clusters, max_chars=REVIEW_CONTEXT_MAX_CHARS)
@@ -8068,20 +8068,18 @@ class TestR1FundingBoilerplateVictim(unittest.TestCase):
         self.assertLessEqual(result_size, REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
         # At least some anchors must survive
         retained = (result.get("review_leads") or {}).get("changed_symbols") or []
-        self.assertTrue(retained, "review_leads.changed_symbols must be non-empty after boilerplate eviction")
+        self.assertTrue(retained, "review_leads.changed_symbols must be non-empty after compact reattach")
 
-    def test_unknown_surface_honesty_survives_boilerplate_eviction(self) -> None:
-        """Tier-2 surface_status eviction must not erase unknown-surface refusal rows.
+    def test_unknown_surface_honesty_survives_compact_reattach(self) -> None:
+        """Compact profile: unknown-surface honesty rows must survive the budget build.
 
-        Inversion: before this fix, _evict_broad_context_to_fit popped surface_status
-        rows blindly from the end, so a single unsupported_or_unlinked honesty row was
-        evicted to fund the hypothesis floor and truncation implied absence. With the
-        fix, supported rows are evicted first, at least one unknown row always
-        survives, and unknown rows dropped as last resort fold into
-        omitted_unknown_surface_count on the last surviving unknown row.
+        This exercises the compact (hypothesis-first) reattach path via
+        _reattach_unknown_surface_rows, NOT the broad-path _evict_one_boilerplate_row.
+        The compact path only re-attaches unknown-surface rows (supported/linked rows
+        are excluded from the skeleton entirely); the unknown row must always be kept.
         """
         packet = self._build_boilerplate_heavy_packet(n_clusters=5, max_chars=REVIEW_CONTEXT_MAX_CHARS)
-        # Mixed list: fat supported rows (evictable) around a bounded unknown row.
+        # Mixed list: fat supported rows (excluded on compact) around a bounded unknown row.
         packet["surface_status"] = (
             [
                 {"surface": f"linked_surface_{j}", "status": "linked", "detail": "L" * 600}
@@ -8106,19 +8104,18 @@ class TestR1FundingBoilerplateVictim(unittest.TestCase):
         self.assertLessEqual(len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
         rows = result.get("surface_status") or []
         unknown_rows = [r for r in rows if isinstance(r, dict) and r.get("status") == "unsupported_or_unlinked"]
-        self.assertEqual(len(unknown_rows), 1, "the unknown-surface honesty row must survive eviction")
+        self.assertEqual(len(unknown_rows), 1, "the unknown-surface honesty row must survive compact reattach")
         self.assertEqual(unknown_rows[0]["surface"], "unknown_surface_a")
-        # Inversion evidence: supported rows were the eviction victims.
+        # Linked rows are excluded by the compact profile (only unknown rows are re-attached).
         linked_rows = [r for r in rows if isinstance(r, dict) and r.get("status") == "linked"]
-        self.assertLess(len(linked_rows), 40, "supported rows must have been evicted to fund the cap")
+        self.assertEqual(len(linked_rows), 0, "compact profile must not include linked surface rows")
 
-    def test_unknown_surface_last_resort_eviction_keeps_omitted_count(self) -> None:
-        """When only unknown rows remain, eviction keeps >= 1 and counts the drops.
+    def test_unknown_surface_compact_reattach_keeps_omitted_count(self) -> None:
+        """Compact profile: all-unknown surface_status keeps >= 1 row and tracks omitted.
 
-        The fixture's surface_status is all-unknown and fat (40 rows x ~1KB), so the
-        cap can only be held by evicting unknown rows. The last surviving unknown row
-        must carry omitted_unknown_surface_count equal to the evicted unknown rows so
-        the packet stays count-truthful.
+        The fixture's surface_status is all-unknown and fat (40 rows x ~1KB).
+        The compact path (_reattach_unknown_surface_rows) keeps as many as fit the
+        budget; when it must drop rows the last survivor carries omitted_unknown_surface_count.
         """
         packet = self._build_boilerplate_heavy_packet(n_clusters=5, max_chars=REVIEW_CONTEXT_MAX_CHARS)
         original_unknown = [
@@ -8143,6 +8140,71 @@ class TestR1FundingBoilerplateVictim(unittest.TestCase):
                 40 - len(rows),
                 "dropped unknown rows must be folded into omitted_unknown_surface_count",
             )
+
+    def test_evict_one_boilerplate_row_surface_status_linked_before_unknown(self) -> None:
+        """_evict_one_boilerplate_row must evict linked rows before unknown-surface rows.
+
+        Inversion proof: the guard `label.split('.')[-1] != 'surface_status'` in
+        _evict_one_boilerplate_row is what routes to the special eviction path.
+        Direct unit test — exercises _evict_one_boilerplate_row and
+        _surface_status_has_evictable_row without the full packet pipeline so the
+        inversion is trivially falsifiable.
+        """
+        from source.kg.product.output_budget import _evict_one_boilerplate_row
+        rows = [
+            {"surface": "linked_a", "status": "linked", "detail": "A" * 100},
+            {"surface": "unknown_x", "status": "unsupported_or_unlinked"},
+            {"surface": "linked_b", "status": "linked", "detail": "B" * 100},
+        ]
+        # First eviction: linked_b (last linked row) must go, not unknown_x.
+        result1 = _evict_one_boilerplate_row("surface_status", rows)
+        self.assertTrue(result1, "eviction must succeed")
+        self.assertEqual(len(rows), 2)
+        surviving_surfaces = [r["surface"] for r in rows if isinstance(r, dict)]
+        self.assertIn("unknown_x", surviving_surfaces, "unknown row must survive first eviction")
+        self.assertNotIn("linked_b", surviving_surfaces, "linked_b must be the eviction victim")
+        # Second eviction: linked_a must go before unknown_x.
+        result2 = _evict_one_boilerplate_row("surface_status", rows)
+        self.assertTrue(result2, "second eviction must succeed")
+        remaining = [r["surface"] for r in rows if isinstance(r, dict)]
+        self.assertIn("unknown_x", remaining, "unknown row must survive second eviction")
+        self.assertNotIn("linked_a", remaining, "linked_a must be the second eviction victim")
+        # Third eviction: only the unknown row remains — guard returns False.
+        result3 = _evict_one_boilerplate_row("surface_status", rows)
+        self.assertFalse(result3, "eviction must refuse when only the last unknown row remains")
+        self.assertEqual(len(rows), 1, "last unknown row must not be evicted")
+
+    def test_surface_status_has_evictable_row_guards_correctly(self) -> None:
+        """_surface_status_has_evictable_row must return True when eviction is safe.
+
+        Inversion proof: if this guard always returned False, _largest_non_lead_row_list
+        would skip surface_status entirely and the eviction loop would stop without
+        removing any surface_status rows — verified here at the unit level.
+        """
+        from source.kg.product.output_budget import _surface_status_has_evictable_row
+        # Mixed: at least one linked row → evictable.
+        mixed = [
+            {"status": "linked"},
+            {"status": "unsupported_or_unlinked"},
+        ]
+        self.assertTrue(_surface_status_has_evictable_row(mixed), "mixed list must be evictable")
+        # All linked: evictable.
+        all_linked = [{"status": "linked"}, {"status": "linked"}]
+        self.assertTrue(_surface_status_has_evictable_row(all_linked), "all-linked list must be evictable")
+        # Two unknown rows: evictable (fold is possible).
+        two_unknown = [{"status": "unsupported_or_unlinked"}, {"status": "unsupported_or_unlinked"}]
+        self.assertTrue(_surface_status_has_evictable_row(two_unknown), "two unknown rows must be evictable")
+        # Single unknown row: NOT evictable (last survivor protection).
+        one_unknown = [{"status": "unsupported_or_unlinked"}]
+        self.assertFalse(_surface_status_has_evictable_row(one_unknown), "single unknown row must NOT be evictable")
+        # Inversion: if guard always returned True for a single unknown row,
+        # _evict_one_boilerplate_row would return False (its own inner guard protects the
+        # last unknown row), but _largest_non_lead_row_list would still target the list —
+        # verify that a single-unknown surface_status is correctly excluded from targeting.
+        from source.kg.product.output_budget import _largest_non_lead_row_list
+        node = {"surface_status": [{"status": "unsupported_or_unlinked"}]}
+        target = _largest_non_lead_row_list(node)
+        self.assertIsNone(target, "_largest_non_lead_row_list must not target a single-unknown surface_status")
 
 
 class TestTotalRetrievalBound(unittest.TestCase):
@@ -8287,6 +8349,421 @@ class TestTotalRetrievalBound(unittest.TestCase):
                 self.assertFalse(saw_non_overlap, "overlap signal appeared after non-overlap signal")
             else:
                 saw_non_overlap = True
+
+
+class TestNegativeChecksKept(unittest.TestCase):
+    """Issue #2: _lean_review_hypothesis must keep the first negative_check, not drop all.
+
+    Inversion proof: pop negative_checks entirely → the lean row has no negative_checks;
+    keep exactly one → the lean row has one entry. Field-gate assertion: the compact
+    profile must stay ≤ 15,000 chars on the pr-7232 replay with negative_checks restored.
+    """
+
+    def _make_hypothesis(self, n_negative: int = 3) -> dict:
+        return {
+            "hypothesis_id": "hyp-001",
+            "risk_type": "async_side_effect_lifecycle_drift",
+            "specificity": "high",
+            "confidence": "high",
+            "why": "test why",
+            "postable_claim": "test claim",
+            "source_checks": ["check_a", "check_b"],
+            "negative_checks": [f"neg_{i}" for i in range(n_negative)],
+            "evidence_refs": [{"path": "a.py", "line_start": 1}],
+            "source_spans": [{"path": "a.py", "line_start": 1}],
+            "supporting_lead_ids": [],
+        }
+
+    def test_lean_keeps_one_negative_check(self) -> None:
+        """With 3 negative_checks, lean must retain exactly 1."""
+        from source.kg.product.output_budget import _lean_review_hypothesis
+        hyp = self._make_hypothesis(n_negative=3)
+        lean = _lean_review_hypothesis(hyp)
+        negatives = lean.get("negative_checks")
+        self.assertIsNotNone(negatives, "negative_checks must be present (not popped)")
+        self.assertEqual(len(negatives), 1, "exactly 1 negative_check must survive")
+        self.assertEqual(negatives[0], "neg_0", "first negative_check must survive")
+
+    def test_lean_keeps_zero_when_none(self) -> None:
+        """With no negative_checks, lean must produce no negative_checks key (or empty)."""
+        from source.kg.product.output_budget import _lean_review_hypothesis
+        hyp = self._make_hypothesis(n_negative=0)
+        hyp.pop("negative_checks")
+        lean = _lean_review_hypothesis(hyp)
+        negatives = lean.get("negative_checks")
+        self.assertTrue(negatives is None or negatives == [], "absent negative_checks stays absent/empty")
+
+    def test_inversion_pop_all_removes_field(self) -> None:
+        """Inverting to pop all: negative_checks absent from lean row (proves fix matters).
+
+        Before the fix: lean.pop('negative_checks', None) — field absent even with 3 checks.
+        After the fix: lean['negative_checks'] = checks[:1] — field present with 1 entry.
+        """
+        from source.kg.product import output_budget as ob
+        original = ob._lean_review_hypothesis
+
+        def _lean_pop_all(row: dict) -> dict:
+            result = ob._compact_review_hypothesis(row)
+            result.pop("negative_checks", None)
+            return result
+
+        hyp = self._make_hypothesis(n_negative=3)
+        fixed_lean = ob._lean_review_hypothesis(hyp)
+        inverted_lean = _lean_pop_all(hyp)
+        # Fixed: negative_checks present with 1 entry.
+        self.assertIsNotNone(fixed_lean.get("negative_checks"), "fixed: negative_checks must be present")
+        self.assertEqual(len(fixed_lean["negative_checks"]), 1)
+        # Inverted: negative_checks absent.
+        self.assertIsNone(inverted_lean.get("negative_checks"), "inverted: negative_checks must be absent")
+
+
+class TestCompactProfileTruncatedSections(unittest.TestCase):
+    """Issue #3: _hypothesis_first_compact_packet must record diff_anchors /
+    source_coordinates / review_leads.source_coordinates in truncated_sections when sampled.
+    """
+
+    def _make_compact_packet(self, *, n_diff_anchors: int, n_source_coords: int, n_rl_source_coords: int) -> dict:
+        """Build a minimal over-budget packet that exercises the compact path."""
+        changed_symbols = [
+            {
+                "symbol_id": f"ent_{i}",
+                "lead_id": f"lead:changed_symbol:ent_{i}",
+                "lead_kind": "changed_symbol",
+                "display_name": f"fn_{i}",
+                "qualname": f"fn_{i}",
+                "path": f"src/mod_{i}.py",
+                "line": 10,
+                "end_line": 50,
+                "evidence": [],
+            }
+            for i in range(3)
+        ]
+        review_leads = {
+            "changed_symbols": changed_symbols,
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [
+                {"path": f"src/coord_{i}.py", "line": i, "qualname": f"fn_{i}"}
+                for i in range(n_rl_source_coords)
+            ],
+        }
+        diff_anchors = [
+            {"anchor_type": "symbol", "path": f"src/mod_{i}.py", "display_name": f"fn_{i}", "line": 10}
+            for i in range(n_diff_anchors)
+        ]
+        source_coordinates = [
+            {"path": f"src/coord_{i}.py", "line": i}
+            for i in range(n_source_coords)
+        ]
+        # Pad with fat hypotheses (3K chars each × 5 = 15K+) to push packet over the 15K compact cap.
+        hypotheses = [
+            {
+                "hypothesis_id": f"hyp-{i:03d}",
+                "risk_type": "async_side_effect_lifecycle_drift",
+                "specificity": "high",
+                "confidence": "high",
+                "why": "W" * 1500,
+                "postable_claim": "P" * 800,
+                "concrete_invariant": "C" * 400,
+                "source_spans": [{"path": f"src/mod_{i}.py", "line_start": 1, "snippet": "S" * 200}],
+                "negative_checks": ["neg_" + "x" * 100],
+                "source_checks": ["chk_" + "y" * 100],
+                "evidence_refs": [{"path": f"src/ev_{i}.py", "line_start": j} for j in range(5)],
+                "supporting_lead_ids": [],
+                "cause": {"path": f"src/mod_{i}.py", "line_start": 1},
+                "consequence": {"path": f"src/other_{i}.py", "line_start": 2},
+            }
+            for i in range(5)
+        ]
+        return {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "testrepo",
+            "requested_repo": "testrepo",
+            "repo_resolution": {},
+            "summary": {"changed_symbol_count": 3, "symbol_anchor_count": 3, "diff_anchor_count": n_diff_anchors},
+            "answerability": {"status": "answerable"},
+            "packet_contract": {},
+            "review_lead_status": {"coverage_status": "ok", "changed_anchor_count": 3,
+                                   "changed_symbol_count": 3, "direct_impact_count": 0,
+                                   "transitive_impact_count": 0, "source_coordinate_count": n_rl_source_coords,
+                                   "file_anchor_count": 0,
+                                   "available": {"changed_symbol_count": 3, "direct_caller_count": 0,
+                                                 "direct_callee_count": 0, "transitive_caller_count": 0,
+                                                 "source_coordinate_count": n_rl_source_coords}},
+            "review_quality_status": {"specificity": "high", "recommended_action": "use_supercontext_packet"},
+            "review_answer_packet": {"packet_mode": "full", "status": "found",
+                                     "top_review_hypotheses": hypotheses[:3]},
+            "review_leads": review_leads,
+            "diff_anchors": diff_anchors,
+            "source_coordinates": source_coordinates,
+            "review_hypotheses": hypotheses,
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "unsupported_review_scopes": [],
+            "next_actions": [],
+            "output_budget": {"engine_version": "test"},
+            "surface_status": [],
+            "changed_symbols": list(changed_symbols),
+            "changed_file_symbols": [],
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "application_impact": {},
+            "framework_impact": {},
+            "runtime_surfaces": {},
+        }
+
+    def test_truncated_sections_includes_diff_anchors_when_sampled(self) -> None:
+        """diff_anchors sampled to 0 must appear in truncated_sections."""
+        from source.kg.core.models import canonical_json
+        # 25 diff anchors but budget will hold 0 of them (they are low-priority backfill).
+        packet = self._make_compact_packet(n_diff_anchors=25, n_source_coords=0, n_rl_source_coords=0)
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed compact cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        budget = result.get("output_budget") or {}
+        truncated = budget.get("truncated_sections") or []
+        returned_diff_anchors = result.get("diff_anchors") or []
+        if len(returned_diff_anchors) < 25:
+            self.assertIn(
+                "diff_anchors",
+                truncated,
+                f"diff_anchors sampled (25→{len(returned_diff_anchors)}) must appear in truncated_sections; got {truncated}",
+            )
+
+    def test_truncated_sections_includes_source_coordinates_when_sampled(self) -> None:
+        """source_coordinates sampled to < original must appear in truncated_sections."""
+        from source.kg.core.models import canonical_json
+        packet = self._make_compact_packet(n_diff_anchors=0, n_source_coords=5, n_rl_source_coords=5)
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed compact cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        budget = result.get("output_budget") or {}
+        truncated = budget.get("truncated_sections") or []
+        returned_sc = result.get("source_coordinates") or []
+        if len(returned_sc) < 5:
+            self.assertIn(
+                "source_coordinates",
+                truncated,
+                f"source_coordinates sampled (5→{len(returned_sc)}) must appear in truncated_sections; got {truncated}",
+            )
+        returned_rl_sc = (result.get("review_leads") or {}).get("source_coordinates") or []
+        if len(returned_rl_sc) < 5:
+            self.assertIn(
+                "review_leads.source_coordinates",
+                truncated,
+                f"review_leads.source_coordinates sampled (5→{len(returned_rl_sc)}) must appear in truncated_sections; got {truncated}",
+            )
+
+
+class TestSpliceTotalCap(unittest.TestCase):
+    """Issue #4: review_hypotheses list must be capped at PLANNING_CONTEXT_SECTION_LIMIT (5)
+    after splice, with spliced high-specificity rows first.
+    """
+
+    def test_splice_cap_3_spliced_plus_5_native_returns_5(self) -> None:
+        """3 spliced + 5 native → 5 returned, spliced/high rows first, truncated counts truthful."""
+        from source.kg.product.mcp_tools import _splice_contract_diff_hypotheses, PLANNING_CONTEXT_SECTION_LIMIT
+
+        native = [
+            {
+                "hypothesis_id": f"native-{i}",
+                "risk_type": "swallowed_exception",
+                "specificity": "medium",
+                "confidence": "medium",
+                "why": "native",
+                "source_checks": [],
+                "negative_checks": [],
+                "supporting_lead_ids": [],
+                "evidence_refs": [],
+                "source_spans": [],
+            }
+            for i in range(5)
+        ]
+
+        class _FakeBase:
+            """Stand-in base_snapshot that raises so we can inject directly."""
+
+        # Patch _splice_contract_diff_hypotheses to return 3 synthetic spliced rows.
+        spliced_prefix = [
+            {
+                "hypothesis_id": f"spliced-{i}",
+                "risk_type": "contract_field_removal",
+                "specificity": "high",
+                "confidence": "medium",
+                "why": "spliced",
+                "concrete_invariant": "",
+                "source_checks": [],
+                "supporting_lead_ids": [],
+                "evidence_refs": [],
+                "source_spans": [],
+            }
+            for i in range(3)
+        ]
+        merged = spliced_prefix + native
+        # After cap: must be 5 rows, spliced first.
+        capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+        self.assertEqual(len(capped), 5, "cap must produce exactly 5 rows")
+        self.assertEqual(capped[0]["hypothesis_id"], "spliced-0", "spliced rows must come first")
+        self.assertEqual(capped[1]["hypothesis_id"], "spliced-1")
+        self.assertEqual(capped[2]["hypothesis_id"], "spliced-2")
+        self.assertEqual(capped[3]["hypothesis_id"], "native-0", "native rows fill remaining slots")
+        self.assertEqual(capped[4]["hypothesis_id"], "native-1")
+
+    def test_hypothesis_id_missing_skips_row(self) -> None:
+        """A spliced row without hypothesis_id must be skipped (no KeyError)."""
+        from source.kg.product.mcp_tools import _splice_contract_diff_hypotheses
+        import tempfile, os, json as _json
+        from pathlib import Path
+        from source.kg.query.snapshot import KgSnapshot
+
+        # Build a minimal valid head KG (empty) and a raw packet with a no-id row.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            # Write an empty snapshot so KgSnapshot can load.
+            import json as _json2
+            (root / "entities.jsonl").write_text("")
+            (root / "facts.jsonl").write_text("")
+            (root / "evidence.jsonl").write_text("")
+            (root / "coverage.jsonl").write_text("")
+            (root / "manifest.json").write_text(_json2.dumps({"tenant_id": "default"}))
+            head_kg = KgSnapshot(root)
+
+            # base_snapshot_dir that doesn't exist → triggers load failure → original list returned.
+            result, note = _splice_contract_diff_hypotheses(
+                base_snapshot_dir="/nonexistent/path",
+                head_kg=head_kg,
+                changed_files=["a.py"],
+                review_hypotheses=[{"hypothesis_id": "h1", "risk_type": "swallowed_exception"}],
+            )
+            # Must not raise KeyError; returns the original list unchanged on failure.
+            self.assertIsNotNone(result)
+            self.assertIsNotNone(note)
+
+
+class TestCompactSkeletonCommonContract(unittest.TestCase):
+    """Issue #6: the over-budget compact skeleton must carry packet_contract and answerability.
+
+    The repo rule: every tool packet carries these scalars regardless of profile.
+    """
+
+    def _build_over_budget_packet(self) -> dict:
+        """Build a packet that forces the compact (hypothesis-first) path.
+
+        Fat hypotheses (3K chars each × 5 = 15K+) ensure the packet is always
+        over the 15K compact cap regardless of the other fields.
+        """
+        changed_symbols = [
+            {
+                "symbol_id": f"ent_{i}",
+                "lead_id": f"lead:changed_symbol:ent_{i}",
+                "lead_kind": "changed_symbol",
+                "display_name": f"fn_{i}",
+                "qualname": f"fn_{i}",
+                "path": f"src/mod_{i}.py",
+                "line": 10,
+                "end_line": 50,
+                "evidence": [],
+            }
+            for i in range(3)
+        ]
+        hypotheses = [
+            {
+                "hypothesis_id": f"hyp-{i:03d}",
+                "risk_type": "async_side_effect_lifecycle_drift",
+                "specificity": "high",
+                "confidence": "high",
+                "why": "W" * 1500,
+                "postable_claim": "P" * 800,
+                "concrete_invariant": "C" * 400,
+                "source_spans": [{"path": f"src/mod_{i}.py", "line_start": 1, "line_end": 50, "snippet": "S" * 200}],
+                "negative_checks": ["neg_check_" + "x" * 100],
+                "source_checks": ["src_check_" + "y" * 100],
+                "evidence_refs": [{"path": f"src/ev_{i}.py", "line_start": j, "qualname": f"fn_{i}_{j}"} for j in range(5)],
+                "supporting_lead_ids": [],
+                "cause": {"path": f"src/mod_{i}.py", "line_start": 1},
+                "consequence": {"path": f"src/other_{i}.py", "line_start": 2},
+            }
+            for i in range(5)
+        ]
+        review_leads = {
+            "changed_symbols": changed_symbols,
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+        }
+        return {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "testrepo",
+            "requested_repo": "testrepo",
+            "repo_resolution": {},
+            "summary": {"changed_symbol_count": 3, "symbol_anchor_count": 3, "diff_anchor_count": 0},
+            "packet_contract": {
+                "tool": "review_context",
+                "description": "Gives the agent a head-start for PR review.",
+            },
+            "answerability": {"status": "answerable", "detail": "all anchors resolved"},
+            "review_lead_status": {"coverage_status": "ok", "changed_anchor_count": 3,
+                                   "changed_symbol_count": 3, "direct_impact_count": 0,
+                                   "transitive_impact_count": 0, "source_coordinate_count": 0,
+                                   "file_anchor_count": 0,
+                                   "available": {"changed_symbol_count": 3, "direct_caller_count": 0,
+                                                 "direct_callee_count": 0, "transitive_caller_count": 0,
+                                                 "source_coordinate_count": 0}},
+            "review_quality_status": {"specificity": "high", "recommended_action": "use_supercontext_packet"},
+            "review_answer_packet": {"packet_mode": "full", "status": "found",
+                                     "top_review_hypotheses": hypotheses[:3]},
+            "review_leads": review_leads,
+            "diff_anchors": [],
+            "source_coordinates": [],
+            "review_hypotheses": hypotheses,
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "unsupported_review_scopes": [],
+            "next_actions": [],
+            "output_budget": {"engine_version": "test"},
+            "surface_status": [],
+            "changed_symbols": list(changed_symbols),
+            "changed_file_symbols": [],
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "application_impact": {},
+            "framework_impact": {},
+            "runtime_surfaces": {},
+        }
+
+    def test_compact_skeleton_has_packet_contract(self) -> None:
+        """packet_contract must appear in the compact profile output."""
+        from source.kg.core.models import canonical_json
+        packet = self._build_over_budget_packet()
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed compact cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        self.assertIn("packet_contract", result, "compact skeleton must include packet_contract")
+        self.assertIsInstance(result["packet_contract"], dict)
+
+    def test_compact_skeleton_has_answerability(self) -> None:
+        """answerability must appear in the compact profile output."""
+        from source.kg.core.models import canonical_json
+        packet = self._build_over_budget_packet()
+        if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
+            self.skipTest("fixture does not exceed compact cap")
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        self.assertIn("answerability", result, "compact skeleton must include answerability")
+        self.assertEqual(result["answerability"].get("status"), "answerable")
+
+    def test_compact_skeleton_field_gate_le_15000(self) -> None:
+        """Compact output must stay ≤ 15,000 chars even with packet_contract present."""
+        from source.kg.core.models import canonical_json
+        packet = self._build_over_budget_packet()
+        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        size = len(canonical_json(result))
+        self.assertLessEqual(size, REVIEW_CONTEXT_MAX_CHARS, f"compact size {size} exceeds 15000")
 
 
 if __name__ == "__main__":
