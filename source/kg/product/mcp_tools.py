@@ -20,6 +20,12 @@ from source.kg.product.output_budget import (
     enforce_reverse_impact_budget,
     enforce_service_brief_budget,
 )
+from source.kg.product.review_attribution import (
+    add_review_lead_ids,
+    review_available_counts,
+    review_lead_counts,
+)
+from source.kg.product.review_hypotheses import review_hypotheses_for_context
 from source.kg.product.runtime_architecture import ENDPOINT_PATH_SHAPE_MATCH_BASIS, runtime_architecture_packet
 from source.kg.query.call_site import call_site_from_qualifier
 from source.kg.query.snapshot import KgSnapshot
@@ -49,6 +55,7 @@ _PLANNING_CONTEXT_ANCHOR_FIELDS = (
     "domain",
 )
 REVIEW_CONTEXT_DETAIL_LIMIT = 25
+REVIEW_CONTEXT_UNKNOWN_SURFACE_CAP = 8
 REVIEW_CONTEXT_SURFACES = (
     "ui_screens",
     "scheduled_jobs",
@@ -2153,23 +2160,26 @@ def _optional_string_list(arguments: JsonObject, field: str) -> list[str]:
     return normalized
 
 
-def _optional_review_surfaces(arguments: JsonObject, field: str) -> list[str]:
+def _optional_review_surfaces_tolerant(
+    arguments: JsonObject, field: str
+) -> tuple[list[str], list[str]]:
+    """review_context call site: known surfaces + unknown tokens (verbatim, no error)."""
     surfaces: list[str] = []
-    unsupported: list[str] = []
+    unknown: list[str] = []
+    seen_unknown: set[str] = set()
     for value in _optional_string_list(arguments, field):
         normalized_value = value.strip().lower().replace("-", "_").replace(" ", "_")
         if normalized_value in REVIEW_CONTEXT_BUILTIN_SECTION_ALIASES:
             continue
         canonical = REVIEW_CONTEXT_SURFACE_ALIASES.get(normalized_value)
         if canonical is None:
-            unsupported.append(value)
+            if normalized_value not in seen_unknown:
+                seen_unknown.add(normalized_value)
+                unknown.append(value)
             continue
         if canonical not in surfaces:
             surfaces.append(canonical)
-    if unsupported:
-        allowed = ", ".join(REVIEW_CONTEXT_SURFACES)
-        raise ValueError(f"MCP tool argument {field!r} has unsupported surface(s): {', '.join(unsupported)}; allowed: {allowed}")
-    return surfaces
+    return surfaces, unknown
 
 
 def _optional_review_section_aliases(arguments: JsonObject, field: str) -> set[str]:
@@ -2313,7 +2323,9 @@ def _review_context_properties() -> JsonObject:
                 "and contracts are accepted. Built-in review sections and broad answer categories such as callers, "
                 "reverse_impact, services, and deployables are always returned or covered by other packet sections, "
                 "and may be requested as no-op aliases. Owner/maintainer requests are accepted as explicit coverage "
-                "gaps that point to planning_context.ownership_context."
+                "gaps that point to planning_context.ownership_context. "
+                "Unknown surface names are not rejected — they produce unsupported_or_unlinked surface_status rows "
+                "with source_inspection_terms so the agent can continue with manual inspection."
             ),
         },
         "include_deploy_blockers": {"type": "boolean", "default": False},
@@ -2687,7 +2699,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     changed_ranges = _optional_changed_ranges(arguments, "changed_ranges")
     limit = _limit(arguments)
     detail_limit = min(limit, REVIEW_CONTEXT_DETAIL_LIMIT)
-    requested_surfaces = _optional_review_surfaces(arguments, "requested_surfaces")
+    requested_surfaces, unknown_surfaces = _optional_review_surfaces_tolerant(arguments, "requested_surfaces")
     requested_review_sections = _optional_review_section_aliases(arguments, "requested_surfaces")
     include_deploy_blockers = _optional_bool(arguments, "include_deploy_blockers", default=False)
     include_unlinked_leads = _optional_bool(arguments, "include_unlinked_leads", default=False)
@@ -2837,6 +2849,8 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         application_impact=application_impact,
         runtime_surfaces=runtime_surfaces,
         requested_surfaces=requested_surfaces,
+        unknown_surfaces=unknown_surfaces,
+        changed_symbols=changed_symbols,
     )
     answerability = _review_context_answerability(
         status=status,
@@ -2870,6 +2884,23 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     direct_callers_in_scope = public_direct_callers if changed_ranges else []
     direct_callees_in_scope = public_direct_callees if changed_ranges else []
     transitive_callers_in_scope = public_transitive_callers if changed_ranges else []
+    # Stamp lead_id / lead_kind on the in-scope lists before the lead packet and before
+    # building the result dict. The same stamped rows are used everywhere — top-level fields,
+    # review_leads, and hypotheses — so IDs survive budget compaction without re-derivation.
+    _stamped_in_scope = add_review_lead_ids(
+        {
+            "changed_symbols": changed_symbols_in_scope,
+            "direct_callers": direct_callers_in_scope,
+            "direct_callees": direct_callees_in_scope,
+            "transitive_callers": transitive_callers_in_scope,
+            "source_coordinates": source_coordinates,
+        }
+    )
+    changed_symbols_in_scope = _stamped_in_scope["changed_symbols"]
+    direct_callers_in_scope = _stamped_in_scope["direct_callers"]
+    direct_callees_in_scope = _stamped_in_scope["direct_callees"]
+    transitive_callers_in_scope = _stamped_in_scope["transitive_callers"]
+    source_coordinates = _stamped_in_scope["source_coordinates"]
     summary = _review_context_summary(
         changed_files=changed_files,
         changed_symbols=changed_symbols_in_scope,
@@ -2934,6 +2965,19 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     )
     review_answer_packet["repo_resolution"] = repo_resolution
     review_answer_packet["review_lead_status"] = review_lead_packet["review_lead_status"]
+    review_hypotheses = review_hypotheses_for_context(
+        changed_files=changed_files,
+        changed_symbols=changed_symbols_in_scope,
+        direct_callers=direct_callers_in_scope,
+        direct_callees=direct_callees_in_scope,
+        transitive_callers=transitive_callers_in_scope,
+        framework_impact=framework_impact,
+        application_impact=application_impact,
+        runtime_surfaces=runtime_surfaces,
+        review_leads=review_lead_packet["review_leads"],
+        review_lead_status=review_lead_packet["review_lead_status"],
+    )
+    review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     result = {
         "status": status,
         "repo": repo,
@@ -2995,6 +3039,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
             framework_impact.get("tasks", []),
             application_impact.get("runtime_facts", []),
         ),
+        "review_hypotheses": review_hypotheses,
         "next_actions": next_actions,
     }
     if _review_context_should_compact_unanchored(
@@ -3038,7 +3083,14 @@ def _review_context_lead_packet(
     }
     if not useful:
         status["reason"] = "no symbol anchors, changed symbols, or direct/transitive impact edges"
-    leads: JsonObject = {
+    available = review_available_counts(
+        changed_symbols=changed_symbols,
+        direct_callers=direct_callers,
+        direct_callees=direct_callees,
+        transitive_callers=transitive_callers,
+        source_coordinates=source_coordinates,
+    )
+    leads_pre: JsonObject = {
         "changed_files": changed_files[:PLANNING_CONTEXT_SECTION_LIMIT],
         "changed_symbols": changed_symbols[:PLANNING_CONTEXT_SECTION_LIMIT],
         "direct_callers": direct_callers[:PLANNING_CONTEXT_SECTION_LIMIT],
@@ -3046,6 +3098,9 @@ def _review_context_lead_packet(
         "transitive_callers": transitive_callers[:PLANNING_CONTEXT_SECTION_LIMIT],
         "source_coordinates": source_coordinates[:PLANNING_CONTEXT_SECTION_LIMIT],
     }
+    leads = add_review_lead_ids(leads_pre)
+    status["available"] = available
+    status["returned"] = review_lead_counts(leads)
     return {"review_lead_status": status, "review_leads": leads}
 
 
@@ -3104,6 +3159,7 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
     )
     review_lead_status = review_lead_packet["review_lead_status"]
     review_leads = review_lead_packet["review_leads"]
+    stamped_source_coordinates = review_leads.get("source_coordinates") if isinstance(review_leads.get("source_coordinates"), list) else source_coordinates
     omitted_counts = _review_context_omitted_context_counts(result)
     packet_summary = dict(packet.get("summary", {})) if isinstance(packet.get("summary"), dict) else {}
     packet_summary["packet_mode"] = "diff_anchor_only"
@@ -3158,7 +3214,11 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
             "repo_dependencies": repo_dependencies,
         },
         "repo_dependencies": repo_dependencies,
-        "source_coordinates": source_coordinates,
+        "source_coordinates": stamped_source_coordinates,
+        "review_hypotheses": [
+            h for h in (result.get("review_hypotheses") or [])
+            if isinstance(h, dict) and h.get("risk_type") == "low_coverage_stylesheet_gap"
+        ],
         "answerability": answerability,
         "coverage_warnings": result.get("coverage_warnings", []),
         "unsupported_scopes": result.get("unsupported_scopes", []),
@@ -4308,9 +4368,11 @@ def _review_context_surface_status(
     application_impact: JsonObject,
     runtime_surfaces: dict[str, list[JsonObject]],
     requested_surfaces: list[str],
+    unknown_surfaces: list[str] | None = None,
+    changed_symbols: list[JsonObject] | None = None,
 ) -> list[JsonObject]:
-    surfaces = requested_surfaces or list(REVIEW_CONTEXT_SURFACES)
-    return [
+    surfaces = requested_surfaces if (requested_surfaces or unknown_surfaces) else list(REVIEW_CONTEXT_SURFACES)
+    rows: list[JsonObject] = [
         _review_context_surface_status_row(
             surface,
             application_impact=application_impact,
@@ -4318,6 +4380,44 @@ def _review_context_surface_status(
         )
         for surface in surfaces
     ]
+    capped = (unknown_surfaces or [])[:REVIEW_CONTEXT_UNKNOWN_SURFACE_CAP]
+    omitted_unknown = max(0, len(unknown_surfaces or []) - REVIEW_CONTEXT_UNKNOWN_SURFACE_CAP)
+    for token in capped:
+        rows.append(_review_context_unknown_surface_status_row(token, changed_symbols=changed_symbols or []))
+    if omitted_unknown and rows:
+        rows[-1] = dict(rows[-1], omitted_unknown_surface_count=omitted_unknown)
+    return rows
+
+
+_REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN = 200
+_REVIEW_CONTEXT_SOURCE_INSPECTION_TERMS_MAX = 12
+
+
+def _review_context_unknown_surface_status_row(
+    token: str,
+    *,
+    changed_symbols: list[JsonObject],
+) -> JsonObject:
+    token = token[:_REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN]
+    words = [w for w in token.replace("-", "_").replace(" ", "_").split("_") if w and len(w) >= 2]
+    terms: list[str] = []
+    seen: set[str] = set()
+    for t in [token] + words:
+        if t and t not in seen:
+            terms.append(t)
+            seen.add(t)
+    for row in changed_symbols[:5]:
+        name = str(row.get("qualified_name") or row.get("qualname") or "")[:_REVIEW_CONTEXT_SURFACE_TOKEN_MAX_LEN]
+        if name and name not in seen:
+            terms.append(name)
+            seen.add(name)
+            if len(terms) >= _REVIEW_CONTEXT_SOURCE_INSPECTION_TERMS_MAX:
+                break
+    return {
+        "surface": token,
+        "status": "unsupported_or_unlinked",
+        "source_inspection_terms": terms[:_REVIEW_CONTEXT_SOURCE_INSPECTION_TERMS_MAX],
+    }
 
 
 def _review_context_surface_status_row(
@@ -6403,9 +6503,11 @@ _TOOLS: dict[str, McpTool] = {
             "framework_impact includes parser-backed support facts for Django/Celery model fields, model relations, serializers, view/model bindings, tasks, and bounded model relationship paths when present. "
             "authz_surface is available from planning_context/get_service_brief for endpoint-to-handler permission evidence; use source inspection for dynamic middleware or framework defaults not represented in the packet. "
             "application_impact groups changed app/package namespace surfaces into API/model/serializer/worker/scheduled-job sections, app-scoped runtime facts, and unlinked cross-repo name leads that require separate verification when those sections are present or explicitly requested. "
+            "review_hypotheses contains hypothesis_id-tagged candidates with risk_type, confidence, and evidence_refs. "
             "Use it when you know the changed files and need deterministic static review context before drilling into narrower MCP tools. "
             "Large packets are bounded: when output_budget is present the detail rows were compacted to a coordinate-bearing head start, so inspect source coordinates or call narrower changed_ranges/exact tools for omitted detail. "
-            "Does not infer deploy blockers unless explicitly requested, summarize diffs with an LLM, or invent cross-repo and runtime-only impact."
+            "Does not infer deploy blockers unless explicitly requested, summarize diffs with an LLM, or invent cross-repo and runtime-only impact. "
+            "Read review_hypotheses as candidate source-inspection leads, not proven bugs. If using a hypothesis in a review finding, include its hypothesis_id and supporting lead_id values in the finding metadata when the review harness supports attribution."
         ),
         input_schema=_object_schema(_review_context_properties(), required=["repo", "changed_files"]),
         handler=_review_context,

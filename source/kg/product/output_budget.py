@@ -4,6 +4,7 @@ from copy import deepcopy
 
 from source.kg.core.models import JsonObject, canonical_json
 from source.kg.product.evidence_score import rank_rows, score_key
+from source.kg.product.review_attribution import review_lead_counts
 
 
 # Fleet runtime architecture questions need a compact head-start packet that
@@ -107,6 +108,10 @@ _BUDGET_BACKFILL_LIST_PATHS: tuple[tuple[str, ...], ...] = (
     ("related_facts", "symbol_impact", "reverse_impact", "source_inspection_areas"),
 )
 _REVIEW_BUDGET_BACKFILL_LIST_PATHS: tuple[tuple[str, ...], ...] = (
+    # Hypotheses are highest-priority backfill: they are the reviewer's primary signal and
+    # compacted rows are small, so they should be restored before broad context rows.
+    ("review_hypotheses",),
+    ("review_answer_packet", "top_review_hypotheses"),
     ("review_leads", "changed_symbols"),
     ("review_leads", "direct_callers"),
     ("review_leads", "direct_callees"),
@@ -473,10 +478,41 @@ def enforce_review_context_budget(
     the agent inspects source rather than doing saved-file archaeology. Row limits tighten
     across passes until the packet fits; if non-row content alone still exceeds the cap, the
     packet is returned with output_budget.exceeded_after_minimization set.
+
+    Priority order (highest keep-priority first):
+      1. review_lead_status
+      2. review_hypotheses (top 1-3; top 1 is the floor when any were generated)
+      3. review_leads rows with lead_ids
+      4. source coordinates for hypotheses/leads
+      5. compact diff anchors
+      6. inspection_areas
+      7. broad application/runtime/framework context
     """
     measured = len(canonical_json(result))
+    original_hypotheses = [
+        row for row in _list_value(result.get("review_hypotheses")) if isinstance(row, dict)
+    ]
+    # Pre-budget review_leads snapshot: funds the P1 cluster-coverage repair and the
+    # truthful P2 omitted counts, both computed against everything the producer returned.
+    original_review_leads = (
+        deepcopy(result["review_leads"]) if isinstance(result.get("review_leads"), dict) else {}
+    )
     if measured <= max_chars:
+        # Sync mirror and emit status even when no compaction is needed so every packet
+        # carries review_hypothesis_status regardless of packet size.
+        _finalize_review_hypothesis_budget(
+            result, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+        )
         return result
+    # P1: Cluster-aware ordering BEFORE the row-limit passes — _compact_review_detail
+    # samples rows[:limit] and backfill restores in list order, so the interleaved order
+    # (one anchor per cluster, rank-ordered, before any second row) is what makes those
+    # passes keep >= 1 changed-symbol anchor per changed-file cluster. Copy the containers
+    # the interleave reassigns so the caller's packet is never mutated.
+    result = dict(result)
+    if isinstance(result.get("review_leads"), dict):
+        result["review_leads"] = dict(result["review_leads"])
+    _interleave_changed_symbols_by_cluster(result)
     for row_limit in _REVIEW_DETAIL_ROW_LIMITS:
         compact, truncated_sections = _compact_review_detail(result, limit=row_limit)
         _attach_detail_budget_metadata(
@@ -487,24 +523,36 @@ def enforce_review_context_budget(
             truncated_sections=truncated_sections,
         )
         if len(canonical_json(compact)) <= max_chars:
-            return _backfill_review_context(
+            backfilled = _backfill_review_context(
                 compact,
                 result,
                 measured_chars=measured,
                 max_chars=max_chars,
                 truncated_sections=truncated_sections,
             )
+            _finalize_review_hypothesis_budget(
+                backfilled, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+            )
+            return backfilled
     # Even the tightest pass overshot (rare: dominated by non-row content); signal it like
     # the planning path by shrinking the largest low-signal row lists before degrading to a
     # lead-only packet.
     compact = _review_signal_hard_cap(compact, max_chars=max_chars)
+    compact = _protect_review_hypotheses_floor(compact, original_hypotheses, max_chars=max_chars)
     if len(canonical_json(compact)) <= max_chars:
+        _finalize_review_hypothesis_budget(
+            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+        )
         return compact
     compact = _review_lead_only_budget_packet(
         compact,
         measured_chars=measured,
         max_chars=max_chars,
         truncated_sections=truncated_sections,
+        original_hypotheses=original_hypotheses,
+    )
+    _finalize_review_hypothesis_budget(
+        compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
     )
     if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
         compact["output_budget"]["exceeded_after_minimization"] = True
@@ -573,6 +621,11 @@ def _compact_review_detail(result: JsonObject, *, limit: int) -> tuple[JsonObjec
         kept_evidence = evidence[:limit]
         _record_truncated(truncated_sections, "evidence", original=len(evidence), kept=len(kept_evidence))
         compact["evidence"] = kept_evidence
+    review_hypotheses = result.get("review_hypotheses")
+    if isinstance(review_hypotheses, list):
+        kept_hypotheses = [_compact_review_hypothesis(row) for row in review_hypotheses[:limit] if isinstance(row, dict)]
+        _record_truncated(truncated_sections, "review_hypotheses", original=len(review_hypotheses), kept=len(kept_hypotheses))
+        compact["review_hypotheses"] = kept_hypotheses
     answer_packet = result.get("review_answer_packet")
     if isinstance(answer_packet, dict):
         compact["review_answer_packet"] = _compact_review_answer_packet(
@@ -726,6 +779,7 @@ def _review_lead_only_budget_packet(
     measured_chars: int,
     max_chars: int,
     truncated_sections: set[str],
+    original_hypotheses: list[JsonObject] | None = None,
 ) -> JsonObject:
     compact, lead_truncated = _compact_review_detail(result, limit=1)
     truncated_sections = set(truncated_sections) | lead_truncated
@@ -765,6 +819,16 @@ def _review_lead_only_budget_packet(
         "unsupported_review_scopes": compact.get("unsupported_review_scopes", []),
         "next_actions": compact.get("next_actions", []),
     }
+    # Use original_hypotheses as fallback when the compact pass evicted all hypotheses
+    # (can happen when the last detail pass reduced them to an empty list).
+    hyp_source = compact.get("review_hypotheses") or (original_hypotheses or [])
+    compacted_hypotheses = [
+        _compact_review_hypothesis(row)
+        for row in hyp_source
+        if isinstance(row, dict)
+    ]
+    if compacted_hypotheses:
+        lead_only["review_hypotheses"] = compacted_hypotheses
     _sync_review_lead_status_from_packet(lead_only)
     _attach_detail_budget_metadata(
         lead_only,
@@ -777,12 +841,22 @@ def _review_lead_only_budget_packet(
         lead_only["output_budget"]["lead_only"] = True
     if _current_chars(lead_only) > max_chars:
         lead_only = _review_signal_hard_cap(lead_only, max_chars=max_chars)
+        lead_only = _protect_review_hypotheses_floor(lead_only, original_hypotheses or [], max_chars=max_chars)
         if isinstance(lead_only.get("output_budget"), dict):
             lead_only["output_budget"]["lead_only"] = True
     return lead_only
 
 
 def _sync_review_lead_status_from_packet(result: JsonObject) -> None:
+    """Sync review_lead_status counts from the current review_leads rows.
+
+    N1 coherence rule: answer-packet top_* rows are always a subset of review_leads rows;
+    returned counts count review_leads. After syncing counts, clip any answer-packet top_*
+    list to only the rows whose lead_id still exists in the corresponding review_leads list
+    — so top_changed_symbols ⊆ review_leads.changed_symbols, etc. Rows without a lead_id
+    are kept as-is (they cannot be cross-referenced). This is the single authoritative
+    coherence checkpoint called after every eviction step.
+    """
     status = result.get("review_lead_status")
     if not isinstance(status, dict):
         return
@@ -830,10 +904,62 @@ def _sync_review_lead_status_from_packet(result: JsonObject) -> None:
             "file_anchor_count": file_anchor_count,
         }
     )
+    # Preserve the pre-compaction available counts; recompute returned from current packet.
+    available = status.get("available")
+    if isinstance(available, dict):
+        synced_status["available"] = available
+    synced_status["returned"] = review_lead_counts(review_leads)
     result["review_lead_status"] = synced_status
     packet = result.get("review_answer_packet")
     if isinstance(packet, dict):
         packet["review_lead_status"] = synced_status
+        # N1: clip answer-packet top_* to the rows mirrored in review_leads.
+        # Rows without a lead_id have no cross-reference and are kept as-is.
+        _clip_answer_packet_top_to_review_leads(packet, review_leads)
+
+
+# Map from answer-packet field → review_leads field for N1 coherence clipping.
+_ANSWER_PACKET_TO_REVIEW_LEADS_FIELD = {
+    "top_changed_symbols": "changed_symbols",
+    "top_direct_callers": "direct_callers",
+    "top_direct_callees": "direct_callees",
+    "top_transitive_callers": "transitive_callers",
+}
+
+
+def _clip_answer_packet_top_to_review_leads(
+    answer_packet: JsonObject, review_leads: JsonObject
+) -> None:
+    """N1: Clip each answer-packet top_* list to only rows present in review_leads.
+
+    Rows without a lead_id are kept as-is (they carry no cross-reference). Rows with a
+    lead_id are kept only if that lead_id appears in the corresponding review_leads list.
+    This prevents the incoherence where top_changed_symbols shows a symbol that was
+    evicted from review_leads.changed_symbols, which would make returned counts lie.
+    """
+    for ap_field, rl_field in _ANSWER_PACKET_TO_REVIEW_LEADS_FIELD.items():
+        ap_rows = answer_packet.get(ap_field)
+        if not isinstance(ap_rows, list):
+            continue
+        rl_rows = review_leads.get(rl_field)
+        if not isinstance(rl_rows, list):
+            # review_leads field absent or non-list → all rows without lead_id survive.
+            surviving_ids: set[str] = set()
+        else:
+            surviving_ids = {
+                row["lead_id"]
+                for row in rl_rows
+                if isinstance(row, dict) and isinstance(row.get("lead_id"), str) and row["lead_id"]
+            }
+        clipped = [
+            row
+            for row in ap_rows
+            if not isinstance(row, dict)
+            or not isinstance(row.get("lead_id"), str)
+            or not row.get("lead_id")
+            or row["lead_id"] in surviving_ids
+        ]
+        answer_packet[ap_field] = clipped
 
 
 def enforce_reverse_impact_budget(
@@ -1208,6 +1334,17 @@ def _compact_review_answer_packet(
             if truncated_sections is not None:
                 _record_truncated(truncated_sections, f"review_answer_packet.{field}", original=len(rows), kept=len(kept))
             compact[field] = kept
+    top_hypotheses = value.get("top_review_hypotheses")
+    if isinstance(top_hypotheses, list):
+        kept_hypotheses = [_compact_review_hypothesis(row) for row in top_hypotheses[:limit] if isinstance(row, dict)]
+        if truncated_sections is not None:
+            _record_truncated(
+                truncated_sections,
+                "review_answer_packet.top_review_hypotheses",
+                original=len(top_hypotheses),
+                kept=len(kept_hypotheses),
+            )
+        compact["top_review_hypotheses"] = kept_hypotheses
     for field in ("runtime", "framework", "application", "runtime_surfaces", "framework_impact", "application_impact"):
         nested = value.get(field)
         if isinstance(nested, dict):
@@ -2248,6 +2385,8 @@ def _compact_relation_rows(value: object, *, limit: int) -> list[JsonObject]:
         if not isinstance(row, dict):
             continue
         compact_row = {
+            "lead_id": row.get("lead_id"),
+            "lead_kind": row.get("lead_kind"),
             "predicate": row.get("predicate"),
             "depth": row.get("depth"),
             "traversal": row.get("traversal"),
@@ -2260,7 +2399,7 @@ def _compact_relation_rows(value: object, *, limit: int) -> list[JsonObject]:
         bridge = _compact_constructor_bridge(row.get("via_constructor_bridge"))
         if bridge:
             compact_row["via_constructor_bridge"] = bridge
-        rows.append(compact_row)
+        rows.append({k: v for k, v in compact_row.items() if v is not None})
     return rows
 
 
@@ -2279,6 +2418,8 @@ def _compact_relation_endpoint(value: object) -> object:
 def _compact_review_backfill_row(path: tuple[str, ...], row: object) -> object:
     if not isinstance(row, dict):
         return deepcopy(row)
+    if path[-1] in {"review_hypotheses", "top_review_hypotheses"}:
+        return _compact_review_hypothesis(row)
     if path[-1] in {
         "direct_callers",
         "direct_callees",
@@ -2329,6 +2470,8 @@ def _compact_symbol(value: object) -> JsonObject:
     if not isinstance(value, dict):
         return {}
     keys = (
+        "lead_id",
+        "lead_kind",
         "symbol_id",
         "display_name",
         "qualified_name",
@@ -2694,8 +2837,1104 @@ def _compact_source_check(row: JsonObject) -> JsonObject:
 
 
 def _compact_coordinate(row: JsonObject) -> JsonObject:
-    keys = ("repo", "path", "line_start", "line_end")
+    keys = ("lead_id", "lead_kind", "repo", "path", "line_start", "line_end")
     return {key: row[key] for key in keys if key in row}
+
+
+def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
+    compact: JsonObject = {}
+    for key in ("hypothesis_id", "risk_type", "confidence", "why"):
+        if key in row:
+            compact[key] = row[key]
+    evidence_refs = row.get("evidence_refs")
+    if isinstance(evidence_refs, list):
+        compact["evidence_refs"] = evidence_refs[:4]
+    source_checks = row.get("source_checks")
+    if isinstance(source_checks, list):
+        compact["source_checks"] = source_checks[:2]
+    supporting_lead_ids = row.get("supporting_lead_ids")
+    if isinstance(supporting_lead_ids, list):
+        compact["supporting_lead_ids"] = supporting_lead_ids[:5]
+    return compact
+
+
+def _protect_review_hypotheses_floor(
+    result: JsonObject, original_hypotheses: list[JsonObject], *, max_chars: int
+) -> JsonObject:
+    """Ensure at least 1 compacted hypothesis survives when any were originally generated.
+
+    Called after hard-cap or signal-cap passes that may have evicted all hypotheses while
+    keeping broad context rows. If the packet has no hypotheses but the original had some,
+    inserts the top compacted hypothesis in both the top-level list and the answer-packet
+    mirror, and, when the insertion pushes the packet over ``max_chars``, evicts rows from
+    the largest other row list until it fits again — broad context is dropped before the
+    last hypothesis, per the review budget priority order.
+    """
+    if not original_hypotheses:
+        return result
+    current = result.get("review_hypotheses")
+    if isinstance(current, list) and current:
+        return result
+    # Restore top 1 compacted hypothesis.
+    top_compact = _compact_review_hypothesis(original_hypotheses[0])
+    result = deepcopy(result)
+    result["review_hypotheses"] = [top_compact]
+    # Restore mirror floor too.
+    answer_packet = result.get("review_answer_packet")
+    if isinstance(answer_packet, dict):
+        mirror = answer_packet.get("top_review_hypotheses")
+        if not isinstance(mirror, list) or not mirror:
+            answer_packet["top_review_hypotheses"] = [top_compact]
+    truncated: set[str] = set()
+    budget = result.get("output_budget")
+    if isinstance(budget, dict):
+        truncated = set(budget.get("truncated_sections") or [])
+        if len(original_hypotheses) > 1:
+            truncated.add("review_hypotheses")
+            truncated.add("review_answer_packet.top_review_hypotheses")
+        else:
+            truncated.discard("review_hypotheses")
+            truncated.discard("review_answer_packet.top_review_hypotheses")
+    # Compensating eviction: the restored hypotheses must never push the packet over the cap.
+    evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
+    truncated |= evicted
+    if evicted:
+        _sync_review_lead_status_from_packet(result)
+    if isinstance(budget, dict):
+        budget["truncated_sections"] = sorted(truncated)
+    return result
+
+
+_REVIEW_BROAD_CONTEXT_KEYS = frozenset(
+    {
+        "application_impact",
+        "framework_impact",
+        "runtime_surfaces",
+        "impact",
+    }
+)
+
+
+def _is_broad_context_label(label: str) -> bool:
+    """Return True if the dotted path label is a broad application/runtime/framework section.
+
+    Both the top-level keys (e.g. ``application_impact``) and their mirrors inside
+    ``review_answer_packet`` (e.g. ``review_answer_packet.application``) qualify as
+    broad-context victims, so hypotheses can be funded before inspecting signal-heavy
+    lead/coordinate/anchor sections.
+    """
+    root = label.split(".")[0]
+    if root in _REVIEW_BROAD_CONTEXT_KEYS:
+        return True
+    if root == "review_answer_packet":
+        inner = label.split(".", 2)[1] if label.count(".") >= 1 else ""
+        broad_ap_keys = {"application", "framework", "runtime", "runtime_surfaces", "framework_impact", "application_impact"}
+        return inner in broad_ap_keys
+    return False
+
+
+def _evict_broad_context_to_fit(result: JsonObject, *, max_chars: int) -> set[str]:
+    """Evict rows from broad application/runtime/framework sections until the packet fits.
+
+    N2 targeted eviction: only broad-context lists (application_impact, framework_impact,
+    runtime_surfaces, and their answer-packet mirrors) are shrunk. Hypothesis lists, lead
+    rows, coordinates, and anchors are untouched. Returns the labels of lists that lost rows.
+    """
+    evicted: set[str] = set()
+    guard = 0
+    while _current_chars(result) > max_chars and guard < 5_000:
+        guard += 1
+        # Protect hypotheses while finding the broad-context victim
+        protected = result.pop("review_hypotheses", None)
+        answer_packet = result.get("review_answer_packet")
+        protected_mirror = None
+        if isinstance(answer_packet, dict):
+            protected_mirror = answer_packet.pop("top_review_hypotheses", None)
+        # Only consider broad-context lists as victims
+        target = _largest_broad_context_row_list(result)
+        if protected is not None:
+            result["review_hypotheses"] = protected
+        if isinstance(answer_packet, dict) and protected_mirror is not None:
+            answer_packet["top_review_hypotheses"] = protected_mirror
+        if target is None:
+            break
+        label, rows = target
+        rows.pop()
+        evicted.add(label)
+    return evicted
+
+
+def _largest_broad_context_row_list(node: object) -> tuple[str, list] | None:
+    """Find the largest broad-context (application/runtime/framework) list in the packet.
+
+    Only searches inside ``_REVIEW_BROAD_CONTEXT_KEYS`` sections and their
+    ``review_answer_packet.*`` mirrors, leaving lead/coordinate/anchor sections untouched.
+    """
+    best_size = 0
+    best: tuple[str, list] | None = None
+    stack: list[tuple[str, object]] = [("", node)]
+    while stack:
+        label, current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in _HARD_CAP_PROTECTED_KEYS or (not label and key in _HARD_CAP_PROTECTED_TOPLEVEL):
+                    continue
+                child_label = f"{label}.{key}" if label else key
+                if isinstance(value, list) and value and any(isinstance(x, dict) for x in value):
+                    if _is_broad_context_label(child_label):
+                        size = len(canonical_json(value))
+                        if size > best_size:
+                            best_size, best = size, (child_label, value)
+                # Only recurse into broad-context subtrees (or root dict)
+                if not label or _is_broad_context_label(child_label) or label == "review_answer_packet":
+                    stack.append((child_label, value))
+        elif isinstance(current, list):
+            for index, item in enumerate(current):
+                stack.append((f"{label}[{index}]", item))
+    return best
+
+
+def _is_review_leads_label(label: str) -> bool:
+    """Return True if the dotted label is a review_leads or answer-packet top_* field.
+
+    These are the lead rows that pair with answer-packet mirror rows. N1: they are
+    evicted last (after all other non-hypothesis victims are exhausted) so the pair
+    survives; when they must be evicted, the coherent drop of both sides is handled
+    by the subsequent _sync_review_lead_status_from_packet call.
+    """
+    root = label.split(".")[0]
+    if root == "review_leads":
+        return True
+    if root == "review_answer_packet":
+        inner = label.split(".", 2)[1] if label.count(".") >= 1 else ""
+        return inner in {"top_changed_symbols", "top_direct_callers", "top_direct_callees", "top_transitive_callers"}
+    return False
+
+
+def _largest_non_lead_row_list(node: object) -> tuple[str, list] | None:
+    """Find the largest row-list that is NOT a review_leads/top_* lead section or hypothesis list.
+
+    Used by N1 to prefer evicting other sections (broad context, anchors, etc.) before
+    touching the lead pairs that must stay coherent.
+    """
+    best_size = 0
+    best: tuple[str, list] | None = None
+    stack: list[tuple[str, object]] = [("", node)]
+    while stack:
+        label, current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in _HARD_CAP_PROTECTED_KEYS or (not label and key in _HARD_CAP_PROTECTED_TOPLEVEL):
+                    continue
+                child_label = f"{label}.{key}" if label else key
+                if isinstance(value, list) and value and any(isinstance(x, dict) for x in value):
+                    if not _is_review_leads_label(child_label):
+                        size = len(canonical_json(value))
+                        if size > best_size:
+                            best_size, best = size, (child_label, value)
+                stack.append((child_label, value))
+        elif isinstance(current, list):
+            for index, item in enumerate(current):
+                stack.append((f"{label}[{index}]", item))
+    return best
+
+
+def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]:
+    """Evict rows from the largest non-hypothesis row list until the packet fits.
+
+    N1 (flip): review_leads and answer-packet top_* lead rows are evicted last —
+    only after all other non-hypothesis victims (broad context, anchors, diff rows)
+    are exhausted. When a review_leads row must be evicted as a last resort, the
+    subsequent _sync_review_lead_status_from_packet call clips the corresponding
+    top_* mirror entry too (coherent drop of both sides). The subset invariant
+    (top_* ⊆ review_leads) is maintained throughout.
+
+    Both ``review_hypotheses`` and ``review_answer_packet.top_review_hypotheses`` are
+    protected: broad context rows are dropped before the last hypothesis, per the review
+    budget priority order. Mutates ``result`` in place and returns the labels of lists that
+    lost rows.
+    """
+    evicted: set[str] = set()
+    guard = 0
+    while _current_chars(result) > max_chars and guard < 5_000:
+        guard += 1
+        protected = result.pop("review_hypotheses", None)
+        answer_packet = result.get("review_answer_packet")
+        protected_mirror = None
+        if isinstance(answer_packet, dict):
+            protected_mirror = answer_packet.pop("top_review_hypotheses", None)
+        # N1: prefer non-lead victims; fall back to lead rows only when no other victims exist.
+        target = _largest_non_lead_row_list(result)
+        if target is None:
+            target = _largest_row_list(result)
+        if protected is not None:
+            result["review_hypotheses"] = protected
+        if isinstance(answer_packet, dict) and protected_mirror is not None:
+            answer_packet["top_review_hypotheses"] = protected_mirror
+        if target is None:
+            break
+        label, rows = target
+        rows.pop()
+        evicted.add(label)
+        # Tandem clipping: when a top-level detail list is evicted, pop the matching
+        # row from review_leads so the re-mirror at the end of finalize is guaranteed
+        # to be shrink-or-equal (never growth after the last cap check).
+        _TOPLEVEL_TO_REVIEW_LEADS: dict[str, str] = {
+            "changed_symbols": "changed_symbols",
+            "direct_callers": "direct_callers",
+            "direct_callees": "direct_callees",
+            "transitive_callers": "transitive_callers",
+        }
+        if label in _TOPLEVEL_TO_REVIEW_LEADS:
+            rl = result.get("review_leads")
+            if isinstance(rl, dict):
+                rl_field = _TOPLEVEL_TO_REVIEW_LEADS[label]
+                rl_rows = rl.get(rl_field)
+                if isinstance(rl_rows, list) and rl_rows and rl_rows is not rows:
+                    rl_rows.pop()
+                evicted.add(f"review_leads.{rl_field}")
+            _sync_review_lead_status_from_packet(result)
+        # N1 coherent drop: if we just evicted a review_leads row, sync the mirror
+        # immediately so the top_* entry is also removed — never leave mirror showing
+        # a lead_id that no longer exists in review_leads.
+        elif _is_review_leads_label(label):
+            _sync_review_lead_status_from_packet(result)
+    return evicted
+
+
+def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: list[JsonObject]) -> None:
+    """Write review_hypothesis_status in-place on result.
+
+    Emits the status dict so consumers can distinguish none-generated, budget-dropped,
+    mirror-only-dropped, and low-coverage paths without inspecting truncated_sections.
+    Exception: when even this status object would push the packet over max_chars and no
+    other rows are evictable, _finalize_review_hypothesis_budget drops it — the hard cap
+    always wins over metadata.
+
+    Fields:
+      available_count — hypotheses generated pre-budget
+      returned_count — top-level survivors
+      answer_packet_returned_count — mirror survivors in review_answer_packet.top_review_hypotheses
+      truncated_count — available - returned
+      reason — "none_generated" | "budget" | "low_coverage" | null
+      available_risk_types — sorted list of risk_type strings from the pre-budget generated set
+        (not truncated by budget; bounded at 12 entries; empty when no hypotheses generated)
+    """
+    _MAX_AVAILABLE_RISK_TYPES = 12
+    available = len(original_hypotheses)
+    returned = len([h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)])
+    answer_packet = result.get("review_answer_packet")
+    if isinstance(answer_packet, dict):
+        mirror_hyps = answer_packet.get("top_review_hypotheses")
+        mirror_count = len([h for h in _list_value(mirror_hyps) if isinstance(h, dict)])
+    else:
+        mirror_count = 0
+    truncated_count = available - returned
+    coverage_status = ""
+    lead_status = result.get("review_lead_status")
+    if isinstance(lead_status, dict):
+        coverage_status = lead_status.get("coverage_status") or ""
+    if available == 0 and coverage_status == "low_coverage":
+        reason: str | None = "low_coverage"
+    elif available == 0:
+        reason = "none_generated"
+    elif truncated_count > 0 or mirror_count < returned:
+        reason = "budget"
+    else:
+        reason = None
+    available_risk_types = sorted(
+        {str(h.get("risk_type") or "") for h in original_hypotheses if isinstance(h, dict) and h.get("risk_type")}
+    )[:_MAX_AVAILABLE_RISK_TYPES]
+    result["review_hypothesis_status"] = {
+        "available_count": available,
+        "returned_count": returned,
+        "answer_packet_returned_count": mirror_count,
+        "truncated_count": truncated_count,
+        "reason": reason,
+        "available_risk_types": available_risk_types,
+    }
+
+
+def _collect_surviving_lead_ids(result: JsonObject) -> set[str]:
+    """Return the set of lead_ids present in review_leads after all budget eviction."""
+    surviving: set[str] = set()
+    review_leads = result.get("review_leads")
+    if not isinstance(review_leads, dict):
+        return surviving
+    for rows in review_leads.values():
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    lead_id = row.get("lead_id")
+                    if isinstance(lead_id, str) and lead_id:
+                        surviving.add(lead_id)
+    return surviving
+
+
+def _reconcile_hypothesis_lead_ids(result: JsonObject) -> None:
+    """Filter supporting_lead_ids in hypotheses to only ids that survived budget eviction.
+
+    hypothesis_id is computed at producer time from the pre-budget lead set and must NOT
+    be recomputed here — attribution stability across compaction is the contract. Hypotheses
+    whose lead list empties are kept; evidence_refs still guide inspection.
+    """
+    surviving = _collect_surviving_lead_ids(result)
+    for hyp_list_key in ("review_hypotheses",):
+        hyp_list = result.get(hyp_list_key)
+        if not isinstance(hyp_list, list):
+            continue
+        for hyp in hyp_list:
+            if not isinstance(hyp, dict):
+                continue
+            lead_ids = hyp.get("supporting_lead_ids")
+            if isinstance(lead_ids, list):
+                hyp["supporting_lead_ids"] = [lid for lid in lead_ids if lid in surviving]
+    answer_packet = result.get("review_answer_packet")
+    if isinstance(answer_packet, dict):
+        top_hyps = answer_packet.get("top_review_hypotheses")
+        if isinstance(top_hyps, list):
+            for hyp in top_hyps:
+                if not isinstance(hyp, dict):
+                    continue
+                lead_ids = hyp.get("supporting_lead_ids")
+                if isinstance(lead_ids, list):
+                    hyp["supporting_lead_ids"] = [lid for lid in lead_ids if lid in surviving]
+
+
+def _group_changed_symbols_by_cluster(
+    review_leads: JsonObject,
+) -> dict[str, list[int]]:
+    """Group changed_symbol row indices in review_leads by their 'path' field.
+
+    Returns {path: [index, ...]} so callers can reorder rows by cluster.
+    """
+    clusters: dict[str, list[int]] = {}
+    rows = review_leads.get("changed_symbols")
+    if not isinstance(rows, list):
+        return clusters
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        path = row.get("path") or ""
+        if path not in clusters:
+            clusters[path] = []
+        clusters[path].append(i)
+    return clusters
+
+
+def _cluster_rank_key(
+    path: str,
+    cluster_lead_ids: list[str],
+    hyp_supporting_ids: set[str],
+    edge_count: int,
+) -> tuple[int, int, str]:
+    """Deterministic rank for a changed-file cluster.
+
+    Referenced-by-hypothesis clusters rank first (0), then by descending edge
+    count, then by path for tie-breaking. Lower tuple = higher rank = kept first.
+    """
+    referenced = any(lid in hyp_supporting_ids for lid in cluster_lead_ids)
+    return (0 if referenced else 1, -edge_count, path)
+
+
+def _snapshot_edge_counts(snapshot_review_leads: JsonObject) -> dict[str, int]:
+    """Count direct caller/callee edges per path from a pre-budget snapshot.
+
+    Used to keep re-interleave ranking consistent with the repair and P2 passes,
+    which also rank from the snapshot. Current compacted rows may have had edge rows
+    evicted, so ranking from them can give different orderings across the finalize loop.
+    """
+    counts: dict[str, int] = {}
+    for field in ("direct_callers", "direct_callees"):
+        for row in _list_value(snapshot_review_leads.get(field)):
+            if isinstance(row, dict):
+                p = row.get("path") or ""
+                counts[p] = counts.get(p, 0) + 1
+    return counts
+
+
+def _interleave_changed_symbols_by_cluster(
+    result: JsonObject,
+    *,
+    snapshot_edge_counts: dict[str, int] | None = None,
+) -> None:
+    """Reorder changed-symbol lead rows so rows interleave across clusters.
+
+    Cluster key: the changed-file ``path`` field on each row. One row from each
+    cluster is placed before any second row from any cluster, etc. (round-robin by
+    rank). Downstream row-limit sampling (``rows[:limit]`` in _compact_review_detail),
+    backfill order, and the tail-eviction logic in _evict_review_rows_to_fit then all
+    naturally preserve cluster coverage: the head of the list is one anchor per
+    cluster in rank order, so limits keep anchors first and tail pops drop the
+    lowest-priority extras first, then whole lowest-ranked clusters.
+
+    Reorders both ``review_leads.changed_symbols`` and the top-level
+    ``changed_symbols`` detail list (the compaction passes sample the top-level list
+    and sync it back into review_leads). Non-dict rows are preserved at the tail.
+
+    Cluster rank: hypothesis-referenced clusters first, then (descending direct-edge
+    count, ascending path). Deterministic.
+
+    ``snapshot_edge_counts``: when provided, use these pre-budget edge counts for
+    ranking instead of the current (possibly compacted) edge rows in ``result``.
+    This keeps re-interleave ranking consistent with the repair/P2 passes that also
+    rank from the snapshot.
+
+    Mutates result in place.
+    """
+    # Collect supporting_lead_ids from current hypotheses
+    hyp_supporting: set[str] = set()
+    for hyp in _list_value(result.get("review_hypotheses")):
+        if isinstance(hyp, dict):
+            for lid in _list_value(hyp.get("supporting_lead_ids")):
+                if isinstance(lid, str):
+                    hyp_supporting.add(lid)
+
+    if snapshot_edge_counts is not None:
+        edge_counts = snapshot_edge_counts
+    else:
+        # Count direct edges per path to rank clusters with no hypothesis reference.
+        # Prefer review_leads edge rows; fall back to the top-level detail lists.
+        review_leads = result.get("review_leads")
+        edge_source: JsonObject = review_leads if isinstance(review_leads, dict) else result
+        edge_counts = {}
+        for field in ("direct_callers", "direct_callees"):
+            rows = edge_source.get(field)
+            if not isinstance(rows, list):
+                rows = result.get(field) if isinstance(result.get(field), list) else []
+            for row in rows:
+                if isinstance(row, dict):
+                    p = row.get("path") or ""
+                    edge_counts[p] = edge_counts.get(p, 0) + 1
+
+    review_leads = result.get("review_leads")
+    if isinstance(review_leads, dict) and isinstance(review_leads.get("changed_symbols"), list):
+        review_leads["changed_symbols"] = _interleaved_cluster_order(
+            review_leads["changed_symbols"], hyp_supporting=hyp_supporting, edge_counts=edge_counts
+        )
+    if isinstance(result.get("changed_symbols"), list):
+        result["changed_symbols"] = _interleaved_cluster_order(
+            result["changed_symbols"], hyp_supporting=hyp_supporting, edge_counts=edge_counts
+        )
+
+
+def _interleaved_cluster_order(
+    rows: list, *, hyp_supporting: set[str], edge_counts: dict[str, int]
+) -> list:
+    """Return rows reordered round-robin across path clusters in cluster-rank order.
+
+    Within-cluster order is preserved. Non-dict rows are appended at the tail in
+    their original order. Single-cluster lists are returned unchanged.
+    """
+    if len(rows) <= 1:
+        return rows
+    cluster_indices: dict[str, list[int]] = {}
+    other_indices: list[int] = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            other_indices.append(i)
+            continue
+        path = row.get("path") or ""
+        if path not in cluster_indices:
+            cluster_indices[path] = []
+        cluster_indices[path].append(i)
+    if len(cluster_indices) <= 1:
+        return rows
+
+    def _rank(path: str) -> tuple[int, int, str]:
+        lead_ids = [rows[i].get("lead_id") or "" for i in cluster_indices[path]]
+        return _cluster_rank_key(path, lead_ids, hyp_supporting, edge_counts.get(path, 0))
+
+    ranked_paths = sorted(cluster_indices.keys(), key=_rank)
+    interleaved_indices: list[int] = []
+    iterators = [iter(cluster_indices[p]) for p in ranked_paths]
+    active = list(range(len(ranked_paths)))
+    while active:
+        next_active = []
+        for slot in active:
+            idx = next(iterators[slot], None)
+            if idx is not None:
+                interleaved_indices.append(idx)
+                next_active.append(slot)
+        active = next_active
+    interleaved_indices.extend(other_indices)
+    return [rows[i] for i in interleaved_indices]
+
+
+def _build_truncation_summary(
+    result: JsonObject,
+    original_review_leads: JsonObject,
+    original_hypotheses: list[JsonObject],
+) -> JsonObject:
+    """Build P2 truncation_summary from pre-budget lead counts vs current packet.
+
+    ``original_review_leads`` must be the pre-budget snapshot captured before any
+    compaction pass, so omitted counts reflect everything the reviewer lost — not just
+    finalize-stage eviction. ``original_hypotheses`` are the pre-budget hypotheses,
+    whose supporting_lead_ids still reference dropped leads (the in-packet copies are
+    reconciled to surviving leads only, which would erase risk_family attribution for
+    dropped clusters). Returns the summary dict. Bounded: <= 5 cluster rows.
+    """
+    review_leads = result.get("review_leads")
+    if not isinstance(review_leads, dict):
+        review_leads = {}
+
+    def _len_field(leads: JsonObject, field: str) -> int:
+        v = leads.get(field)
+        return len(v) if isinstance(v, list) else 0
+
+    omitted_changed_symbol_count = max(
+        0, _len_field(original_review_leads, "changed_symbols") - _len_field(review_leads, "changed_symbols")
+    )
+    omitted_direct_caller_count = max(
+        0, _len_field(original_review_leads, "direct_callers") - _len_field(review_leads, "direct_callers")
+    )
+    omitted_direct_callee_count = max(
+        0, _len_field(original_review_leads, "direct_callees") - _len_field(review_leads, "direct_callees")
+    )
+    omitted_transitive_caller_count = max(
+        0, _len_field(original_review_leads, "transitive_callers") - _len_field(review_leads, "transitive_callers")
+    )
+
+    # Find clusters whose changed_symbol rows were entirely omitted
+    original_cs = [r for r in _list_value(original_review_leads.get("changed_symbols")) if isinstance(r, dict)]
+    retained_cs = [r for r in _list_value(review_leads.get("changed_symbols")) if isinstance(r, dict)]
+    retained_lead_ids: set[str] = {r.get("lead_id") or "" for r in retained_cs}
+
+    # Group original rows by cluster (file path)
+    original_by_cluster: dict[str, list[dict]] = {}
+    for row in original_cs:
+        p = row.get("path") or ""
+        if p not in original_by_cluster:
+            original_by_cluster[p] = []
+        original_by_cluster[p].append(row)
+
+    # Collect hypothesis supporting ids to determine risk_family. Use the pre-budget
+    # hypotheses: in-packet copies had supporting_lead_ids reconciled to surviving leads,
+    # so dropped clusters would never match them.
+    hyp_supporting_by_risk: dict[str, set[str]] = {}
+    for hyp in original_hypotheses:
+        if not isinstance(hyp, dict):
+            continue
+        rt = str(hyp.get("risk_type") or "")
+        for lid in _list_value(hyp.get("supporting_lead_ids")):
+            if isinstance(lid, str):
+                if rt not in hyp_supporting_by_risk:
+                    hyp_supporting_by_risk[rt] = set()
+                hyp_supporting_by_risk[rt].add(lid)
+
+    # Edge count per path
+    edge_counts: dict[str, int] = {}
+    for field in ("direct_callers", "direct_callees"):
+        for row in _list_value(original_review_leads.get(field)):
+            if isinstance(row, dict):
+                p = row.get("path") or ""
+                edge_counts[p] = edge_counts.get(p, 0) + 1
+
+    # Clusters dropped entirely
+    dropped_clusters: list[tuple[tuple[int, int, str], str, list[dict]]] = []
+    for path, orig_rows in original_by_cluster.items():
+        if all((r.get("lead_id") or "") not in retained_lead_ids for r in orig_rows):
+            orig_ids = {r.get("lead_id") or "" for r in orig_rows}
+            hyp_ids = {lid for s in hyp_supporting_by_risk.values() for lid in s}
+            rank = _cluster_rank_key(path, list(orig_ids), hyp_ids, edge_counts.get(path, 0))
+            dropped_clusters.append((rank, path, orig_rows))
+
+    # Sort by rank (highest-priority dropped clusters first in summary)
+    dropped_clusters.sort(key=lambda t: t[0])
+
+    omitted_high_risk_clusters: list[JsonObject] = []
+    for _, path, orig_rows in dropped_clusters[:5]:
+        orig_ids_list = [r.get("lead_id") or "" for r in orig_rows if r.get("lead_id")]
+        orig_ids_set = set(orig_ids_list)
+        risk_family = None
+        for rt, lids in sorted(hyp_supporting_by_risk.items()):
+            if orig_ids_set & lids:
+                risk_family = rt
+                break
+        n_edges = edge_counts.get(path, 0)
+        if risk_family:
+            reason = f"referenced by hypothesis {risk_family}"
+        elif n_edges:
+            reason = f"{n_edges} direct edges"
+        else:
+            reason = "changed file with no retained symbols"
+        rep_syms = [
+            r.get("qualname") or r.get("name") or ""
+            for r in orig_rows[:3]
+            if isinstance(r, dict) and (r.get("qualname") or r.get("name"))
+        ]
+        omitted_high_risk_clusters.append({
+            "risk_family": risk_family,
+            "changed_files": [path],
+            "representative_symbols": rep_syms[:3],
+            "representative_lead_ids": orig_ids_list[:3],
+            "reason_ranked_high": reason,
+        })
+
+    return {
+        "omitted_changed_symbol_count": omitted_changed_symbol_count,
+        "omitted_direct_caller_count": omitted_direct_caller_count,
+        "omitted_direct_callee_count": omitted_direct_callee_count,
+        "omitted_transitive_caller_count": omitted_transitive_caller_count,
+        "omitted_high_risk_clusters": omitted_high_risk_clusters,
+    }
+
+
+def _repair_cluster_coverage(
+    result: JsonObject,
+    original_review_leads: JsonObject,
+    original_hypotheses: list[JsonObject],
+    *,
+    max_chars: int,
+) -> bool:
+    """P1 guarantee: restore >= 1 changed-symbol anchor per changed-file cluster.
+
+    Cluster key: the changed-file ``path`` on review_leads.changed_symbols rows.
+    The interleave ordering makes the row-limit and tail-eviction passes cluster-aware,
+    but the signal hard cap re-ranks rows by score and can leave one cluster holding
+    multiple rows while another holds none. This step enforces the binding rule
+    directly against the pre-budget snapshot: while an original cluster has no retained
+    anchor, swap in its first original row (compacted) by removing one row from a donor
+    cluster — the cluster with the most retained rows, tie-broken toward the
+    lowest-ranked cluster. When no cluster holds a 2nd row, a covered cluster that
+    ranks BELOW the uncovered one gives up its only anchor instead (whole lowest-ranked
+    clusters are dropped, not high-ranked ones). Swaps are approximately size-neutral;
+    the caller re-checks the cap afterwards.
+
+    Cluster rank: hypothesis-referenced (pre-budget hypotheses) first, then
+    (descending direct-edge count, ascending path). Returns True when rows changed.
+    """
+    review_leads = result.get("review_leads")
+    if not isinstance(review_leads, dict):
+        return False
+    retained = review_leads.get("changed_symbols")
+    if not isinstance(retained, list):
+        return False
+    original_rows = [
+        row for row in _list_value(original_review_leads.get("changed_symbols")) if isinstance(row, dict)
+    ]
+    if not original_rows:
+        return False
+    original_by_cluster: dict[str, list[JsonObject]] = {}
+    for row in original_rows:
+        path = row.get("path") or ""
+        if path not in original_by_cluster:
+            original_by_cluster[path] = []
+        original_by_cluster[path].append(row)
+    if len(original_by_cluster) <= 1:
+        return False
+    hyp_supporting: set[str] = set()
+    for hyp in original_hypotheses:
+        if isinstance(hyp, dict):
+            for lid in _list_value(hyp.get("supporting_lead_ids")):
+                if isinstance(lid, str):
+                    hyp_supporting.add(lid)
+    edge_counts: dict[str, int] = {}
+    for field in ("direct_callers", "direct_callees"):
+        for row in _list_value(original_review_leads.get(field)):
+            if isinstance(row, dict):
+                path = row.get("path") or ""
+                edge_counts[path] = edge_counts.get(path, 0) + 1
+
+    def _rank(path: str) -> tuple[int, int, str]:
+        lead_ids = [row.get("lead_id") or "" for row in original_by_cluster[path]]
+        return _cluster_rank_key(path, lead_ids, hyp_supporting, edge_counts.get(path, 0))
+
+    retained_counts: dict[str, int] = {}
+    for row in retained:
+        if isinstance(row, dict):
+            path = row.get("path") or ""
+            retained_counts[path] = retained_counts.get(path, 0) + 1
+    changed = False
+    for path in sorted(original_by_cluster, key=_rank):
+        if retained_counts.get(path, 0) > 0:
+            continue
+        donors = [p for p, count in retained_counts.items() if count >= 2 and p in original_by_cluster]
+        donor: str | None = None
+        if donors:
+            donor = max(donors, key=lambda p: (retained_counts[p], _rank(p)))
+        else:
+            singles = [p for p, count in retained_counts.items() if count == 1 and p in original_by_cluster]
+            if singles:
+                worst = max(singles, key=_rank)
+                if _rank(worst) > _rank(path):
+                    donor = worst
+        if donor is None:
+            # The best-ranked uncovered cluster cannot be funded; lower-ranked ones
+            # cannot either — they stay dropped whole and P2 records them.
+            break
+        for index in range(len(retained) - 1, -1, -1):
+            row = retained[index]
+            if isinstance(row, dict) and (row.get("path") or "") == donor:
+                del retained[index]
+                retained_counts[donor] -= 1
+                break
+        retained.append(_compact_symbol(original_by_cluster[path][0]))
+        retained_counts[path] = retained_counts.get(path, 0) + 1
+        changed = True
+    if changed:
+        # Keep the top-level changed_symbols detail list mirrored with review_leads
+        # (the compaction passes keep them in sync; repair must not desync them).
+        if isinstance(result.get("changed_symbols"), list):
+            result["changed_symbols"] = list(retained)
+        # Re-cluster the order so any later tail eviction drops extras before anchors.
+        # Use snapshot-derived edge counts (same source repair/P2 already rank from)
+        # so ranking is consistent regardless of which edge rows survived compaction.
+        _interleave_changed_symbols_by_cluster(result, snapshot_edge_counts=edge_counts)
+    return changed
+
+
+_REVIEW_HYPOTHESIS_HEADROOM_TARGET = 3
+
+
+def _restore_hypotheses_up_to_target(
+    result: JsonObject,
+    original_hypotheses: list[JsonObject],
+    *,
+    max_chars: int,
+    target: int,
+) -> set[str]:
+    """N2: Evict broad-context rows to fund up to ``target`` compacted hypotheses.
+
+    Priority order: hypotheses > leads > coordinates > anchors > inspection areas >
+    broad context. This step only evicts from broad application/runtime/framework sections
+    (and their answer-packet mirrors) — never from lead/coordinate/anchor sections.
+    Returns the set of section labels that had rows evicted.
+    """
+    if not original_hypotheses:
+        return set()
+    current_hyps = [h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)]
+    if len(current_hyps) >= min(target, len(original_hypotheses)):
+        return set()
+    evicted: set[str] = set()
+    # Try to restore hypotheses one by one (compacted), evicting broad context as needed.
+    for hyp in original_hypotheses[len(current_hyps) : target]:
+        compact_hyp = _compact_review_hypothesis(hyp)
+        hyp_cost = len(canonical_json(compact_hyp))
+        # Evict broad-context rows until there is room for this hypothesis.
+        broad_evicted = _evict_broad_context_to_fit(
+            result, max_chars=max(1, max_chars - hyp_cost - _HARD_CAP_AREA_RESERVE // 4)
+        )
+        evicted |= broad_evicted
+        # Re-check budget after broad eviction.
+        if _current_chars(result) + hyp_cost > max_chars:
+            break
+        # Append the hypothesis to the top-level list.
+        hyp_list = result.get("review_hypotheses")
+        if not isinstance(hyp_list, list):
+            result["review_hypotheses"] = [compact_hyp]
+        else:
+            hyp_list.append(compact_hyp)
+        if _current_chars(result) > max_chars:
+            # Didn't fit after all — roll back.
+            if isinstance(result.get("review_hypotheses"), list):
+                result["review_hypotheses"].pop()
+            break
+    return evicted
+
+
+def _finalize_review_hypothesis_budget(
+    result: JsonObject,
+    original_hypotheses: list[JsonObject],
+    *,
+    original_review_leads: JsonObject,
+    max_chars: int,
+) -> None:
+    """Sync the answer-packet mirror, attach review_hypothesis_status, and keep under the cap.
+
+    The status metadata is added after the budget passes measured the packet, so its extra
+    chars must be paid for by evicting broad rows — never by exceeding the cap and never by
+    dropping the protected hypotheses. Mutates ``result`` in place.
+
+    ``original_review_leads`` is the pre-budget review_leads snapshot captured before any
+    compaction pass in enforce_review_context_budget. It funds the P1 coverage repair and
+    the truthful P2 omitted counts.
+
+    P1: When the packet is still over the cap at entry, reorder changed_symbols so rows
+    interleave across clusters (changed file paths); the tail-eviction logic then retains
+    >= 1 anchor per cluster before a 2nd anchor from any single cluster. After eviction
+    stabilizes, _repair_cluster_coverage enforces the rule against the pre-budget snapshot
+    (the signal hard cap re-ranks rows cluster-blind and can violate it).
+
+    N2: Before syncing the mirror, attempt to restore up to min(3, available) compacted
+    hypotheses by evicting broad application/runtime/framework context first. This ensures
+    Grafana-shaped packets (modest headroom, fat broad sections) return top-3 hypotheses
+    instead of just the floor-of-1.
+
+    P2: After all eviction, attach truncation_summary to output_budget when truncated.
+    """
+    # P1: Interleave changed_symbols by cluster so eviction respects cluster coverage.
+    # Gated on budget pressure so packets that already fit keep their producer order.
+    # Use snapshot-derived edge counts to keep ranking consistent with repair/P2 passes.
+    _snap_edge_counts = _snapshot_edge_counts(original_review_leads)
+    if _current_chars(result) > max_chars:
+        _interleave_changed_symbols_by_cluster(result, snapshot_edge_counts=_snap_edge_counts)
+
+    # N2: Evict broad context to fund up to _REVIEW_HYPOTHESIS_HEADROOM_TARGET hypotheses.
+    broad_evicted = _restore_hypotheses_up_to_target(
+        result,
+        original_hypotheses,
+        max_chars=max_chars,
+        target=_REVIEW_HYPOTHESIS_HEADROOM_TARGET,
+    )
+    if broad_evicted:
+        _sync_review_lead_status_from_packet(result)
+        budget = result.get("output_budget")
+        if isinstance(budget, dict):
+            budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | broad_evicted)
+    # Sync mirror within budget: keep as many top-level hypotheses as fit in the mirror,
+    # starting from the highest-ranked (first). If none fit, mirror is empty — recorded in status.
+    _sync_review_hypothesis_mirror_within_budget(result, max_chars=max_chars)
+    _attach_review_hypothesis_status(result, original_hypotheses)
+    # The truncated_sections bookkeeping itself costs chars, so iterate until stable.
+    for _ in range(5):
+        evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
+        if not evicted:
+            break
+        _sync_review_lead_status_from_packet(result)
+        _attach_review_hypothesis_status(result, original_hypotheses)
+        budget = result.get("output_budget")
+        if isinstance(budget, dict):
+            budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
+    # P1: Enforce one-anchor-per-cluster against the pre-budget snapshot; the swaps are
+    # approximately size-neutral, so re-run the eviction/status cycle if the cap moved.
+    if _repair_cluster_coverage(result, original_review_leads, original_hypotheses, max_chars=max_chars):
+        _sync_review_lead_status_from_packet(result)
+        _attach_review_hypothesis_status(result, original_hypotheses)
+        evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
+        if evicted:
+            _sync_review_lead_status_from_packet(result)
+            _attach_review_hypothesis_status(result, original_hypotheses)
+            budget = result.get("output_budget")
+            if isinstance(budget, dict):
+                budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
+    # If nothing was evictable but the status field pushed the packet over the cap, drop it.
+    # review_hypothesis_status is optional metadata; the hard-cap guarantee wins.
+    if _current_chars(result) > max_chars:
+        result.pop("review_hypothesis_status", None)
+    # Drop stale lead IDs from hypotheses before sizing the truncation summary (the
+    # reconciliation frees chars the summary can use). hypothesis_id is intentionally not
+    # recomputed — it was stamped at producer time from the pre-budget set.
+    _reconcile_hypothesis_lead_ids(result)
+    # P2: Attach truncation_summary when the packet was truncated. The summary replaces
+    # bulk, so it may be funded by evicting low-priority rows (leads last); any lead rows
+    # it evicts become part of the omitted counts it reports.
+    _attach_truncation_summary_within_budget(
+        result, original_review_leads, original_hypotheses, max_chars=max_chars
+    )
+    # The funding eviction above may have dropped further lead rows; reconcile again so
+    # hypotheses never cite lead_ids that no longer exist in the packet.
+    _reconcile_hypothesis_lead_ids(result)
+    # Re-mirror top-level changed_symbols from review_leads.changed_symbols.
+    # _repair_cluster_coverage and the gated re-interleave both de-alias the two lists.
+    # Tandem clipping in _evict_review_rows_to_fit keeps review_leads.changed_symbols in
+    # sync with top-level evictions, so this re-mirror is guaranteed shrink-or-equal BY
+    # CONSTRUCTION — never a growth that would breach the cap.  It exists as cheap
+    # invariant enforcement (reorder/repair can shift the list objects) and to handle the
+    # _repair_cluster_coverage de-alias path.
+    _rl = result.get("review_leads")
+    if isinstance(_rl, dict) and isinstance(_rl.get("changed_symbols"), list):
+        _rl_cs = _rl["changed_symbols"]
+        if isinstance(result.get("changed_symbols"), list):
+            result["changed_symbols"] = list(_rl_cs)
+
+
+# Changed-symbol anchor lists are never evicted to fund the truncation summary: the
+# P1 coverage rule (one anchor per cluster) outranks P2 summary detail.
+_SUMMARY_FUNDING_PROTECTED_SUFFIXES = ("changed_symbols", "top_changed_symbols")
+
+
+def _largest_summary_funding_victim(node: object) -> tuple[str, list] | None:
+    """Largest row list that may fund the truncation summary.
+
+    Same walk as _largest_row_list, but changed-symbol anchor lists are excluded:
+    evicting an anchor to fund a summary row that describes its own omission would
+    invert the P1 > P2 priority.
+    """
+    best_size = 0
+    best: tuple[str, list] | None = None
+    stack: list[tuple[str, object]] = [("", node)]
+    while stack:
+        label, current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in _HARD_CAP_PROTECTED_KEYS or (not label and key in _HARD_CAP_PROTECTED_TOPLEVEL):
+                    continue
+                child_label = f"{label}.{key}" if label else key
+                if isinstance(value, list) and value and any(isinstance(x, dict) for x in value):
+                    if child_label.split(".")[-1] not in _SUMMARY_FUNDING_PROTECTED_SUFFIXES:
+                        size = len(canonical_json(value))
+                        if size > best_size:
+                            best_size, best = size, (child_label, value)
+                stack.append((child_label, value))
+        elif isinstance(current, list):
+            for index, item in enumerate(current):
+                stack.append((f"{label}[{index}]", item))
+    return best
+
+
+def _evict_summary_funding_rows(result: JsonObject, *, max_chars: int) -> set[str]:
+    """Evict rows to fund the truncation summary, protecting hypotheses and anchors.
+
+    Mirrors _evict_review_rows_to_fit (hypotheses and their mirror are shielded, lead
+    evictions immediately re-sync the answer-packet mirror) but never touches
+    changed-symbol anchor lists. Returns the labels of lists that lost rows.
+    """
+    evicted: set[str] = set()
+    guard = 0
+    while _current_chars(result) > max_chars and guard < 5_000:
+        guard += 1
+        protected = result.pop("review_hypotheses", None)
+        answer_packet = result.get("review_answer_packet")
+        protected_mirror = None
+        if isinstance(answer_packet, dict):
+            protected_mirror = answer_packet.pop("top_review_hypotheses", None)
+        target = _largest_summary_funding_victim(result)
+        if protected is not None:
+            result["review_hypotheses"] = protected
+        if isinstance(answer_packet, dict) and protected_mirror is not None:
+            answer_packet["top_review_hypotheses"] = protected_mirror
+        if target is None:
+            break
+        label, rows = target
+        rows.pop()
+        evicted.add(label)
+        if _is_review_leads_label(label):
+            _sync_review_lead_status_from_packet(result)
+    return evicted
+
+
+def _compact_omitted_cluster_row(row: JsonObject) -> JsonObject:
+    """Degraded omitted-cluster row: one representative instead of three."""
+    compact = dict(row)
+    for key in ("representative_symbols", "representative_lead_ids"):
+        value = compact.get(key)
+        if isinstance(value, list):
+            compact[key] = value[:1]
+    return compact
+
+
+def _attach_truncation_summary_within_budget(
+    result: JsonObject,
+    original_review_leads: JsonObject,
+    original_hypotheses: list[JsonObject],
+    *,
+    max_chars: int,
+) -> None:
+    """Attach output_budget.truncation_summary without ever exceeding the cap.
+
+    Attach counts first; when even the counts-only form does not fit, evict
+    low-priority rows to fund it (broad context first, lead rows last — the summary
+    replaces bulk per the head-start discipline) and rebuild the summary so its
+    counts stay truthful about the funding eviction. Then add omitted-cluster rows
+    one at a time while the packet stays under the cap. If nothing is evictable and
+    the summary cannot fit, it is dropped — the hard cap wins over metadata.
+    Zero-truncation packets get no truncation_summary.
+    """
+    budget = result.get("output_budget")
+    if not isinstance(budget, dict) or not budget.get("truncated"):
+        return
+    for _ in range(5):
+        ts = _build_truncation_summary(result, original_review_leads, original_hypotheses)
+        # Gate: broad-bulk-only truncation (no lead rows omitted, no dropped clusters)
+        # produces an all-zero summary that adds noise without value — skip it.
+        _omit_fields = (
+            "omitted_changed_symbol_count",
+            "omitted_direct_caller_count",
+            "omitted_direct_callee_count",
+            "omitted_transitive_caller_count",
+        )
+        if not any(ts.get(f) for f in _omit_fields) and not ts.get("omitted_high_risk_clusters"):
+            return
+        cluster_rows = list(ts.get("omitted_high_risk_clusters") or [])
+        ts["omitted_high_risk_clusters"] = []
+        budget["truncation_summary"] = ts
+        if _current_chars(result) > max_chars:
+            # Counts-only summary overflows: fund it by evicting rows while the summary
+            # is still attached (so eviction targets the packet-with-summary size), then
+            # rebuild the summary so the reported counts include the funding eviction.
+            evicted = _evict_summary_funding_rows(result, max_chars=max_chars)
+            budget.pop("truncation_summary", None)
+            if not evicted:
+                return
+            _sync_review_lead_status_from_packet(result)
+            _attach_review_hypothesis_status(result, original_hypotheses)
+            budget = result.get("output_budget")
+            if not isinstance(budget, dict):
+                return
+            budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
+            continue
+        # Counts fit; add cluster rows while the packet stays under the cap, funding
+        # each row that overflows by evicting non-anchor rows and degrading the row
+        # to a single representative before giving up on it.
+        funding_evicted: set[str] = set()
+        for row in cluster_rows:
+            attached = False
+            for candidate in (row, _compact_omitted_cluster_row(row)):
+                ts["omitted_high_risk_clusters"].append(candidate)
+                if _current_chars(result) <= max_chars:
+                    attached = True
+                    break
+                evicted = _evict_summary_funding_rows(result, max_chars=max_chars)
+                funding_evicted |= evicted
+                if _current_chars(result) <= max_chars:
+                    attached = True
+                    break
+                ts["omitted_high_risk_clusters"].pop()
+            if not attached:
+                break
+        if funding_evicted:
+            _sync_review_lead_status_from_packet(result)
+            _attach_review_hypothesis_status(result, original_hypotheses)
+            budget = result.get("output_budget")
+            if isinstance(budget, dict):
+                budget["truncated_sections"] = sorted(
+                    set(budget.get("truncated_sections") or []) | funding_evicted
+                )
+            # The funding eviction may have dropped further lead rows; refresh the
+            # summary count fields so they stay truthful (cluster rows stay as fitted).
+            refreshed = _build_truncation_summary(result, original_review_leads, original_hypotheses)
+            for key in (
+                "omitted_changed_symbol_count",
+                "omitted_direct_caller_count",
+                "omitted_direct_callee_count",
+                "omitted_transitive_caller_count",
+            ):
+                ts[key] = refreshed[key]
+        break
+    # Safety: never leave the packet over the cap because of the summary itself.
+    if isinstance(budget, dict) and _current_chars(result) > max_chars:
+        budget.pop("truncation_summary", None)
+
+
+_REVIEW_HYPOTHESIS_MIRROR_CAP = 3
+
+
+def _sync_review_hypothesis_mirror_within_budget(result: JsonObject, *, max_chars: int) -> None:
+    """Sync the mirror, adding rows only while the packet stays within max_chars.
+
+    Starts with an empty mirror and adds compacted top-level hypotheses one at a time,
+    stopping when the next row would exceed the cap. This keeps the mirror in sync with the
+    top-level list without growing the packet beyond the budget.
+    """
+    answer_packet = result.get("review_answer_packet")
+    if not isinstance(answer_packet, dict):
+        return
+    top_hyps = result.get("review_hypotheses")
+    if not isinstance(top_hyps, list):
+        answer_packet["top_review_hypotheses"] = []
+        return
+    # Start by clearing any existing mirror rows (they may be stale from a prior pass).
+    answer_packet["top_review_hypotheses"] = []
+    for hyp in top_hyps[:_REVIEW_HYPOTHESIS_MIRROR_CAP]:
+        if not isinstance(hyp, dict):
+            continue
+        compact_hyp = _compact_review_hypothesis(hyp)
+        answer_packet["top_review_hypotheses"].append(compact_hyp)
+        if _current_chars(result) > max_chars:
+            answer_packet["top_review_hypotheses"].pop()
+            break
 
 
 def _compact_diff_anchor(value: object) -> JsonObject:

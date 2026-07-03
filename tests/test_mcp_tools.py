@@ -10,10 +10,12 @@ from pathlib import Path
 
 from source.kg.core.models import Coverage, Entity, Evidence, Fact, canonical_json
 from source.kg.core.store import JsonlKgStore
+from source.kg.product.review_attribution import add_review_lead_ids
 from source.kg.product.application_impact import application_impact_packet
 from source.kg.product.mcp_tools import (
     ENDPOINT_PATH_SHAPE_MATCH_BASIS,
     TOOL_NAMES,
+    _optional_review_surfaces_tolerant,
     _planning_context_has_resolved_anchor,
     _planning_context_authz_surface_reference,
     _planning_context_symbol_impact,
@@ -147,6 +149,12 @@ class McpToolsTest(unittest.TestCase):
             self.assertIn("candidate_leads", description)
             self.assertIn("coverage_gaps", description)
             self.assertIn("inspection_areas", description)
+
+    def test_review_context_tool_mentions_review_hypotheses_and_hypothesis_id(self) -> None:
+        definitions = tool_definitions()
+        review_tool = next(tool for tool in definitions if tool["name"] == "review_context")
+        self.assertIn("review_hypotheses", review_tool["description"])
+        self.assertIn("hypothesis_id", review_tool["description"])
 
     def test_default_tool_metadata_treats_missing_status_as_answerable(self) -> None:
         payload = _with_default_tool_metadata({"services": [{"name": "api"}]}, tool_name="search_services")
@@ -1830,6 +1838,95 @@ class McpToolsTest(unittest.TestCase):
         self.assertNotIn("direct_callers", budgeted["output_budget"]["truncated_sections"])
         self.assertIn("review_leads.direct_callers", budgeted["output_budget"]["truncated_sections"])
 
+    def test_review_backfill_restores_hypothesis_when_headroom_allows(self) -> None:
+        # Packet where initial compaction keeps only 1 hypothesis but there is
+        # headroom to backfill the second.  After enforce_review_context_budget,
+        # both hypotheses must be present and review_lead_status.returned counts
+        # must reflect what is actually shown.
+        hyp1 = {
+            "hypothesis_id": "hyp_backfill_0",
+            "risk_type": "direct_call_contract_drift",
+            "confidence": "strong",
+            "why": "First hypothesis",
+            "evidence_refs": [{"repo": "repo", "path": "pkg/a.py", "line_start": 1}],
+            "source_checks": ["Check callers."],
+            "supporting_lead_ids": ["lead-1"],
+        }
+        hyp2 = {
+            "hypothesis_id": "hyp_backfill_1",
+            "risk_type": "test_locks_in_regression",
+            "confidence": "weak",
+            "why": "Second hypothesis",
+            "evidence_refs": [{"repo": "repo", "path": "tests/test_a.py", "line_start": 5}],
+            "source_checks": ["Check tests."],
+            "supporting_lead_ids": ["lead-2"],
+        }
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 1,
+            "changed_symbol_count": 1,
+            "direct_impact_count": 1,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+            "available": {"changed_symbol_count": 1, "direct_caller_count": 1},
+        }
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"direct_caller_count": 1},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "top_review_hypotheses": [hyp1, hyp2],
+            },
+            "review_hypotheses": [hyp1, hyp2],
+            "review_leads": {
+                "changed_files": ["pkg/a.py"],
+                "changed_symbols": [
+                    {"lead_id": "lead-1", "qualname": "func_a", "path": "pkg/a.py", "line_start": 1}
+                ],
+                "direct_callers": [
+                    {
+                        "predicate": "CALLS",
+                        "depth": 1,
+                        "subject": "pkg.b.caller",
+                        "object": "pkg.a.func_a",
+                        "lead_id": "lead-c1",
+                    }
+                ],
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": [
+                {
+                    "predicate": "CALLS",
+                    "depth": 1,
+                    "subject": "pkg.b.caller",
+                    "object": "pkg.a.func_a",
+                    "lead_id": "lead-c1",
+                }
+            ],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+        # Cap generous enough to fit both hypotheses but tight enough that we
+        # need the backfill path to exercise it.
+        budgeted = enforce_review_context_budget(result, max_chars=50_000)
+
+        hyps = budgeted.get("review_hypotheses", [])
+        self.assertEqual(len(hyps), 2, "backfill must restore both hypotheses when headroom allows")
+        hyp_ids = {h["hypothesis_id"] for h in hyps}
+        self.assertIn("hyp_backfill_0", hyp_ids)
+        self.assertIn("hyp_backfill_1", hyp_ids)
+
     def test_review_context_budget_degrades_to_lead_only_for_non_row_answer_packet_bloat(self) -> None:
         relation_rows = [
             {
@@ -1964,6 +2061,290 @@ class McpToolsTest(unittest.TestCase):
         result = {"tool": "review_context", "status": "found", "summary": {}, "direct_callers": [], "next_actions": []}
         self.assertIs(enforce_review_context_budget(result), result)
         self.assertNotIn("output_budget", result)
+
+    def test_review_context_budget_preserves_top_hypothesis_under_heavy_compaction(self) -> None:
+        # Build hypotheses with distinct hypothesis_ids ranked by position.
+        hypotheses = [
+            {
+                "hypothesis_id": f"hyp_{i}",
+                "risk_type": "data_mutation_risk",
+                "confidence": 0.9 - i * 0.1,
+                "why": f"Hypothesis {i} explanation with enough text to be substantial",
+                "evidence_refs": [{"repo": "repo", "path": f"pkg/hyp_{i}.py", "line_start": i, "line_end": i}],
+                "source_checks": [{"repo": "repo", "path": f"pkg/hyp_{i}.py"}],
+                "supporting_lead_ids": [f"lead_{i}"],
+                "payload": "h" * 500,
+            }
+            for i in range(5)
+        ]
+        # Many broad rows to dominate the budget.
+        broad_caller_rows = [
+            {
+                "predicate": "CALLS",
+                "depth": 1,
+                "subject": f"pkg.module_{i}.caller",
+                "object": "pkg.target.changed",
+                "evidence": [{"bytes_ref": {"repo": "repo", "path": f"pkg/module_{i}.py", "line_start": i, "line_end": i}}],
+                "payload": "z" * 1_200,
+            }
+            for i in range(80)
+        ]
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 0,
+            "changed_symbol_count": 0,
+            "direct_impact_count": 80,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+        }
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"direct_caller_count": 80},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "top_direct_callers": broad_caller_rows,
+                "top_review_hypotheses": hypotheses,
+                "application": {"runtime_facts": broad_caller_rows},
+                "framework": {"changed_models": broad_caller_rows},
+            },
+            "review_hypotheses": hypotheses,
+            "review_leads": {
+                "changed_files": ["pkg/module.py"],
+                "changed_symbols": [],
+                "direct_callers": broad_caller_rows,
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": broad_caller_rows,
+            "direct_callees": [],
+            "application_impact": {"runtime_facts": broad_caller_rows},
+            "framework_impact": {"changed_models": broad_caller_rows},
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+        budgeted = enforce_review_context_budget(result, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+
+        final_size = len(canonical_json(budgeted))
+        self.assertLessEqual(final_size, REVIEW_CONTEXT_MAX_CHARS)
+        # At least the top-ranked (first) hypothesis must survive; hypotheses backfill
+        # ahead of broad rows, so the top-3 target holds at the normal cap.
+        self.assertIsInstance(budgeted.get("review_hypotheses"), list)
+        self.assertGreaterEqual(len(budgeted["review_hypotheses"]), 3)
+        top_hyp = budgeted["review_hypotheses"][0]
+        self.assertEqual(top_hyp["hypothesis_id"], "hyp_0")
+        # Surviving hypotheses keep required compacted fields.
+        self.assertIn("risk_type", top_hyp)
+        self.assertIn("confidence", top_hyp)
+        self.assertIn("why", top_hyp)
+        self.assertIn("evidence_refs", top_hyp)
+        self.assertIn("source_checks", top_hyp)
+        self.assertIn("supporting_lead_ids", top_hyp)
+        # payload stripped by compaction.
+        self.assertNotIn("payload", top_hyp)
+
+    def test_review_context_budget_lead_only_preserves_top_hypothesis(self) -> None:
+        hypotheses = [
+            {
+                "hypothesis_id": f"hyp_{i}",
+                "risk_type": "auth_bypass_risk",
+                "confidence": 0.8,
+                "why": f"Hypothesis {i} reason",
+                "evidence_refs": [{"repo": "repo", "path": f"pkg/h_{i}.py", "line_start": i, "line_end": i}],
+                "source_checks": [{"repo": "repo", "path": f"pkg/h_{i}.py"}],
+                "supporting_lead_ids": [f"lead_{i}"],
+            }
+            for i in range(3)
+        ]
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 0,
+            "changed_symbol_count": 0,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+        }
+        # Force lead-only by stuffing a huge non-row string that survives compaction.
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "top_review_hypotheses": hypotheses,
+                "application": {"oversized_non_row_context": "z" * 50_000},
+            },
+            "review_hypotheses": hypotheses,
+            "review_leads": {
+                "changed_files": ["pkg/module.py"],
+                "changed_symbols": [],
+                "direct_callers": [],
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+
+        self.assertLessEqual(len(canonical_json(budgeted)), 10_000)
+        self.assertTrue(budgeted["output_budget"].get("lead_only"))
+        # Top hypothesis must survive even in lead-only path.
+        self.assertIsInstance(budgeted.get("review_hypotheses"), list)
+        self.assertGreater(len(budgeted["review_hypotheses"]), 0)
+        self.assertEqual(budgeted["review_hypotheses"][0]["hypothesis_id"], "hyp_0")
+
+    def test_review_context_budget_emits_hypothesis_status_when_truncated(self) -> None:
+        # Hypothesis rows are large enough (~2000 chars each when compacted) that
+        # only 1-3 fit within a 4500-char cap after backfill.  This guarantees
+        # truncation even with the now-working hypothesis backfill dispatch.
+        hypotheses = [
+            {
+                "hypothesis_id": f"hyp_{i}",
+                "risk_type": "data_mutation_risk",
+                "confidence": 0.7,
+                "why": f"Hypothesis {i} reason " + "w" * 1_200,
+                "evidence_refs": [
+                    {"repo": "repo", "path": f"pkg/h_{i}.py", "line_start": i, "line_end": i}
+                    for _ in range(3)
+                ],
+                "source_checks": [f"Check {i} step {j}" for j in range(2)],
+                "supporting_lead_ids": [f"lead_{i}_{j}" for j in range(5)],
+            }
+            for i in range(5)
+        ]
+        broad_caller_rows = [
+            {
+                "predicate": "CALLS",
+                "depth": 1,
+                "subject": f"pkg.module_{i}.caller",
+                "object": "pkg.target.changed",
+                "evidence": [{"bytes_ref": {"repo": "repo", "path": f"pkg/module_{i}.py", "line_start": i, "line_end": i}}],
+                "payload": "z" * 1_200,
+            }
+            for i in range(80)
+        ]
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 0,
+            "changed_symbol_count": 0,
+            "direct_impact_count": 80,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+        }
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"direct_caller_count": 80},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "top_direct_callers": broad_caller_rows,
+                "top_review_hypotheses": hypotheses,
+            },
+            "review_hypotheses": hypotheses,
+            "review_leads": {
+                "changed_files": ["pkg/module.py"],
+                "changed_symbols": [],
+                "direct_callers": broad_caller_rows,
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": broad_caller_rows,
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+        # 4,500 chars is tight enough that only some of the 5 large hypotheses fit.
+        budgeted = enforce_review_context_budget(result, max_chars=4_500)
+
+        self.assertLessEqual(len(canonical_json(budgeted)), 4_500)
+        returned_hyps = budgeted.get("review_hypotheses", [])
+        # Truncation must actually happen at this cap, and the floor must hold.
+        self.assertGreater(len(returned_hyps), 0)
+        self.assertLess(len(returned_hyps), 5)
+        self.assertEqual(returned_hyps[0]["hypothesis_id"], "hyp_0")
+        self.assertIn("review_hypothesis_status", budgeted)
+        status = budgeted["review_hypothesis_status"]
+        self.assertEqual(status["available_count"], 5)
+        self.assertEqual(status["returned_count"], len(returned_hyps))
+        self.assertIn("review_hypotheses", budgeted["output_budget"]["truncated_sections"])
+
+    def test_review_context_budget_hypothesis_status_none_generated_when_zero_hypotheses(self) -> None:
+        # Packet with no hypotheses: no fake hypothesis injected; status emitted with reason=none_generated.
+        review_lead_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "changed_anchor_count": 0,
+            "changed_symbol_count": 0,
+            "direct_impact_count": 0,
+            "transitive_impact_count": 0,
+            "source_coordinate_count": 0,
+            "file_anchor_count": 0,
+        }
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {},
+            "review_lead_status": review_lead_status,
+            "review_answer_packet": {
+                "status": "found",
+                "review_lead_status": review_lead_status,
+                "application": {"oversized_non_row_context": "z" * 50_000},
+            },
+            "review_leads": {
+                "changed_files": ["pkg/module.py"],
+                "changed_symbols": [],
+                "direct_callers": [],
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+            "next_actions": [],
+        }
+
+        budgeted = enforce_review_context_budget(result, max_chars=10_000)
+
+        self.assertLessEqual(len(canonical_json(budgeted)), 10_000)
+        self.assertNotIn("review_hypotheses", budgeted)
+        # K: status always present — even when zero hypotheses were generated.
+        status = budgeted.get("review_hypothesis_status")
+        self.assertIsNotNone(status, "review_hypothesis_status must be present even for zero-hypothesis packets")
+        self.assertEqual(status.get("available_count"), 0)
+        self.assertEqual(status.get("returned_count"), 0)
+        self.assertEqual(status.get("answer_packet_returned_count"), 0)
+        self.assertEqual(status.get("truncated_count"), 0)
+        self.assertEqual(status.get("reason"), "none_generated")
 
     def test_reverse_impact_callable_partition_rule(self) -> None:
         from source.kg.query.reverse_impact import _is_callable_symbol
@@ -3429,6 +3810,151 @@ class McpToolsTest(unittest.TestCase):
         self.assertIn("repo_dependencies", result["impact"])
         self.assertIn("runtime_surfaces", result)
 
+    def test_review_context_unknown_surfaces_degrade_to_status_rows(self) -> None:
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "requested_surfaces": ["rule_actions", "abilities", "authz", "tests"],
+                    "limit": 10,
+                },
+            )
+
+        self.assertEqual(result["status"], "found")
+        statuses = {row["surface"]: row for row in result["surface_status"]}
+        self.assertIn("rule_actions", statuses)
+        self.assertIn("abilities", statuses)
+        self.assertIn("authz", statuses)
+        self.assertIn("tests", statuses)
+        for token in ("rule_actions", "abilities", "authz", "tests"):
+            row = statuses[token]
+            self.assertEqual(row["status"], "unsupported_or_unlinked")
+            self.assertIn("source_inspection_terms", row)
+            terms = row["source_inspection_terms"]
+            self.assertIn(token, terms)
+        # split words present for multi-word token
+        self.assertIn("rule", statuses["rule_actions"]["source_inspection_terms"])
+        self.assertIn("actions", statuses["rule_actions"]["source_inspection_terms"])
+
+    def test_review_context_mixed_known_and_unknown_surfaces(self) -> None:
+        with _fixture_snapshot(app_surface=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "requested_surfaces": ["scheduled_jobs", "authz"],
+                    "limit": 10,
+                },
+            )
+
+        self.assertEqual(result["status"], "found")
+        statuses = {row["surface"]: row for row in result["surface_status"]}
+        # known surface behaves normally
+        self.assertIn("scheduled_jobs", statuses)
+        self.assertIn(statuses["scheduled_jobs"]["status"], {"inventory_context", "unlinked_lead", "missing"})
+        self.assertNotEqual(statuses["scheduled_jobs"]["status"], "unsupported_or_unlinked")
+        # unknown surface gets degraded row
+        self.assertIn("authz", statuses)
+        self.assertEqual(statuses["authz"]["status"], "unsupported_or_unlinked")
+        self.assertIn("authz", statuses["authz"]["source_inspection_terms"])
+
+    def test_review_context_unknown_surface_inspection_terms_include_changed_symbol_names(self) -> None:
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 1, "end_line": 200}],
+                    "requested_surfaces": ["ability_checks"],
+                    "limit": 10,
+                },
+            )
+
+        statuses = {row["surface"]: row for row in result["surface_status"]}
+        self.assertIn("ability_checks", statuses)
+        row = statuses["ability_checks"]
+        self.assertEqual(row["status"], "unsupported_or_unlinked")
+        terms = row["source_inspection_terms"]
+        # token and its split words
+        self.assertIn("ability_checks", terms)
+        self.assertIn("ability", terms)
+        self.assertIn("checks", terms)
+        # at most 5 symbol names appended (no duplicates in terms)
+        self.assertEqual(len(terms), len(set(terms)))
+
+    def test_review_context_unknown_surface_cap_applied(self) -> None:
+        # 12 unknown surfaces → at most 8 rows + omission count on last row
+        surfaces = [f"unknown_surface_{i}" for i in range(12)]
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "requested_surfaces": surfaces,
+                    "limit": 10,
+                },
+            )
+
+        unknown_rows = [r for r in result["surface_status"] if r.get("status") == "unsupported_or_unlinked"]
+        self.assertEqual(len(unknown_rows), 8)
+        last = unknown_rows[-1]
+        self.assertIn("omitted_unknown_surface_count", last)
+        self.assertEqual(last["omitted_unknown_surface_count"], 4)
+
+    def test_review_context_unknown_surface_token_truncated(self) -> None:
+        long_token = "x" * 300
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "requested_surfaces": [long_token],
+                    "limit": 10,
+                },
+            )
+
+        unknown_rows = [r for r in result["surface_status"] if r.get("status") == "unsupported_or_unlinked"]
+        self.assertEqual(len(unknown_rows), 1)
+        self.assertLessEqual(len(unknown_rows[0]["surface"]), 200)
+        for term in unknown_rows[0]["source_inspection_terms"]:
+            self.assertLessEqual(len(term), 200)
+
+    def test_review_context_unknown_surface_pathological_separators(self) -> None:
+        # pathological token with many single-char components → no 1-char terms, capped at 12
+        pathological_token = "a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r_s_t"
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "requested_surfaces": [pathological_token],
+                    "limit": 10,
+                },
+            )
+
+        unknown_rows = [r for r in result["surface_status"] if r.get("status") == "unsupported_or_unlinked"]
+        self.assertEqual(len(unknown_rows), 1)
+        row = unknown_rows[0]
+        terms = row["source_inspection_terms"]
+        # no 1-char terms
+        for term in terms:
+            self.assertGreaterEqual(len(term), 2, f"Found 1-char term: {term}")
+        # capped at 12
+        self.assertLessEqual(len(terms), 12)
+
     def test_review_context_surfaces_path_matched_endpoint_consumers(self) -> None:
         with _fixture_snapshot(endpoint_consumer=True) as kg:
             result = call_tool(
@@ -3942,6 +4468,42 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(packet["review_lead_status"]["changed_anchor_count"], 1)
         self.assertNotIn("reason", packet["review_lead_status"])
 
+    def test_review_context_leads_have_stable_ids_and_kinds(self) -> None:
+        with _fixture_snapshot(upstream_checkout_caller=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                },
+            )
+
+        for field, expected_kind in (
+            ("changed_symbols", "changed_symbol"),
+            ("direct_callers", "direct_caller"),
+            ("direct_callees", "direct_callee"),
+        ):
+            row = result["review_leads"][field][0]
+            self.assertEqual(row["lead_kind"], expected_kind)
+            self.assertRegex(row["lead_id"], rf"^lead:{expected_kind}:")
+
+        with _fixture_snapshot(upstream_checkout_caller=True) as kg2:
+            repeat = call_tool(
+                kg2,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                },
+            )
+        self.assertEqual(
+            result["review_leads"]["direct_callers"][0]["lead_id"],
+            repeat["review_leads"]["direct_callers"][0]["lead_id"],
+        )
+
     def test_review_context_changed_ranges_use_symbol_evidence_span(self) -> None:
         with _fixture_snapshot(
             symbol_without_end_line=True,
@@ -4074,7 +4636,7 @@ class McpToolsTest(unittest.TestCase):
         self.assertNotIn("framework_impact", result)
         self.assertEqual(result["omitted_context"]["counts"]["application_impact.cross_repo_name_leads"], 1)
         self.assertEqual(result["candidate_leads"]["status"], "empty")
-        self.assertLess(len(canonical_json(result)), 8_000)
+        self.assertLess(len(canonical_json(result)), 8_500)
         self.assertTrue(any("include_unlinked_leads=true" in action for action in result["next_actions"]))
 
     def test_review_context_file_anchor_only_can_opt_into_broad_unlinked_leads(self) -> None:
@@ -4255,6 +4817,40 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(anchors_by_path["payments/gateway.py"]["match_kind"], "changed_file_without_range")
         self.assertEqual(anchors_by_path["payments/gateway.py"]["symbol_count"], 1)
 
+    def test_review_context_live_packet_cluster_coverage(self) -> None:
+        """Task P spec 5: end-to-end call_tool review_context on a multi-file change.
+
+        Every changed file with indexed symbols is a cluster; the live packet must carry
+        >= 1 changed-symbol anchor (with lead_id) per cluster, and a packet that was not
+        truncated must not carry a truncation_summary.
+        """
+        with _fixture_snapshot() as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py", "payments/gateway.py"],
+                    "changed_ranges": [
+                        {"path": "payments/checkout.py", "start_line": 10, "end_line": 10},
+                        {"path": "payments/gateway.py", "start_line": 5, "end_line": 5},
+                    ],
+                    "limit": 10,
+                },
+            )
+
+        self.assertEqual(result["status"], "found")
+        leads = [row for row in result["review_leads"]["changed_symbols"] if isinstance(row, dict)]
+        self.assertTrue(leads, "live packet has no changed-symbol lead rows")
+        retained_paths = {row.get("path") for row in leads}
+        for path in ("payments/checkout.py", "payments/gateway.py"):
+            self.assertIn(path, retained_paths, f"cluster {path} has no changed-symbol anchor in live packet")
+        for row in leads:
+            self.assertTrue(row.get("lead_id"), f"lead row missing lead_id: {row}")
+        budget = result.get("output_budget") or {}
+        if not budget.get("truncated"):
+            self.assertNotIn("truncation_summary", budget)
+
     def test_review_context_missing_changed_file_still_returns_repo_dependencies(self) -> None:
         with _fixture_snapshot() as kg:
             result = call_tool(kg, "review_context", {"repo": "payments", "changed_files": ["payments/missing.py"]})
@@ -4330,16 +4926,7 @@ class McpToolsTest(unittest.TestCase):
                     "review_context",
                     {"repo": "payments", "changed_files": ["payments/checkout.py"], "changed_ranges": None},
                 )
-            with self.assertRaisesRegex(ValueError, "requested_surfaces.*unsupported"):
-                call_tool(
-                    kg,
-                    "review_context",
-                    {
-                        "repo": "payments",
-                        "changed_files": ["payments/checkout.py"],
-                        "requested_surfaces": ["campaign_specific_guess"],
-                    },
-                )
+            # Unknown surfaces no longer raise; they degrade to unsupported_or_unlinked status rows.
             with self.assertRaisesRegex(ValueError, "requested_surfaces.*list"):
                 call_tool(
                     kg,
@@ -5224,6 +5811,304 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(handler.sys_version, "")
         self.assertEqual(handler.version_string(fake_handler), "supercontext-local/0.1.0")
 
+    def test_review_context_budget_compaction_preserves_lead_ids_and_hypothesis_refs(self) -> None:
+        # Build a result with pre-stamped review_leads and hypotheses whose
+        # supporting_lead_ids reference those lead IDs. Force compaction and assert
+        # every surviving review_leads row has a lead_id and every hypothesis's
+        # supporting_lead_ids is a subset of the lead IDs still in the packet.
+        leads_pre = {
+            "changed_symbols": [
+                {
+                    "qualified_name": f"pkg.mod.sym_{i}",
+                    "repo": "repo",
+                    "path": f"pkg/mod_{i}.py",
+                    "line": i,
+                    "payload": "x" * 300,
+                }
+                for i in range(40)
+            ],
+            "direct_callers": [
+                {
+                    "predicate": "CALLS",
+                    "caller_symbol": {"qualified_name": f"pkg.caller_{i}", "repo": "repo", "path": f"pkg/c_{i}.py", "line": i},
+                    "evidence": [{"bytes_ref": {"repo": "repo", "path": f"pkg/c_{i}.py", "line_start": i, "line_end": i}}],
+                    "payload": "x" * 300,
+                }
+                for i in range(40)
+            ],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [
+                {"repo": "repo", "path": f"pkg/mod_{i}.py", "line_start": i, "line_end": i}
+                for i in range(40)
+            ],
+        }
+        stamped = add_review_lead_ids(leads_pre)
+        all_lead_ids = [
+            row["lead_id"]
+            for field in ("changed_symbols", "direct_callers", "source_coordinates")
+            for row in stamped.get(field, [])
+            if isinstance(row, dict) and "lead_id" in row
+        ]
+        hypothesis = {
+            "hypothesis_id": "hypothesis:test:abc123",
+            "risk_type": "direct_call_contract_drift",
+            "confidence": "medium",
+            "why": "test",
+            "evidence_refs": [],
+            "source_checks": ["check it"],
+            "supporting_lead_ids": all_lead_ids[:5],
+        }
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"changed_symbol_count": 40, "direct_caller_count": 40},
+            "review_lead_status": {
+                "coverage_status": "useful",
+                "recommended_action": "use_supercontext_packet",
+                "changed_anchor_count": 0,
+                "changed_symbol_count": 40,
+                "direct_impact_count": 40,
+                "transitive_impact_count": 0,
+                "source_coordinate_count": 40,
+                "file_anchor_count": 0,
+            },
+            "review_answer_packet": {
+                "status": "found",
+                "summary": {"changed_symbol_count": 40},
+                "top_changed_symbols": stamped["changed_symbols"][:5],
+                "top_direct_callers": stamped["direct_callers"][:5],
+                "top_direct_callees": [],
+                "top_transitive_callers": [],
+                "top_review_hypotheses": [hypothesis],
+            },
+            "review_leads": stamped,
+            "diff_anchors": [],
+            "changed_symbols": stamped["changed_symbols"],
+            "changed_file_symbols": [],
+            "direct_callers": stamped["direct_callers"],
+            "direct_callees": [],
+            "direct_callers_of_changed_symbols": stamped["direct_callers"],
+            "direct_callees_from_changed_symbols": [],
+            "transitive_callers": [],
+            "source_coordinates": stamped["source_coordinates"],
+            "review_hypotheses": [hypothesis],
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "next_actions": [],
+            "answerability": {"status": "answerable"},
+        }
+        # Use a budget that forces compaction but is large enough for the minimal packet.
+        budgeted = enforce_review_context_budget(result, max_chars=30_000)
+
+        self.assertTrue(budgeted.get("output_budget", {}).get("truncated"))
+        review_leads = budgeted.get("review_leads", {})
+        surviving_lead_ids = {
+            row["lead_id"]
+            for field in ("changed_symbols", "direct_callers", "source_coordinates")
+            for row in review_leads.get(field, [])
+            if isinstance(row, dict)
+        }
+        for field in ("changed_symbols", "direct_callers", "source_coordinates"):
+            for row in review_leads.get(field, []):
+                self.assertIn("lead_id", row, f"review_leads.{field} row missing lead_id after compaction")
+        hypotheses = budgeted.get("review_hypotheses") or []
+        for hyp in hypotheses:
+            for sid in (hyp.get("supporting_lead_ids") or []):
+                self.assertIn(sid, surviving_lead_ids, f"dangling supporting_lead_id {sid!r} not in surviving leads")
+
+    def test_review_lead_only_packet_includes_hypotheses(self) -> None:
+        # Force lead-only fallback by making the packet very large and checking
+        # that review_hypotheses survives in the output.
+        leads_pre = {
+            "changed_symbols": [
+                {"qualified_name": f"pkg.sym_{i}", "repo": "repo", "path": f"pkg/m_{i}.py", "line": i}
+                for i in range(5)
+            ],
+            "direct_callers": [],
+            "direct_callees": [],
+            "transitive_callers": [],
+            "source_coordinates": [],
+        }
+        stamped = add_review_lead_ids(leads_pre)
+        lead_ids = [r["lead_id"] for r in stamped["changed_symbols"] if isinstance(r, dict)]
+        hypothesis = {
+            "hypothesis_id": "hypothesis:direct_call_contract_drift:aaa",
+            "risk_type": "direct_call_contract_drift",
+            "confidence": "medium",
+            "why": "test hypothesis",
+            "evidence_refs": [{"repo": "repo", "path": "pkg/m_0.py"}],
+            "source_checks": ["check"],
+            "supporting_lead_ids": lead_ids[:2],
+        }
+        # Build a fat result so the lead-only path is reached.
+        fat_rows = [
+            {
+                "predicate": "CALLS",
+                "caller_symbol": {"qualified_name": f"pkg.c_{i}", "repo": "repo", "path": f"pkg/c_{i}.py", "line": i},
+                "evidence": [{"bytes_ref": {"repo": "repo", "path": f"pkg/c_{i}.py", "line_start": i, "line_end": i}}],
+                "payload": "x" * 2_000,
+            }
+            for i in range(200)
+        ]
+        result = {
+            "tool": "review_context",
+            "status": "found",
+            "repo": "repo",
+            "summary": {"changed_symbol_count": 5, "direct_caller_count": 200},
+            "review_lead_status": {
+                "coverage_status": "useful",
+                "recommended_action": "use_supercontext_packet",
+                "changed_anchor_count": 0,
+                "changed_symbol_count": 5,
+                "direct_impact_count": 200,
+                "transitive_impact_count": 0,
+                "source_coordinate_count": 0,
+                "file_anchor_count": 0,
+            },
+            "review_answer_packet": {
+                "status": "found",
+                "summary": {"changed_symbol_count": 5},
+                "top_changed_symbols": stamped["changed_symbols"],
+                "top_direct_callers": fat_rows[:5],
+                "top_direct_callees": [],
+                "top_transitive_callers": [],
+                "top_review_hypotheses": [hypothesis],
+            },
+            "review_leads": stamped,
+            "diff_anchors": [],
+            "changed_symbols": stamped["changed_symbols"],
+            "changed_file_symbols": [],
+            "direct_callers": fat_rows,
+            "direct_callees": fat_rows,
+            "direct_callers_of_changed_symbols": fat_rows,
+            "direct_callees_from_changed_symbols": fat_rows,
+            "transitive_callers": fat_rows,
+            "source_coordinates": [],
+            "review_hypotheses": [hypothesis],
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "next_actions": [],
+            "answerability": {"status": "answerable"},
+        }
+        # Use a budget large enough to hold the lead-only skeleton + one compact hypothesis
+        # but small enough to force the lead-only path (the fat_rows dominate the full packet).
+        budgeted = enforce_review_context_budget(result, max_chars=8_000)
+
+        self.assertIn("review_hypotheses", budgeted, "review_hypotheses missing from lead-only packet")
+        hyps = budgeted["review_hypotheses"]
+        self.assertTrue(hyps, "review_hypotheses is empty in lead-only packet")
+        self.assertEqual(hyps[0]["risk_type"], "direct_call_contract_drift")
+        self.assertLessEqual(len(canonical_json(budgeted)), 8_000)
+
+    def test_review_context_emits_direct_call_contract_hypothesis(self) -> None:
+        with _fixture_snapshot(upstream_checkout_caller=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                },
+            )
+
+        hypotheses = result["review_hypotheses"]
+        self.assertTrue(hypotheses)
+        first = hypotheses[0]
+        self.assertRegex(first["hypothesis_id"], r"^hypothesis:")
+        self.assertEqual(first["risk_type"], "direct_call_contract_drift")
+        self.assertIn(first["confidence"], {"medium", "strong"})
+        self.assertTrue(first["evidence_refs"])
+        self.assertTrue(first["source_checks"])
+        self.assertTrue(first["supporting_lead_ids"])
+        self.assertTrue(
+            set(first["supporting_lead_ids"]).issubset(
+                {
+                    row["lead_id"]
+                    for field in ("direct_callers", "direct_callees", "transitive_callers")
+                    for row in result["review_leads"].get(field, [])
+                }
+            )
+        )
+
+    def test_review_context_low_coverage_non_stylesheet_emits_empty_hypotheses(self) -> None:
+        with _fixture_snapshot(app_surface=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/config.yaml"],
+                    "changed_ranges": [{"path": "payments/config.yaml", "start_line": 4, "end_line": 6}],
+                    "limit": 10,
+                },
+            )
+        self.assertEqual(result["review_lead_status"]["coverage_status"], "low_coverage")
+        self.assertEqual(result["review_hypotheses"], [])
+
+    def test_review_context_stylesheet_low_coverage_emits_gap_hypothesis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            JsonlKgStore(root).write(entities=[], facts=[], evidence=[], coverage=[], manifest={"version": 1})
+            kg = KgSnapshot(root)
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "styles",
+                    "changed_files": ["app/assets/stylesheets/buttons.scss"],
+                    "changed_ranges": [{"path": "app/assets/stylesheets/buttons.scss", "start_line": 1, "end_line": 20}],
+                },
+            )
+        self.assertEqual(result["review_lead_status"]["coverage_status"], "low_coverage")
+        self.assertEqual(len(result["review_hypotheses"]), 1)
+        self.assertEqual(result["review_hypotheses"][0]["risk_type"], "low_coverage_stylesheet_gap")
+        self.assertIn("stylesheet", result["review_hypotheses"][0]["why"].lower())
+
+    def test_review_context_no_ranges_non_code_file_emits_empty_hypotheses(self) -> None:
+        # C2 regression: no changed_ranges + non-code file against an endpoint-bearing fixture
+        # must not emit runtime hypotheses even when the service has endpoints in the KG.
+        with _fixture_snapshot(app_surface=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {"repo": "payments", "changed_files": ["docs/README.md"]},
+            )
+        self.assertEqual(result["review_lead_status"]["coverage_status"], "low_coverage")
+        self.assertEqual(result["review_hypotheses"], [])
+
+    def test_review_context_producer_stamps_full_lists_before_slicing(self) -> None:
+        # Finding 1: producer-time stamping must use full in-scope lists so that
+        # summary counts and available counts reflect all callers (>5), not a
+        # truncated slice. extra_callers=6 + upstream_checkout_caller=True yields 7
+        # direct callers (verified by find_callers); the budget enforcer may then
+        # compact the top-level list, but summary/available must still show 7.
+        with _fixture_snapshot(upstream_checkout_caller=True, extra_callers=6) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                },
+            )
+        # summary.direct_caller_count must reflect all 7 callers, not a truncated 5
+        self.assertGreater(result["summary"]["direct_caller_count"], 5, "summary count must reflect full caller list")
+        # available count must also reflect the full list
+        available = result["review_lead_status"]["available"]
+        self.assertGreater(available["direct_caller_count"], 5, "available count must reflect full caller list")
+        # available >= returned (budget enforcer may compact the list)
+        returned = result["review_lead_status"]["returned"]
+        self.assertLessEqual(returned["direct_caller_count"], available["direct_caller_count"])
+        # all lead_ids in the lead packet must be a subset of top-level direct_callers lead_ids
+        top_level_lead_ids = {row["lead_id"] for row in result["direct_callers"] if isinstance(row, dict) and "lead_id" in row}
+        lead_packet_lead_ids = {row["lead_id"] for row in result["review_leads"].get("direct_callers", []) if isinstance(row, dict) and "lead_id" in row}
+        self.assertTrue(lead_packet_lead_ids, "lead packet direct_callers must be non-empty")
+        self.assertTrue(lead_packet_lead_ids.issubset(top_level_lead_ids), "lead packet lead_ids must be a subset of top-level lead_ids")
+
 
 class _constructor_reverse_impact_snapshot:
     def __enter__(self) -> KgSnapshot:
@@ -5571,6 +6456,7 @@ class _fixture_snapshot:
     def __init__(
         self,
         extra_consumers: int = 0,
+        extra_callers: int = 0,
         extra_package_importers: int = 0,
         extra_charge_card_symbol: bool = False,
         duplicate_endpoint_fact: bool = False,
@@ -5601,6 +6487,7 @@ class _fixture_snapshot:
         symbol_repo: str = "payments",
     ) -> None:
         self.extra_consumers = extra_consumers
+        self.extra_callers = extra_callers
         self.extra_package_importers = extra_package_importers
         self.extra_charge_card_symbol = extra_charge_card_symbol
         self.duplicate_endpoint_fact = duplicate_endpoint_fact
@@ -6047,6 +6934,21 @@ class _fixture_snapshot:
             )
             for index in range(self.extra_package_importers)
         ]
+        extra_caller_symbols = [
+            Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "payments",
+                    "module": f"payments.extra_{index}",
+                    "qualname": f"extra_caller_{index}",
+                    "symbol_kind": "function",
+                },
+                properties={"path": f"payments/extra_{index}.py", "line": index + 1, "end_line": index + 2},
+            )
+            for index in range(self.extra_callers)
+        ]
+        extra_caller_facts = [Fact("CALLS", sym.entity_id, caller.entity_id) for sym in extra_caller_symbols]
         extra_consume_facts = [Fact("CONSUMES_EVENT", extra_service.entity_id, channel.entity_id) for extra_service in extra_services]
         extra_import_facts = [
             Fact(
@@ -6253,6 +7155,7 @@ class _fixture_snapshot:
             *runtime_targets,
             *extra_services,
             *extra_modules,
+            *extra_caller_symbols,
         ]
         facts = [
             call_fact,
@@ -6276,6 +7179,7 @@ class _fixture_snapshot:
             *([endpoint_fact] if self.duplicate_endpoint_fact else []),
             *extra_consume_facts,
             *extra_import_facts,
+            *extra_caller_facts,
         ]
         JsonlKgStore(root).write(
             entities=entities,
@@ -6309,6 +7213,208 @@ class _FakeConnection:
 class _TimeoutReader:
     def read(self, size: int) -> bytes:
         raise TimeoutError("stalled")
+
+
+class TestNewHypothesisFamiliesIntegration(unittest.TestCase):
+    """Integration tests for the three new hypothesis families (F).
+
+    Each test builds a minimal JSONL snapshot then calls review_context end-to-end
+    to assert the corresponding risk_type surfaces in review_hypotheses.
+    """
+
+    def _build_snapshot(self, entities, facts, root):
+        JsonlKgStore(root).write(
+            entities=entities,
+            facts=facts,
+            evidence=[],
+            coverage=[],
+            manifest={"version": 1},
+        )
+        return KgSnapshot(root)
+
+    def test_component_list_render_identity_drift_fires_on_tsx_component(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            component = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "ui",
+                    "module": "src.ItemList",
+                    "qualname": "ItemList",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "src/ItemList.tsx", "line": 5, "end_line": 25},
+            )
+            row_component = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "ui",
+                    "module": "src.WidgetRow",
+                    "qualname": "WidgetRow",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "src/WidgetRow.tsx", "line": 1, "end_line": 10},
+            )
+            calls_fact = Fact("CALLS", component.entity_id, row_component.entity_id)
+            kg = self._build_snapshot([component, row_component], [calls_fact], root)
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "ui",
+                    "changed_files": ["src/ItemList.tsx"],
+                    "changed_ranges": [{"path": "src/ItemList.tsx", "start_line": 5, "end_line": 25}],
+                },
+            )
+        risk_types = [h["risk_type"] for h in result["review_hypotheses"]]
+        self.assertIn("component_list_render_identity_drift", risk_types)
+
+    def test_hook_gate_render_mismatch_fires_on_hook_with_component_consumer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hook = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "ui",
+                    "module": "src.useGate",
+                    "qualname": "useGate",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "src/useGate.ts", "line": 1, "end_line": 20},
+            )
+            consumer = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "ui",
+                    "module": "src.WidgetRow",
+                    "qualname": "WidgetRow",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "src/WidgetRow.tsx", "line": 1, "end_line": 15},
+            )
+            calls_fact = Fact("CALLS", consumer.entity_id, hook.entity_id)
+            kg = self._build_snapshot([hook, consumer], [calls_fact], root)
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "ui",
+                    "changed_files": ["src/useGate.ts"],
+                    "changed_ranges": [{"path": "src/useGate.ts", "start_line": 1, "end_line": 20}],
+                },
+            )
+        risk_types = [h["risk_type"] for h in result["review_hypotheses"]]
+        self.assertIn("hook_gate_render_mismatch", risk_types)
+
+    def test_test_locks_in_regression_fires_on_test_plus_code_with_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            code_sym = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "lib",
+                    "module": "src.processor",
+                    "qualname": "process",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "src/processor.py", "line": 10, "end_line": 30},
+            )
+            test_sym = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "lib",
+                    "module": "tests.test_processor",
+                    "qualname": "test_process",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "tests/test_processor.py", "line": 5, "end_line": 15},
+            )
+            calls_fact = Fact("CALLS", test_sym.entity_id, code_sym.entity_id)
+            kg = self._build_snapshot([code_sym, test_sym], [calls_fact], root)
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "lib",
+                    "changed_files": ["src/processor.py", "tests/test_processor.py"],
+                    "changed_ranges": [
+                        {"path": "src/processor.py", "start_line": 10, "end_line": 30},
+                        {"path": "tests/test_processor.py", "start_line": 5, "end_line": 15},
+                    ],
+                },
+            )
+        risk_types = [h["risk_type"] for h in result["review_hypotheses"]]
+        self.assertIn("test_locks_in_regression", risk_types)
+
+
+class TestHypothesisStatusE2E(unittest.TestCase):
+    """Task K test 6: E2E call_tool on the fixture snapshot produces review_hypothesis_status with consistent counts."""
+
+    def test_review_hypothesis_status_present_and_consistent_on_fixture(self) -> None:
+        with _fixture_snapshot(upstream_checkout_caller=True) as kg:
+            result = call_tool(
+                kg,
+                "review_context",
+                {
+                    "repo": "payments",
+                    "changed_files": ["payments/checkout.py"],
+                    "changed_ranges": [{"path": "payments/checkout.py", "start_line": 10, "end_line": 20}],
+                },
+            )
+
+        status = result.get("review_hypothesis_status")
+        self.assertIsNotNone(status, "review_hypothesis_status must be present in live call_tool result")
+        available = status.get("available_count", -1)
+        returned = status.get("returned_count", -1)
+        mirror_count = status.get("answer_packet_returned_count", -1)
+        truncated = status.get("truncated_count", -1)
+
+        # Counts must be non-negative integers
+        self.assertGreaterEqual(available, 0, "available_count must be >= 0")
+        self.assertGreaterEqual(returned, 0, "returned_count must be >= 0")
+        self.assertGreaterEqual(mirror_count, 0, "answer_packet_returned_count must be >= 0")
+        # truncated_count = available - returned
+        self.assertEqual(truncated, available - returned, "truncated_count must equal available_count - returned_count")
+        # returned <= available
+        self.assertLessEqual(returned, available, "returned_count must not exceed available_count")
+        # mirror <= returned
+        self.assertLessEqual(mirror_count, returned, "answer_packet_returned_count must not exceed returned_count")
+        # reason consistency
+        reason = status.get("reason")
+        if truncated == 0 and mirror_count == returned:
+            self.assertIsNone(reason, f"reason must be null when nothing truncated, got {reason!r}")
+        if truncated > 0 or mirror_count < returned:
+            self.assertIn(reason, ("budget", "none_generated", "low_coverage"), f"unexpected reason: {reason!r}")
+
+
+class TestOptionalReviewSurfacesTolerantDedupe(unittest.TestCase):
+    """Finding 2 (Copilot): unknown-surface dedupe must use normalized token so case/separator
+    variants that map to the same normalized form produce only one unknown row."""
+
+    def test_case_and_separator_variants_dedupe(self) -> None:
+        """AuthZ + authz and rule-actions + rule_actions → 2 unknown rows, first spelling kept."""
+        _surfaces, unknown = _optional_review_surfaces_tolerant(
+            {"requested_surfaces": ["AuthZ", "authz", "rule-actions", "rule_actions"]},
+            "requested_surfaces",
+        )
+        self.assertEqual(len(unknown), 2, f"expected 2 unknown rows, got {unknown}")
+        self.assertEqual(unknown[0], "AuthZ")
+        self.assertEqual(unknown[1], "rule-actions")
+
+    def test_identical_tokens_dedupe(self) -> None:
+        """Exact-same unknown token appears only once."""
+        _surfaces, unknown = _optional_review_surfaces_tolerant(
+            {"requested_surfaces": ["foobar", "foobar"]},
+            "requested_surfaces",
+        )
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0], "foobar")
 
 
 if __name__ == "__main__":
