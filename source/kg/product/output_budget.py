@@ -4195,6 +4195,77 @@ def _restore_hypotheses_up_to_target(
     return evicted
 
 
+_QUALITY_SPECIFICITY_RANK: dict[str, int] = {"high": 2, "medium": 1, "low": 0}
+
+
+def _sync_review_quality_status_from_packet(
+    result: JsonObject,
+    original_hypotheses: list[JsonObject],
+) -> None:
+    """Recompute review_quality_status counts from the FINAL review_hypotheses in result.
+
+    Mirrors the lead-status sync pattern: returned counts describe what is shown in the
+    packet after all budget passes. When truncation removed high-specificity rows that
+    were generated, ``generated_specific_hypothesis_count`` is added so the caller can
+    distinguish "none generated" from "generated but truncated".
+    """
+    status = result.get("review_quality_status")
+    if not isinstance(status, dict):
+        return
+    final_hyps = result.get("review_hypotheses")
+    if not isinstance(final_hyps, list):
+        return
+    specific_count = 0
+    generic_count = 0
+    max_spec = "low"
+    for h in final_hyps:
+        if not isinstance(h, dict):
+            continue
+        spec = str(h.get("specificity") or "low")
+        if spec in ("high", "medium"):
+            specific_count += 1
+        else:
+            generic_count += 1
+        if _QUALITY_SPECIFICITY_RANK.get(spec, 0) > _QUALITY_SPECIFICITY_RANK.get(max_spec, 0):
+            max_spec = spec
+    synced = dict(status)
+    synced["specific_hypothesis_count"] = specific_count
+    synced["generic_hypothesis_count"] = generic_count
+    synced["specificity"] = max_spec
+    if max_spec in ("high", "medium"):
+        synced["recommended_action"] = "use_supercontext_packet"
+        synced["reason"] = (
+            f"Packet contains {specific_count} specific hypothesis/es (specificity={max_spec}) "
+            "backed by signal or convention evidence."
+        )
+    else:
+        synced["recommended_action"] = "use_live_followups_or_plain_review"
+        # Preserve contract_diff_note in reason if present
+        base_reason = (
+            "All generated hypotheses are generic (no signal/delta or convention-specific evidence); "
+            "live source inspection will yield higher precision."
+        )
+        contract_note = status.get("contract_diff_note")
+        synced["reason"] = f"{base_reason} {contract_note}" if contract_note else base_reason
+    # Honesty: if truncation removed high-specificity rows that were generated, record the
+    # pre-budget count so the caller can distinguish "none generated" from "truncated away".
+    orig_specific = sum(
+        1
+        for h in original_hypotheses
+        if isinstance(h, dict) and str(h.get("specificity") or "low") in ("high", "medium")
+    )
+    if orig_specific > specific_count:
+        synced["generated_specific_hypothesis_count"] = orig_specific
+        if max_spec not in ("high", "medium"):
+            synced["reason"] = (
+                f"{synced['reason']} Note: {orig_specific} specific hypothesis/es were generated "
+                "but removed by budget truncation."
+            )
+    elif "generated_specific_hypothesis_count" in synced:
+        del synced["generated_specific_hypothesis_count"]
+    result["review_quality_status"] = synced
+
+
 def _finalize_review_hypothesis_budget(
     result: JsonObject,
     original_hypotheses: list[JsonObject],
@@ -4287,6 +4358,9 @@ def _finalize_review_hypothesis_budget(
     # The funding eviction above may have dropped further lead rows; reconcile again so
     # hypotheses never cite lead_ids that no longer exist in the packet.
     _reconcile_hypothesis_lead_ids(result)
+    # Sync review_quality_status counts from the FINAL review_hypotheses so specific/generic
+    # counts describe rows actually returned, not the pre-budget set.
+    _sync_review_quality_status_from_packet(result, original_hypotheses)
     # Re-mirror top-level changed_symbols from review_leads.changed_symbols.
     # _repair_cluster_coverage and the gated re-interleave both de-alias the two lists.
     # Tandem clipping in _evict_review_rows_to_fit keeps review_leads.changed_symbols in

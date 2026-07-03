@@ -2807,8 +2807,13 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         direct_callees.extend(callees.get("callees", []))
     repo_dependency_result = kg.repo_dependencies(repo, limit=detail_limit)
     repo_dependencies = list(repo_dependency_result.get("dependencies", []))
-    direct_callers = _review_context_dedupe_rows(direct_callers)[:detail_limit]
-    direct_callees = _review_context_dedupe_rows(direct_callees)[:detail_limit]
+    # Annotate and rank on a wider internal collection (4×detail_limit) so semantic rows
+    # beyond the first detail_limit positions survive role-based ranking before the public
+    # slice is applied. Without this, a persistence or external_side_effect callee beyond
+    # position detail_limit is irrecoverably dropped before rank_by_review_value runs.
+    _rank_limit = detail_limit * 4
+    direct_callers = _review_context_dedupe_rows(direct_callers)[:_rank_limit]
+    direct_callees = _review_context_dedupe_rows(direct_callees)[:_rank_limit]
     transitive_callers = _review_context_transitive_callers(
         kg, changed_symbols=changed_symbols, depth=3, limit=detail_limit
     )
@@ -2817,8 +2822,8 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     annotate_edge_roles(direct_callers, _edge_index, caller_perspective=True)
     annotate_edge_roles(direct_callees, _edge_index, caller_perspective=False)
     annotate_edge_roles(transitive_callers, _edge_index, caller_perspective=True)
-    direct_callers = rank_by_review_value(direct_callers)
-    direct_callees = rank_by_review_value(direct_callees)
+    direct_callers = rank_by_review_value(direct_callers)[:detail_limit]
+    direct_callees = rank_by_review_value(direct_callees)[:detail_limit]
     transitive_callers = rank_by_review_value(transitive_callers)
     runtime_surfaces = _review_context_runtime_surfaces(
         kg, repo=repo, changed_symbols=changed_symbols, limit=detail_limit
@@ -3264,6 +3269,19 @@ def _splice_contract_diff_hypotheses(
         if not hypothesis_id:
             # hypothesis_id is required for mirror pairing; skip rows missing it.
             continue
+        if risk_type == "guard_call_removed_drift":
+            negative_checks: list[str] = [
+                "Verify the removed call's effect is performed elsewhere or intentionally dropped; if the guarded invariant is enforced by another path or the call was dead code, this risk does not apply.",
+            ]
+        elif risk_type == "responsibility_moved_drift":
+            negative_checks = [
+                f"Check that {h.get('from_symbol', 'the original symbol')} survives in the head snapshot under the same or a new name; if the symbol is renamed and callers are updated consistently, this risk does not apply.",
+            ]
+        else:
+            # test_reference_removed_drift
+            negative_checks = [
+                "Verify the removed test reference was superseded by a broader or renamed test that still covers the same invariant; if coverage is maintained, this risk does not apply.",
+            ]
         spliced_row: JsonObject = {
             "hypothesis_id": hypothesis_id,
             "risk_type": risk_type,
@@ -3272,6 +3290,7 @@ def _splice_contract_diff_hypotheses(
             "concrete_invariant": h.get("concrete_invariant", ""),
             "why": h.get("why", ""),
             "source_checks": (h.get("source_checks") or [])[:2],
+            "negative_checks": negative_checks,
             "supporting_lead_ids": [],
             "evidence_refs": source_spans,
             "source_spans": source_spans,

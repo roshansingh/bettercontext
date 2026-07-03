@@ -71,6 +71,31 @@ _FAMILY_SPECIFICITY: dict[str, str] = {
 }
 
 
+_SPEC_RANK: dict[str, int] = {"high": 0, "medium": 1, "low": 2}
+
+
+def _sort_and_cap_hypotheses(hypotheses: list[JsonObject]) -> list[JsonObject]:
+    """Sort by signal strength, partition into high/medium/low specificity tiers, cap at 5.
+
+    Partition is applied to the FULL sorted list so a high-specificity row ranked 6th by
+    lead-count is not discarded before the tier ordering runs. Within each tier the 4-part
+    comparator order (lead count, evidence count, confidence, risk_type) is preserved.
+    """
+    hypotheses = list(hypotheses)
+    hypotheses.sort(
+        key=lambda row: (
+            -len(row.get("supporting_lead_ids") or []),
+            -len(row.get("evidence_refs") or []),
+            -_CONFIDENCE_RANK.get(str(row.get("confidence")), 0),
+            str(row.get("risk_type") or ""),
+        )
+    )
+    highs = [h for h in hypotheses if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 0]
+    mediums = [h for h in hypotheses if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 1]
+    lows = [h for h in hypotheses if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 2]
+    return (highs + mediums + lows)[:5]
+
+
 def review_hypotheses_for_context(
     *,
     changed_files: list[str],
@@ -190,25 +215,7 @@ def review_hypotheses_for_context(
     )
     if h:
         hypotheses.append(h)
-    hypotheses.sort(
-        key=lambda row: (
-            -len(row.get("supporting_lead_ids") or []),
-            -len(row.get("evidence_refs") or []),
-            -_CONFIDENCE_RANK.get(str(row.get("confidence")), 0),
-            str(row.get("risk_type") or ""),
-        )
-    )
-    cap = 5
-    selected = list(hypotheses[:cap])
-    # O2/B2: Three-tier partition — high-specificity first, medium second, low (generic) last.
-    # Within each tier, the 4-part comparator order above is preserved. Mirror slot selection
-    # takes the head of this order, so signal-backed families always outrank generics and
-    # test_locks (low specificity) never outranks a high-specificity hypothesis.
-    _SPEC_RANK = {"high": 0, "medium": 1, "low": 2}
-    highs = [h for h in selected if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 0]
-    mediums = [h for h in selected if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 1]
-    lows = [h for h in selected if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 2]
-    return highs + mediums + lows
+    return _sort_and_cap_hypotheses(hypotheses)
 
 
 def _has_framework_signal(framework_impact: JsonObject) -> bool:
