@@ -3100,6 +3100,10 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     # counts for available_count/available_by_risk_type so truncated_by_risk_type
     # includes cap-time drops (not just budget-time drops).
     generated_hypothesis_counts = _generated_hypothesis_counts(review_hypotheses)
+    # Full pre-cap hypothesis rows (private): the budget layer uses these to build
+    # inspection_areas for truncated high/medium rows dropped at cap AND budget time.
+    # Popped and never leaked to callers (see enforce_review_context_budget).
+    full_pre_cap_hypotheses = [row for row in review_hypotheses if isinstance(row, dict)]
     # Structural noise downranking: stably reorder within each derivation trust tier so
     # low-value deterministic rows (builtin/module-root call moves, test-only cause and
     # consequence) sink below high-value peers (concrete failure modes, changed-prod-file
@@ -3212,6 +3216,9 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         # Shared score-driven seat plan (private; consumed and removed by the review budget
         # layer so budget-time eviction reverses the SAME ordering the cap seated by).
         "_hypothesis_seat_plan": hypothesis_seat_plan,
+        # Full pre-cap hypothesis rows (private; consumed and removed by the review budget
+        # layer to build inspection_areas for truncated high/medium rows).
+        "_full_pre_cap_hypotheses": full_pre_cap_hypotheses,
     }
     if _review_context_should_compact_unanchored(
         changed_ranges=changed_ranges,

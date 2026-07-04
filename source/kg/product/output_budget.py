@@ -355,7 +355,14 @@ _HARD_CAP_AREA_RESERVE = 4_000
 # Tree keys whose lists are contracts/metadata, never row payloads to shrink.
 # Contracts/metadata: protected anywhere in the tree (small, never row payloads).
 _HARD_CAP_PROTECTED_KEYS = frozenset(
-    {"output_budget", "packet_contract", "claim_contract", "scope_contract", "answerability", "next_actions"}
+    {
+        "output_budget", "packet_contract", "claim_contract", "scope_contract",
+        "answerability", "next_actions",
+        # review_quality_status is a small routing scalar; its nested C1 inspection_areas
+        # block must never be silently row-evicted (truncation would imply absence). Its
+        # own char cost is bounded by _trim_review_quality_status_to_fit.
+        "review_quality_status",
+    }
 )
 # The common evidence index is already bounded by the minimal packet and carries its own
 # truncation markers; protect it only at the TOP level — same-named nested lists (e.g.
@@ -620,6 +627,15 @@ def enforce_review_context_budget(
     seat_plan = result.pop("_hypothesis_seat_plan", None)
     if not isinstance(seat_plan, dict):
         seat_plan = None
+    # Full pre-cap hypothesis rows threaded from the producer. Used to build
+    # inspection_areas for high/medium rows truncated at cap AND budget time. Pop so it
+    # never leaks to callers.
+    full_pre_cap = result.pop("_full_pre_cap_hypotheses", None)
+    full_pre_cap_hypotheses = (
+        [row for row in full_pre_cap if isinstance(row, dict)]
+        if isinstance(full_pre_cap, list)
+        else None
+    )
     measured = len(canonical_json(result))
     original_hypotheses = [
         row for row in _list_value(result.get("review_hypotheses")) if isinstance(row, dict)
@@ -633,7 +649,7 @@ def enforce_review_context_budget(
         # Sync mirror and emit status even when no compaction is needed so every packet
         # carries review_hypothesis_status regardless of packet size.
         _finalize_review_hypothesis_budget(
-            result, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan
+            result, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
         )
         return result
     if not include_broad_context:
@@ -648,7 +664,7 @@ def enforce_review_context_budget(
             seat_plan=seat_plan,
         )
         _finalize_review_hypothesis_budget(
-            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan
+            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
         )
         if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
             compact["output_budget"]["exceeded_after_minimization"] = True
@@ -680,7 +696,7 @@ def enforce_review_context_budget(
                 truncated_sections=truncated_sections,
             )
             _finalize_review_hypothesis_budget(
-                backfilled, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan
+                backfilled, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
             )
             return backfilled
     # Even the tightest pass overshot (rare: dominated by non-row content); signal it like
@@ -690,7 +706,7 @@ def enforce_review_context_budget(
     compact = _protect_review_hypotheses_floor(compact, original_hypotheses, max_chars=max_chars)
     if len(canonical_json(compact)) <= max_chars:
         _finalize_review_hypothesis_budget(
-            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan
+            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
         )
         return compact
     compact = _review_lead_only_budget_packet(
@@ -701,7 +717,7 @@ def enforce_review_context_budget(
         original_hypotheses=original_hypotheses,
     )
     _finalize_review_hypothesis_budget(
-        compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan
+        compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
     )
     if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
         compact["output_budget"]["exceeded_after_minimization"] = True
@@ -4614,9 +4630,15 @@ def _restore_hypotheses_up_to_target(
 _QUALITY_SPECIFICITY_RANK: dict[str, int] = {"high": 2, "medium": 1, "low": 0}
 
 
+_TRUNCATED_INSPECTION_AREA_CAP = 5
+
+
 def _sync_review_quality_status_from_packet(
     result: JsonObject,
     original_hypotheses: list[JsonObject],
+    *,
+    full_pre_cap_hypotheses: list[JsonObject] | None = None,
+    max_chars: int | None = None,
 ) -> None:
     """Recompute review_quality_status counts from the FINAL review_hypotheses in result.
 
@@ -4624,6 +4646,14 @@ def _sync_review_quality_status_from_packet(
     packet after all budget passes. When truncation removed high-specificity rows that
     were generated, ``generated_specific_hypothesis_count`` is added so the caller can
     distinguish "none generated" from "generated but truncated".
+
+    C1 (readiness honesty): when high/medium-specificity rows were truncated at cap OR
+    budget time — even if a high/medium row survived — review_readiness is downgraded to
+    ``needs_followup`` and the truncated high/medium rows are converted into compact
+    ``inspection_areas`` (capped, with a remainder count) plus concrete suggested_followups,
+    so truncation never implies the absence of those risks. ``full_pre_cap_hypotheses`` is
+    the producer's full pre-cap set; without it the capped set (``original_hypotheses``) is
+    used as the available set (back-compat for standalone callers/fixtures).
     """
     status = result.get("review_quality_status")
     if not isinstance(status, dict):
@@ -4682,13 +4712,40 @@ def _sync_review_quality_status_from_packet(
     ):
         if _s1_key in status:
             synced[_s1_key] = status[_s1_key]
-    # Minor 13: recompute review_readiness from the final (post-budget) max_spec and base_diff_status.
-    # Pre-budget max_spec may have been "high" (packet_ready) but after truncation all high-spec rows
-    # may be evicted, so review_readiness must be downgraded to reflect actual remaining content.
-    if max_spec in ("high", "medium"):
-        synced["review_readiness"] = "packet_ready"
-    elif base_diff_note == "missing":
+    # C1: identify high/medium rows truncated at cap OR budget time. The available set is
+    # the producer's full pre-cap list when threaded; otherwise the capped set. Returned
+    # rows are matched by stable hypothesis_id so cap-time and budget-time drops both count.
+    available_hyps = (
+        [h for h in full_pre_cap_hypotheses if isinstance(h, dict)]
+        if full_pre_cap_hypotheses is not None
+        else [h for h in original_hypotheses if isinstance(h, dict)]
+    )
+    returned_ids = {
+        str(h.get("hypothesis_id"))
+        for h in final_hyps
+        if isinstance(h, dict) and h.get("hypothesis_id")
+    }
+    truncated_specific_rows = [
+        h
+        for h in available_hyps
+        if str(h.get("specificity") or "low") in ("high", "medium")
+        and str(h.get("hypothesis_id")) not in returned_ids
+    ]
+    truncated_high_rows = [
+        h for h in truncated_specific_rows if str(h.get("specificity") or "low") == "high"
+    ]
+
+    # Minor 13 + C1: recompute review_readiness from the final (post-budget) max_spec and
+    # base_diff_status. Pre-budget max_spec may have been "high" (packet_ready) but after
+    # truncation the surviving rows may be low, so readiness must reflect actual content.
+    # C1: even when a high/medium row SURVIVED, downgrade packet_ready → needs_followup if
+    # any high/medium row was truncated — a partial packet is not ready to review from alone.
+    if base_diff_note == "missing" and max_spec not in ("high", "medium"):
         synced["review_readiness"] = "base_snapshot_required"
+    elif max_spec in ("high", "medium"):
+        synced["review_readiness"] = (
+            "needs_followup" if truncated_specific_rows else "packet_ready"
+        )
     else:
         # Preserve needs_followup/plain_review_better from status — those routing decisions depend
         # on suggested_followups content and remain valid post-budget.
@@ -4701,8 +4758,8 @@ def _sync_review_quality_status_from_packet(
     # pre-budget count so the caller can distinguish "none generated" from "truncated away".
     orig_specific = sum(
         1
-        for h in original_hypotheses
-        if isinstance(h, dict) and str(h.get("specificity") or "low") in ("high", "medium")
+        for h in available_hyps
+        if str(h.get("specificity") or "low") in ("high", "medium")
     )
     if orig_specific > specific_count:
         synced["generated_specific_hypothesis_count"] = orig_specific
@@ -4713,7 +4770,172 @@ def _sync_review_quality_status_from_packet(
             )
     elif "generated_specific_hypothesis_count" in synced:
         del synced["generated_specific_hypothesis_count"]
+
+    # C1: convert truncated high/medium rows into compact inspection_areas + concrete
+    # followups so truncation never implies absence. Only when readiness actually downgraded.
+    if synced.get("review_readiness") == "needs_followup" and truncated_specific_rows:
+        _attach_truncated_hypothesis_followups(
+            synced,
+            truncated_specific_rows=truncated_specific_rows,
+            truncated_high_rows=truncated_high_rows,
+        )
+    else:
+        synced.pop("inspection_areas", None)
+
     result["review_quality_status"] = synced
+    # C1: fund the added inspection_areas/followups inside the hard cap by evicting broad
+    # rows if the status object now overshoots. The hard cap always wins over the affordance.
+    if max_chars is not None and _current_chars(result) > max_chars:
+        _trim_review_quality_status_to_fit(result, max_chars=max_chars)
+
+
+def _inspection_area_from_hypothesis(row: JsonObject) -> JsonObject:
+    """Compact inspection_area from a truncated hypothesis row.
+
+    Structural fields only (no text parsing): coords sourced from the row's cause, then
+    consequence, then first source_span. Shape: {repo, path, line, symbol/qualname (when
+    available), risk_type, search_terms}. Empty coord keys are omitted so the row stays lean.
+    """
+    coord: JsonObject = {}
+    for candidate in (row.get("cause"), row.get("consequence")):
+        if isinstance(candidate, dict):
+            coord = candidate
+            break
+    if not coord:
+        spans = row.get("source_spans")
+        if isinstance(spans, list) and spans and isinstance(spans[0], dict):
+            coord = spans[0]
+    area: JsonObject = {"risk_type": str(row.get("risk_type") or "")}
+    repo = coord.get("repo")
+    if repo:
+        area["repo"] = str(repo)
+    path = coord.get("path")
+    if path:
+        area["path"] = str(path)
+    line = coord.get("line_start")
+    if line is None:
+        line = coord.get("line")
+    if isinstance(line, int):
+        area["line"] = line
+    symbol = coord.get("qualname") or coord.get("qualified_name")
+    if symbol:
+        area["symbol"] = str(symbol)
+    label = row.get("label")
+    if label:
+        area["label"] = str(label)
+    search_terms: list[str] = []
+    if symbol:
+        search_terms.append(str(symbol))
+    callee = coord.get("callee") or coord.get("call")
+    if callee:
+        search_terms.append(str(callee))
+    if search_terms:
+        area["search_terms"] = search_terms
+    return area
+
+
+def _attach_truncated_hypothesis_followups(
+    synced: JsonObject,
+    *,
+    truncated_specific_rows: list[JsonObject],
+    truncated_high_rows: list[JsonObject],
+) -> None:
+    """Populate inspection_areas (capped, with remainder count) and merge concrete
+    suggested_followups for truncated high-specificity families onto ``synced`` in place."""
+    areas = [
+        _inspection_area_from_hypothesis(h)
+        for h in truncated_specific_rows[:_TRUNCATED_INSPECTION_AREA_CAP]
+    ]
+    if areas:
+        block: JsonObject = {"areas": areas}
+        remaining = len(truncated_specific_rows) - len(areas)
+        if remaining > 0:
+            block["omitted_count"] = remaining
+        synced["inspection_areas"] = block
+    # One concrete followup per truncated high-specificity family (re-run narrowed).
+    existing_followups = [
+        f for f in _list_value(synced.get("suggested_followups")) if isinstance(f, dict)
+    ]
+    seen_families = {
+        str(f.get("risk_type")) for f in existing_followups if f.get("risk_type")
+    }
+    new_followups: list[JsonObject] = []
+    for row in truncated_high_rows:
+        rt = str(row.get("risk_type") or "")
+        if not rt or rt in seen_families:
+            continue
+        seen_families.add(rt)
+        area = _inspection_area_from_hypothesis(row)
+        path = area.get("path")
+        symbol = area.get("symbol")
+        anchor = symbol or path or rt
+        new_followups.append({
+            "tool": "review_context",
+            "risk_type": rt,
+            "why": (
+                f"Truncated high-specificity {rt} hypothesis on {anchor}; re-run review_context "
+                "narrowed to that path/symbol to surface it and its evidence in full."
+            ),
+        })
+    if new_followups:
+        synced["suggested_followups"] = existing_followups + new_followups
+
+
+def _trim_review_quality_status_to_fit(result: JsonObject, *, max_chars: int) -> None:
+    """Shrink the C1 inspection_areas affordance until the packet fits the hard cap.
+
+    Evicts inspection_area rows (tracking the omitted count) before dropping the block, so
+    the hard-cap guarantee always wins while preserving the remainder count as honesty."""
+    status = result.get("review_quality_status")
+    if not isinstance(status, dict):
+        return
+    block = status.get("inspection_areas")
+    if isinstance(block, dict):
+        areas = [a for a in _list_value(block.get("areas")) if isinstance(a, dict)]
+        while areas and _current_chars(result) > max_chars:
+            areas.pop()
+            block["omitted_count"] = int(block.get("omitted_count") or 0) + 1
+            block["areas"] = areas
+        if not areas or _current_chars(result) > max_chars:
+            status.pop("inspection_areas", None)
+
+
+# C2/rec-6: instruction telling ANY consuming agent (any harness) to cite the labels in
+# findings that rely on them, so downstream reviewer TPs carry measurable attribution.
+_ATTRIBUTION_LABELS_INSTRUCTION = (
+    "Cite the matching label in any review finding that relies on a returned hypothesis."
+)
+
+
+def _attach_attribution_labels(result: JsonObject, *, max_chars: int) -> None:
+    """Attach review_answer_packet.attribution_labels — a compact affordance at the top of
+    the answer packet listing the returned hypothesis labels plus a cite instruction.
+
+    Computed from the FINAL top-level review_hypotheses so the labels exactly match the
+    rows the packet returned. Dropped if it would push the packet over the hard cap.
+    """
+    answer_packet = result.get("review_answer_packet")
+    if not isinstance(answer_packet, dict):
+        return
+    labels: list[str] = []
+    seen: set[str] = set()
+    for h in _list_value(result.get("review_hypotheses")):
+        if not isinstance(h, dict):
+            continue
+        label = h.get("label")
+        if isinstance(label, str) and label and label not in seen:
+            seen.add(label)
+            labels.append(label)
+    if not labels:
+        answer_packet.pop("attribution_labels", None)
+        return
+    answer_packet["attribution_labels"] = {
+        "labels": labels,
+        "instruction": _ATTRIBUTION_LABELS_INSTRUCTION,
+    }
+    # Hard cap wins over the affordance.
+    if _current_chars(result) > max_chars:
+        answer_packet.pop("attribution_labels", None)
 
 
 def _finalize_review_hypothesis_budget(
@@ -4724,6 +4946,7 @@ def _finalize_review_hypothesis_budget(
     max_chars: int,
     generated_counts: JsonObject | None = None,
     seat_plan: JsonObject | None = None,
+    full_pre_cap_hypotheses: list[JsonObject] | None = None,
 ) -> None:
     """Sync the answer-packet mirror, attach review_hypothesis_status, and keep under the cap.
 
@@ -4813,8 +5036,16 @@ def _finalize_review_hypothesis_budget(
     # hypotheses never cite lead_ids that no longer exist in the packet.
     _reconcile_hypothesis_lead_ids(result)
     # Sync review_quality_status counts from the FINAL review_hypotheses so specific/generic
-    # counts describe rows actually returned, not the pre-budget set.
-    _sync_review_quality_status_from_packet(result, original_hypotheses)
+    # counts describe rows actually returned, not the pre-budget set. Also downgrades
+    # review_readiness and attaches inspection_areas when high/medium rows were truncated.
+    _sync_review_quality_status_from_packet(
+        result, original_hypotheses, full_pre_cap_hypotheses=full_pre_cap_hypotheses,
+        max_chars=max_chars,
+    )
+    # Attribution-label affordance (C2/rec-6): mirror the returned hypothesis labels to the
+    # TOP of the answer packet so downstream reviewer findings can cite them. Recomputed here
+    # (after all eviction) so labels match the FINAL returned rows. Kept under the cap.
+    _attach_attribution_labels(result, max_chars=max_chars)
     # Re-mirror top-level changed_symbols from review_leads.changed_symbols.
     # _repair_cluster_coverage and the gated re-interleave both de-alias the two lists.
     # Tandem clipping in _evict_review_rows_to_fit keeps review_leads.changed_symbols in
