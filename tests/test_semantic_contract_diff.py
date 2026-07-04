@@ -73,7 +73,9 @@ class _FakeClient:
     """Deterministic fake LLM client — returns fixed valid JSON via LlmResult."""
 
     def __init__(self, response: list | None = None, raise_import: bool = False, return_malformed: bool = False):
-        self._response = response or _FAKE_RESPONSE
+        # `is None` (not falsy-or): an explicit empty list [] is a meaningful
+        # "no changes found" response and must not silently swap to the default.
+        self._response = _FAKE_RESPONSE if response is None else response
         self._raise_import = raise_import
         self._return_malformed = return_malformed
         self.call_count = 0
@@ -3842,6 +3844,31 @@ class TestViolatedInvariantSchema(unittest.TestCase):
             self.assertGreater(len(valid_rows), 0, "valid-schema response must produce rows")
             self.assertEqual(valid_status, "active",
                              f"valid-schema response must be 'active'; got {valid_status!r}")
+
+    def test_parsed_empty_list_is_valid_no_changes_and_stays_active(self) -> None:
+        """A parsed EMPTY list ([]) is a valid 'no behavioral contract changes found'
+        answer to the 'up to 2 changes' prompt — it must stay 'active', never be
+        misclassified as 'failed:no_valid_claims'. Failure requires candidate items
+        that existed and did not survive; [] has no candidates at all.
+        """
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _FakeClient(response=[])
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=client,
+            )
+            self.assertGreater(client.call_count, 0,
+                               "test must actually attempt an LLM call")
+            self.assertEqual(rows, [], "empty response must produce no rows")
+            self.assertEqual(status, "active",
+                             f"parsed empty list is a clean no-op and must stay 'active'; got {status!r}")
 
     def test_oversized_new_field_dropped(self) -> None:
         """violated_invariant > _DROP_VIOLATED_INVARIANT (1200) → item dropped entirely.

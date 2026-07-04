@@ -367,7 +367,9 @@ def semantic_contract_diff(
       "partial:auth"                  — partial rows returned but some calls hit auth errors
       "failed:unreadable_sources"     — all source-body reads failed before any LLM call
       "failed:all_responses_unparseable" — calls completed but no response parsed to a usable list
-      "failed:no_valid_claims"        — response(s) parsed to a list but every item failed schema validation
+      "failed:no_valid_claims"        — parsed list(s) contained candidate items but none survived
+                                        schema validation / drop thresholds / dedupe into rows;
+                                        a parsed EMPTY list is a valid "no changes" and stays active
 
     Each row is a candidate-class hypothesis only — never stored as a canonical fact.
 
@@ -449,6 +451,7 @@ def semantic_contract_diff(
     calls_failed = 0
     parse_miss_count = 0
     parsed_ok_count = 0  # responses that parsed to a usable list (even if zero valid items)
+    parsed_item_count = 0  # candidate items across parsed lists; [] is a valid "no changes"
     auth_error_seen = False
     total_prompt_tokens: int | None = None
     total_completion_tokens: int | None = None
@@ -528,6 +531,7 @@ def semantic_contract_diff(
             parse_miss_count += 1
             continue
         parsed_ok_count += 1
+        parsed_item_count += len(parsed)
 
         sym_span: JsonObject = {}
         if head_path:
@@ -723,14 +727,15 @@ def semantic_contract_diff(
     # Schema-invalid honesty: a response can parse as a JSON list yet emit ZERO rows — either
     # because every item failed _validate_item (e.g. the old five-key shape after the schema
     # grew) OR because every schema-valid item was then dropped by the _DROP_* oversized-field
-    # thresholds (or fully deduped). All three yield zero rows but are NOT a clean run, so they
+    # thresholds (or fully deduped). Those yield zero rows but are NOT a clean run, so they
     # must not report "active" (silent nothing). Key on EMITTED rows (post-dedupe,
-    # post-drop-threshold), not valid_item_count, so all-items-dropped is covered too: when
-    # calls were attempted, >= 1 response parsed, and no item survived into rows, surface
-    # "failed:no_valid_claims". `not rows` also keeps any usable row on the active/partial path.
+    # post-drop-threshold) AND on parsed_item_count: a parsed EMPTY list ([]) is a valid
+    # "no behavioral contract changes found" answer to the "up to 2 changes" prompt and stays
+    # "active" — failure requires that candidate items existed and none survived into rows.
     no_valid_claims = (
         calls_attempted > 0
         and parsed_ok_count > 0
+        and parsed_item_count > 0
         and not rows
     )
 
