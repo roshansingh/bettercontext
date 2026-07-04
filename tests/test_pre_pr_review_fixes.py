@@ -336,6 +336,111 @@ class TestFinalizeReviewHypothesisBudgetHardCapNoEvictable(unittest.TestCase):
         )
 
 
+class TestHardCapHoldsAfterSuggestedFollowups(unittest.TestCase):
+    """P1: suggested_followups attached by _attach_truncated_hypothesis_followups grow
+    review_quality_status, which is in _HARD_CAP_PROTECTED_KEYS. Before the fix the trim
+    ladder only shrank inspection_areas, so a packet could exit finalize over max_chars.
+    The trim ladder now also drops suggested_followups and a final assertion enforces the
+    cap contract that the review-context lead gate relies on."""
+
+    def _high_hyp(self, risk_type: str, hyp_id: str) -> dict:
+        return {
+            "hypothesis_id": hyp_id,
+            "risk_type": risk_type,
+            "specificity": "high",
+            "confidence": "strong",
+            "why": "Contract drift.",
+            "evidence_refs": [],
+            "source_checks": [],
+            "supporting_lead_ids": [],
+            "cause": {"repo": "svc", "path": f"src/{risk_type}.py", "line_start": 12,
+                      "qualname": f"mod.{risk_type}_fn"},
+            "label": f"H-{risk_type}",
+        }
+
+    def _packet_with_many_truncated_high_families(self):
+        # One high-specificity row survives (drives review_readiness -> needs_followup),
+        # many high families are truncated -> one suggested_followup each.
+        survivor = self._high_hyp("survivor_risk", "hypothesis:survivor:id0000")
+        result = {
+            "status": "found",
+            "review_hypotheses": [survivor],
+            "review_quality_status": {
+                "review_readiness": "packet_ready",
+                "specificity": "high",
+            },
+        }
+        # full_pre_cap set: survivor plus many distinct-family high rows NOT in the packet.
+        truncated = [
+            self._high_hyp(f"trunc_family_{i:02d}", f"hypothesis:trunc:id{i:04d}")
+            for i in range(20)
+        ]
+        full_pre_cap = [survivor] + truncated
+        return result, [survivor], full_pre_cap
+
+    def _affordance_free_size(self):
+        """Size of the finalized packet with ALL status affordances stripped — the
+        irreducible floor the trim ladder can shrink down to."""
+        result, original, full_pre_cap = self._packet_with_many_truncated_high_families()
+        _finalize_review_hypothesis_budget(
+            result, original, original_review_leads={}, max_chars=1_000_000,
+            full_pre_cap_hypotheses=full_pre_cap,
+        )
+        status = result["review_quality_status"]
+        status.pop("suggested_followups", None)
+        status.pop("inspection_areas", None)
+        return len(canonical_json(result))
+
+    def test_followups_overshoot_trimmed_and_cap_holds(self):
+        result, original, full_pre_cap = self._packet_with_many_truncated_high_families()
+        # Tight cap: just above the affordance-free floor so the irreducible status scalars
+        # fit, but the many attached followups (one per truncated family) overshoot even
+        # after inspection_areas are fully removed. Forces the followups trim rung.
+        max_chars = self._affordance_free_size() + 150
+        _finalize_review_hypothesis_budget(
+            result,
+            original,
+            original_review_leads={},
+            max_chars=max_chars,
+            full_pre_cap_hypotheses=full_pre_cap,
+        )
+        final_chars = len(canonical_json(result))
+        # Hard-cap contract: must hold on this exit path.
+        self.assertLessEqual(
+            final_chars, max_chars,
+            f"packet breached hard cap after suggested_followups: {final_chars} > {max_chars}",
+        )
+        status = result.get("review_quality_status")
+        self.assertIsInstance(status, dict)
+        # The affordances were bounded down to fit: at most 1 followup, inspection_areas
+        # trimmed/dropped. (The exact count depends on slack; assert the invariant, not a
+        # magic number.)
+        followups = status.get("suggested_followups") or []
+        self.assertLessEqual(
+            len(followups), 1,
+            f"trim ladder must leave <=1 suggested_followup under a tight cap; got {len(followups)}",
+        )
+
+    def test_inversion_ample_budget_keeps_multiple_followups(self):
+        # Inversion proof: with ample budget the followups are NOT trimmed, proving the
+        # trimming above is driven by the cap, not an unconditional cull.
+        result, original, full_pre_cap = self._packet_with_many_truncated_high_families()
+        _finalize_review_hypothesis_budget(
+            result,
+            original,
+            original_review_leads={},
+            max_chars=100_000,
+            full_pre_cap_hypotheses=full_pre_cap,
+        )
+        status = result.get("review_quality_status")
+        self.assertIsInstance(status, dict)
+        followups = status.get("suggested_followups") or []
+        self.assertGreater(
+            len(followups), 1,
+            "ample budget must retain multiple suggested_followups (inversion of the trim path)",
+        )
+
+
 class TestFloorEvictionResyncsReturnedCounts(unittest.TestCase):
     """Fix 6: floor eviction in _protect_review_hypotheses_floor must resync returned counts."""
 

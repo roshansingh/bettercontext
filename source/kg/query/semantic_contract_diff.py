@@ -367,6 +367,7 @@ def semantic_contract_diff(
       "partial:auth"                  — partial rows returned but some calls hit auth errors
       "failed:unreadable_sources"     — all source-body reads failed before any LLM call
       "failed:all_responses_unparseable" — calls completed but no response parsed to a usable list
+      "failed:no_valid_claims"        — response(s) parsed to a list but every item failed schema validation
 
     Each row is a candidate-class hypothesis only — never stored as a canonical fact.
 
@@ -448,6 +449,7 @@ def semantic_contract_diff(
     calls_failed = 0
     parse_miss_count = 0
     parsed_ok_count = 0  # responses that parsed to a usable list (even if zero valid items)
+    valid_item_count = 0  # items that passed _validate_item across all parsed responses
     auth_error_seen = False
     total_prompt_tokens: int | None = None
     total_completion_tokens: int | None = None
@@ -548,6 +550,7 @@ def semantic_contract_diff(
                 break
             if not _validate_item(item):
                 continue
+            valid_item_count += 1
             claim_key = str(item.get("claim", ""))
             if claim_key in seen_claims:
                 continue
@@ -719,6 +722,17 @@ def semantic_contract_diff(
         and parsed_ok_count == 0
         and parse_miss_count > 0
     )
+    # Schema-invalid honesty: a response can parse as a JSON list yet have EVERY item fail
+    # _validate_item (e.g. the old five-key shape after the schema grew). That yields zero
+    # rows but is NOT a clean run, so it must not report "active" (silent nothing). When
+    # calls were attempted, >= 1 response parsed, and no item validated overall, surface
+    # "failed:no_valid_claims". Gated on rows being empty so any usable row keeps the
+    # active/partial path.
+    no_valid_claims = (
+        calls_attempted > 0
+        and parsed_ok_count > 0
+        and valid_item_count == 0
+    )
 
     if rows and calls_failed > 0:
         status = "partial:auth" if auth_error_seen else "partial"
@@ -728,6 +742,8 @@ def semantic_contract_diff(
         status = "no_api_key"
     elif calls_attempted > 0 and calls_failed == calls_attempted:
         status = "llm_error"
+    elif no_valid_claims:
+        status = "failed:no_valid_claims"
     else:
         status = "active"
 

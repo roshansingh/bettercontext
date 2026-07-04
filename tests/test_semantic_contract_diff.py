@@ -3794,12 +3794,15 @@ class TestViolatedInvariantSchema(unittest.TestCase):
             )
             self.assertEqual(rows, [], "item missing new keys must produce no rows")
 
-    def test_all_missing_new_keys_produces_unparseable_status(self) -> None:
-        """All responses missing new keys → failed:all_responses_unparseable path still works.
+    def test_all_parsed_but_schema_invalid_produces_no_valid_claims_status(self) -> None:
+        """Response parses to a list but EVERY item fails schema validation → honest
+        'failed:no_valid_claims', never a silent 'active' with zero rows.
 
-        The response parses to a list (parsed_ok), but every item is invalid, so zero
-        rows result. This exercises the new-schema validation drop, not parse_miss;
-        assert zero rows and a non-'active-with-rows' outcome.
+        Uses a parsed-but-old-schema client (the five-key shape from before the schema
+        grew old_contract/new_contract/violated_invariant). The response parses fine
+        (parsed_ok > 0), but no item validates, so zero rows result. This is distinct
+        from a parse_miss (see test_all_parse_miss_status) — the model DID return usable
+        JSON, it just used a stale schema, which must be surfaced, not hidden as 'active'.
         """
         from source.kg.query.semantic_contract_diff import semantic_contract_diff
 
@@ -3808,15 +3811,37 @@ class TestViolatedInvariantSchema(unittest.TestCase):
             snap, base_dir, head_dir = self._make_single_symbol_snap(root)
             entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
 
-            client = _AllParseMissClient()  # returns parse_miss for every call
+            # Old-schema item: the original 5 keys, NONE of the new 3 → parses, invalid.
+            old_schema_response = [{
+                "claim": "Guard removed.",
+                "cause_line": 2,
+                "consequence": "Callers may pass None.",
+                "negative_check": "No check.",
+                "category": "guard_removal",
+            }]
+            client = _FakeClient(response=old_schema_response)
             rows, status = semantic_contract_diff(
                 base_snapshot=snap, head_snapshot=snap,
                 base_root=base_dir, head_root=head_dir,
                 changed_symbols=entity_dicts, client=client,
             )
-            self.assertEqual(rows, [])
-            self.assertEqual(status, "failed:all_responses_unparseable",
-                             f"all parse_miss with new schema must still yield the honest status; got {status!r}")
+            self.assertGreater(client.call_count, 0,
+                               "test must actually attempt an LLM call for the status to be honest")
+            self.assertEqual(rows, [], "old-schema items must produce no valid rows")
+            self.assertEqual(status, "failed:no_valid_claims",
+                             f"all-invalid parsed response must be honest, not 'active'; got {status!r}")
+
+            # Inversion proof: the SAME pipeline with a schema-valid response returns
+            # rows and 'active', proving the status is driven by validity, not a constant.
+            valid_client = _FakeClient(response=[_claim()])
+            valid_rows, valid_status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=valid_client,
+            )
+            self.assertGreater(len(valid_rows), 0, "valid-schema response must produce rows")
+            self.assertEqual(valid_status, "active",
+                             f"valid-schema response must be 'active'; got {valid_status!r}")
 
     def test_oversized_new_field_dropped(self) -> None:
         """violated_invariant > _DROP_VIOLATED_INVARIANT (1200) → item dropped entirely."""

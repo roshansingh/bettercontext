@@ -4891,10 +4891,14 @@ def _attach_truncated_hypothesis_followups(
 
 
 def _trim_review_quality_status_to_fit(result: JsonObject, *, max_chars: int) -> None:
-    """Shrink the C1 inspection_areas affordance until the packet fits the hard cap.
+    """Shrink the C1 review_quality_status affordances until the packet fits the hard cap.
 
-    Evicts inspection_area rows (tracking the omitted count) before dropping the block, so
-    the hard-cap guarantee always wins while preserving the remainder count as honesty."""
+    review_quality_status is in _HARD_CAP_PROTECTED_KEYS, so _evict_review_rows_to_fit cannot
+    shrink it; this is the only place its bounded C1 affordances (inspection_areas, then
+    suggested_followups) are trimmed. Ladder, cheapest-honesty-loss first:
+      1. Evict inspection_area rows (tracking omitted_count) then drop the block.
+      2. Trim suggested_followups oldest/lowest-value first: keep at most 1, then drop all.
+    The hard-cap guarantee always wins over these affordances."""
     status = result.get("review_quality_status")
     if not isinstance(status, dict):
         return
@@ -4907,6 +4911,16 @@ def _trim_review_quality_status_to_fit(result: JsonObject, *, max_chars: int) ->
             block["areas"] = areas
         if not areas or _current_chars(result) > max_chars:
             status.pop("inspection_areas", None)
+    # suggested_followups next: trim oldest/lowest-value (list head) first down to at most 1,
+    # then drop the key entirely. The followups are ordered producer-first (oldest first), so
+    # popping index 0 sheds the lowest-value entry while keeping the freshest single followup.
+    if _current_chars(result) > max_chars:
+        followups = [f for f in _list_value(status.get("suggested_followups")) if isinstance(f, dict)]
+        while len(followups) > 1 and _current_chars(result) > max_chars:
+            followups.pop(0)
+            status["suggested_followups"] = followups
+        if followups and _current_chars(result) > max_chars:
+            status.pop("suggested_followups", None)
 
 
 # C2/rec-6: instruction telling ANY consuming agent (any harness) to cite the labels in
@@ -5084,6 +5098,29 @@ def _finalize_review_hypothesis_budget(
         _rl_cs = _rl["changed_symbols"]
         if isinstance(result.get("changed_symbols"), list):
             result["changed_symbols"] = list(_rl_cs)
+    # Final hard-cap fallback: the cap is a CONTRACT the review-context lead gate and packet
+    # consumers rely on. _sync_review_quality_status_from_packet can grow the protected
+    # review_quality_status (suggested_followups + inspection_areas) after the last generic
+    # eviction pass, and those keys are in _HARD_CAP_PROTECTED_KEYS so _evict_review_rows_to_fit
+    # cannot shrink them. Trim the bounded status affordances until the packet fits.
+    if max_chars is not None and _current_chars(result) > max_chars:
+        _trim_review_quality_status_to_fit(result, max_chars=max_chars)
+        # Invariant enforcement. A residual overshoot is legitimate ONLY when irreducible
+        # protected content (e.g. the floor-of-1 review_hypotheses row) alone exceeds the
+        # cap — that case is flagged via output_budget.exceeded_after_minimization, never
+        # silently hidden. But an overshoot caused by the trimmable status affordances is a
+        # BUG: after the trim ladder, review_quality_status must carry neither
+        # suggested_followups nor inspection_areas when the packet is still over the cap.
+        if _current_chars(result) > max_chars:
+            _status = result.get("review_quality_status")
+            if isinstance(_status, dict):
+                assert "suggested_followups" not in _status and "inspection_areas" not in _status, (
+                    "review packet over hard cap with trimmable status affordances still "
+                    f"present: {sorted(k for k in ('suggested_followups', 'inspection_areas') if k in _status)}"
+                )
+            budget = result.get("output_budget")
+            if isinstance(budget, dict):
+                budget["exceeded_after_minimization"] = True
 
 
 # Changed-symbol anchor lists are never evicted to fund the truncation summary: the
