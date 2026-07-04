@@ -33,11 +33,19 @@ def _guard_row(*, target_kind: str = "", target_urn: str = "", cause: dict | Non
     return row
 
 
-def _moved_row(*, target_kind: str = "", cause: dict | None = None,
-               consequence: dict | None = None) -> dict:
+def _moved_row(*, target_kind: str = "", callee_kind: str = "", callee_urn: str = "",
+               cause: dict | None = None, consequence: dict | None = None) -> dict:
+    # target_kind = the move DESTINATION (symbol Y); callee_kind/callee_urn = the moved
+    # CALL's callee (symbol Z). The call-target penalties key on the CALLEE, so a moved
+    # row must set callee_* to a module-root/external kind to be penalized — setting only
+    # the destination target_kind must NOT fire the penalty (that was the defect).
     row: dict = {"risk_type": "responsibility_moved_drift", "derivation": "deterministic_static"}
     if target_kind:
         row["target_entity_kind"] = target_kind
+    if callee_kind:
+        row["callee_entity_kind"] = callee_kind
+    if callee_urn:
+        row["callee_urn"] = callee_urn
     if cause is not None:
         row["cause"] = cause
     if consequence is not None:
@@ -79,6 +87,19 @@ class TestExternalCallTargetPenalty(unittest.TestCase):
                "target_urn": "urn:external-symbol:x", "derivation": "deterministic_static"}
         self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
 
+    def test_positive_moved_row_external_callee_penalized_despite_symbol_destination(self) -> None:
+        # Moved-call destination is a CodeSymbol but the moved CALL's callee is an
+        # ExternalSymbol (builtin) → penalty keys on the callee, not the destination.
+        row = _moved_row(target_kind="CodeSymbol", callee_kind="ExternalSymbol",
+                         callee_urn="urn:external-symbol:x")
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _PENALTY_EXTERNAL_CALL_TARGET)
+
+    def test_negative_moved_row_external_callee_overlap_suppresses(self) -> None:
+        # Inversion: the external callee URN references a PR-changed symbol → not noise.
+        row = _moved_row(target_kind="CodeSymbol", callee_kind="ExternalSymbol",
+                         callee_urn="urn:external-symbol:foo_helper")
+        self.assertEqual(_structural_noise_score(row, _EMPTY, frozenset({"foo_helper"})), 0.0)
+
 
 class TestBothPathsTestPenalty(unittest.TestCase):
     """Rule 2: cause AND consequence are both test-classified paths."""
@@ -110,15 +131,30 @@ class TestBothPathsTestPenalty(unittest.TestCase):
 
 
 class TestModuleRootTargetPenalty(unittest.TestCase):
-    """Rule 3: moved-call target is a bare module/package root entity."""
+    """Rule 3: moved-call CALLEE is a bare module/package root entity."""
 
     def test_positive_module_root_target_penalized(self) -> None:
         # CodeModule == a bare module root (entity kind, not segment counting).
+        # Legacy shape (target-only, no distinct callee) resolves via the target_* fallback.
         row = _moved_row(target_kind="CodeModule")
         self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _PENALTY_MODULE_ROOT_TARGET)
 
+    def test_positive_module_root_callee_penalized_despite_symbol_destination(self) -> None:
+        # DEFECT LOCK: the moved-call DESTINATION is a normal CodeSymbol (target_*), but the
+        # moved CALL's callee is a bare CodeModule (callee_*). Keying on target saw CodeSymbol
+        # and never fired; keying on the CALLEE must fire the module-root penalty.
+        row = _moved_row(target_kind="CodeSymbol", callee_kind="CodeModule",
+                         callee_urn="urn:code-module:pkg_root")
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _PENALTY_MODULE_ROOT_TARGET)
+
+    def test_negative_symbol_callee_not_penalized_despite_symbol_destination(self) -> None:
+        # Inversion: destination AND callee both CodeSymbol → no module-root penalty.
+        row = _moved_row(target_kind="CodeSymbol", callee_kind="CodeSymbol",
+                         callee_urn="urn:code-symbol:helper")
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
+
     def test_negative_symbol_target_not_penalized(self) -> None:
-        # Inversion: a real CodeSymbol target → no module-root penalty.
+        # Inversion: a real CodeSymbol target (legacy, no callee) → no module-root penalty.
         row = _moved_row(target_kind="CodeSymbol")
         self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
 
@@ -302,6 +338,145 @@ class TestRealPipelineNoisyRowRanksBelowClean(unittest.TestCase):
             codesymbol_idx, builtin_idx,
             f"clean CodeSymbol-target row must rank above builtin-target row; order={invariants}",
         )
+
+
+class TestRealPipelineModuleRootCalleeMovedRowLosesSeat(unittest.TestCase):
+    """End-to-end through _splice_contract_diff_hypotheses → apply_structural_noise_downranking
+    → cap on real KgSnapshot pairs. Proves a responsibility_moved row whose moved CALL's
+    CALLEE is a bare module root (CodeModule) — but whose move DESTINATION is a normal
+    CodeSymbol — is penalized and ranks BELOW a clean moved row whose callee is a real
+    CodeSymbol. The scorer keys on the CALLEE entity kind, not the destination; names in
+    the fixture are generic (alpha/beta/gamma/delta + a module root). Inversion: a moved
+    row whose callee is a CodeSymbol is not penalized.
+    """
+
+    def _make_snapshot(self, tmpdir, name, entities, facts):
+        from source.kg.core.store import JsonlKgStore
+        from source.kg.query.snapshot import KgSnapshot
+
+        root = tmpdir / name
+        JsonlKgStore(root).write(
+            entities=entities, facts=facts, evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": "default"},
+        )
+        return KgSnapshot(root)
+
+    def _symbol(self, module, qualname, path, line):
+        from source.kg.core.models import Entity
+        return Entity(
+            "CodeSymbol",
+            {"tenant_id": "default", "repo": "svc", "module": module,
+             "qualname": qualname, "symbol_kind": "function"},
+            {"path": path, "line": line, "end_line": line + 3},
+        )
+
+    def _module(self, module):
+        from source.kg.core.models import Entity
+        return Entity("CodeModule", {"tenant_id": "default", "repo": "svc", "module": module})
+
+    def _calls(self, caller, callee):
+        from source.kg.core.models import Fact
+        return Fact("CALLS", caller.entity_id, callee.entity_id)
+
+    def _build_pair(self, tmpdir):
+        # Clean move: alpha→gamma (removed), beta→gamma (added). gamma is a CodeSymbol.
+        # Noisy move: delta→pkg_root (removed), epsilon→pkg_root (added). pkg_root is a
+        #             CodeModule; the destinations (beta, epsilon) are normal CodeSymbols.
+        gamma = self._symbol("svc.core", "gamma", "svc/core.py", 40)
+        pkg_root = self._module("svc.pkg")
+        alpha = self._symbol("svc.core", "alpha", "svc/core.py", 1)
+        beta = self._symbol("svc.core", "beta", "svc/core.py", 20)
+        delta = self._symbol("svc.core", "delta", "svc/core.py", 60)
+        epsilon = self._symbol("svc.core", "epsilon", "svc/core.py", 80)
+        ents = [gamma, pkg_root, alpha, beta, delta, epsilon]
+        base = self._make_snapshot(
+            tmpdir, "base", ents,
+            [self._calls(alpha, gamma), self._calls(delta, pkg_root)],
+        )
+        head = self._make_snapshot(
+            tmpdir, "head", ents,
+            [self._calls(beta, gamma), self._calls(epsilon, pkg_root)],
+        )
+        return base, head
+
+    def test_module_root_callee_moved_row_ranks_below_symbol_callee_row(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from source.kg.product.mcp_tools import (
+            _splice_contract_diff_hypotheses,
+            apply_structural_noise_downranking,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base, head = self._build_pair(root)
+            spliced, note = _splice_contract_diff_hypotheses(
+                base_snapshot_dir=str(base.root),
+                head_kg=head,
+                changed_files=["svc/core.py"],
+                review_hypotheses=[],
+            )
+        self.assertIsNone(note, note)
+        moved = [h for h in spliced if h.get("risk_type") == "responsibility_moved_drift"]
+        # Hard assert: both moved rows must exist or the ordering claim is vacuous.
+        self.assertEqual(
+            len(moved), 2,
+            f"fixture must yield exactly two moved rows; got "
+            f"{[m.get('concrete_invariant') for m in moved]}",
+        )
+        # Structurally identify each row by its callee entity kind (not by name).
+        module_row = next(m for m in moved if m.get("callee_entity_kind") == "CodeModule")
+        symbol_row = next(m for m in moved if m.get("callee_entity_kind") == "CodeSymbol")
+        # The destinations are BOTH normal CodeSymbols — the only distinguishing signal is
+        # the callee kind, proving the fix keys on the callee, not the destination target.
+        self.assertEqual(module_row.get("target_entity_kind"), "CodeSymbol")
+        self.assertEqual(symbol_row.get("target_entity_kind"), "CodeSymbol")
+
+        ordered = apply_structural_noise_downranking(
+            spliced, changed_files=["svc/core.py"], changed_symbols=[]
+        )
+        ordered_moved = [h for h in ordered if h.get("risk_type") == "responsibility_moved_drift"]
+        kinds = [m.get("callee_entity_kind") for m in ordered_moved]
+        self.assertLess(
+            kinds.index("CodeSymbol"), kinds.index("CodeModule"),
+            f"clean CodeSymbol-callee moved row must rank above CodeModule-callee row; "
+            f"callee-kind order={kinds}",
+        )
+
+    def test_inversion_symbol_callee_moved_row_not_penalized(self) -> None:
+        # Inversion: when both moved rows carry a CodeSymbol callee, neither is penalized,
+        # so the module-root penalty is proven specific to the module-root callee kind.
+        import tempfile
+        from pathlib import Path
+        from source.kg.core.models import Entity, Fact  # noqa: F401
+        from source.kg.product.mcp_tools import _splice_contract_diff_hypotheses
+        from source.kg.product.review_hypotheses import (
+            _PENALTY_MODULE_ROOT_TARGET,
+            score_hypothesis_row,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            gamma = self._symbol("svc.core", "gamma", "svc/core.py", 40)
+            alpha = self._symbol("svc.core", "alpha", "svc/core.py", 1)
+            beta = self._symbol("svc.core", "beta", "svc/core.py", 20)
+            ents = [gamma, alpha, beta]
+            base = self._make_snapshot(root, "base", ents, [self._calls(alpha, gamma)])
+            head = self._make_snapshot(root, "head", ents, [self._calls(beta, gamma)])
+            spliced, note = _splice_contract_diff_hypotheses(
+                base_snapshot_dir=str(base.root),
+                head_kg=head,
+                changed_files=["svc/core.py"],
+                review_hypotheses=[],
+            )
+        self.assertIsNone(note, note)
+        moved = [h for h in spliced if h.get("risk_type") == "responsibility_moved_drift"]
+        self.assertEqual(len(moved), 1)
+        row = moved[0]
+        self.assertEqual(row.get("callee_entity_kind"), "CodeSymbol")
+        score = score_hypothesis_row(row, ["svc/core.py"], [])
+        # No module-root penalty applied (score is strictly above the penalty floor).
+        self.assertGreater(score, _PENALTY_MODULE_ROOT_TARGET)
 
 
 if __name__ == "__main__":

@@ -144,12 +144,12 @@ def _structural_noise_score(
     Structural signals only — entity kind, path segments, claim shape. Base 0.
 
     Penalize:
-      - a removed/moved-call row whose call target resolves to a language builtin or
-        external-package entity, with no changed-symbol overlap (target/subject qualname
-        not among the PR's changed symbols) — a call into third-party/builtin code that
+      - a removed/moved-call row whose CALLEE resolves to a language builtin or
+        external-package entity, with no changed-symbol overlap (callee URN does not
+        contain a PR-changed qualname) — a call into third-party/builtin code that
         the PR did not itself touch.
       - a row whose cause AND consequence are both test-classified paths.
-      - a moved-call row whose target is a bare module/package root entity.
+      - a call-move row whose CALLEE is a bare module/package root entity.
     Boost:
       - a row carrying a concrete failure mode in its claim structure
         (an ``unimplemented_members`` list — e.g. abstract-contract rows).
@@ -160,12 +160,18 @@ def _structural_noise_score(
     risk_type = str(row.get("risk_type") or "")
     cause_path = _path_of(row.get("cause"))
     consequence_path = _path_of(row.get("consequence"))
-    target_kind = str(row.get("target_entity_kind") or "")
+    # The builtin/external and module-root penalties describe a property of the moved/
+    # removed call's CALLEE, so they key on callee_entity_kind/callee_urn. For a guard
+    # row the callee coincides with target; for a moved row the callee (shared_callee Z)
+    # differs from target_entity_kind (the move destination Y) — keying on target there
+    # was the defect. Fall back to target_* only when a call-move row carries no callee
+    # field (defensive; the splice always sets callee_* for both call-move families).
+    callee_kind = str(row.get("callee_entity_kind") or row.get("target_entity_kind") or "")
+    callee_urn = str(row.get("callee_urn") or row.get("target_urn") or "")
 
-    # Penalty 1: call row targeting a builtin/external entity with no changed-symbol overlap.
-    if risk_type in _CALL_MOVE_RISK_TYPES and target_kind in _LOW_VALUE_CALL_TARGET_KINDS:
-        target_urn = str(row.get("target_urn") or "")
-        overlaps = bool(target_urn) and any(q and q in target_urn for q in changed_qualnames)
+    # Penalty 1: call row whose callee is a builtin/external entity with no changed-symbol overlap.
+    if risk_type in _CALL_MOVE_RISK_TYPES and callee_kind in _LOW_VALUE_CALL_TARGET_KINDS:
+        overlaps = bool(callee_urn) and any(q and q in callee_urn for q in changed_qualnames)
         if not overlaps:
             score += _PENALTY_EXTERNAL_CALL_TARGET
 
@@ -173,8 +179,8 @@ def _structural_noise_score(
     if cause_path and consequence_path and _is_test_file(cause_path) and _is_test_file(consequence_path):
         score += _PENALTY_BOTH_PATHS_TEST
 
-    # Penalty 3: moved-call row whose target is a bare module/package root.
-    if risk_type in _CALL_MOVE_RISK_TYPES and target_kind in _MODULE_ROOT_TARGET_KINDS:
+    # Penalty 3: call-move row whose callee is a bare module/package root.
+    if risk_type in _CALL_MOVE_RISK_TYPES and callee_kind in _MODULE_ROOT_TARGET_KINDS:
         score += _PENALTY_MODULE_ROOT_TARGET
 
     # Boost 1: concrete failure mode carried in the claim structure.

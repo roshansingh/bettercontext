@@ -3683,16 +3683,31 @@ def _splice_contract_diff_hypotheses(
             negative_checks = [
                 "Verify the removed test reference was superseded by a broader or renamed test that still covers the same invariant; if coverage is maintained, this risk does not apply.",
             ]
-        # Preserve the structural identity of the call target (removed callee for a
-        # guard row, moved-to symbol for a responsibility-moved row) so the structural
-        # scorer can key on the KG entity kind — e.g. penalize call rows targeting a
-        # language builtin/external package or a bare module/package root. Reads the
-        # symbol_ref emitted by contract_diff (kind/urn); never string-matches names.
+        # Preserve two structural identities from the contract_diff symbol_refs so the
+        # scorer can key on KG entity kind without string-matching names:
+        #
+        #   target_ref  — the "primary" symbol per risk family (kept for rules that key
+        #                 on it). guard row: the removed CALLEE (removed_callee). moved
+        #                 row: the move DESTINATION (moved_to, symbol Y).
+        #   callee_ref  — the moved/removed CALL's actual CALLEE. guard row: the removed
+        #                 CALLEE (removed_callee) — target and callee coincide here.
+        #                 moved row: the shared callee Z (shared_callee), which is the
+        #                 symbol whose invocation moved — NOT the destination Y.
+        #
+        # The call-target noise penalties (builtin/external, bare module/package root)
+        # describe a property of the CALLEE, so they must key on callee_ref. Prior to
+        # this, moved rows fed moved_to (the destination) into target_* and the penalties
+        # saw the destination's kind, never the callee's — so a move whose callee is a
+        # bare CodeModule went un-penalized. Reads symbol_ref kind/urn only; never parses
+        # the concrete_invariant string.
         target_ref: JsonObject | None = None
+        callee_ref: JsonObject | None = None
         if risk_type == "guard_call_removed_drift":
             target_ref = h.get("removed_callee") if isinstance(h.get("removed_callee"), dict) else None
+            callee_ref = target_ref
         elif risk_type == "responsibility_moved_drift":
             target_ref = h.get("moved_to") if isinstance(h.get("moved_to"), dict) else None
+            callee_ref = h.get("shared_callee") if isinstance(h.get("shared_callee"), dict) else None
         spliced_row: JsonObject = {
             "hypothesis_id": hypothesis_id,
             "label": hypothesis_label(risk_type, hypothesis_id),
@@ -3713,6 +3728,11 @@ def _splice_contract_diff_hypotheses(
                 spliced_row["target_entity_kind"] = str(target_ref["kind"])
             if target_ref.get("urn"):
                 spliced_row["target_urn"] = str(target_ref["urn"])
+        if callee_ref is not None:
+            if callee_ref.get("kind"):
+                spliced_row["callee_entity_kind"] = str(callee_ref["kind"])
+            if callee_ref.get("urn"):
+                spliced_row["callee_urn"] = str(callee_ref["urn"])
         if cause is not None:
             spliced_row["cause"] = cause
         if consequence is not None:
