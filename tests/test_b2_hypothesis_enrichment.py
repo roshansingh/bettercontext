@@ -192,6 +192,31 @@ class TestSpecificityField(unittest.TestCase):
         h = next(h for h in hyps if h["risk_type"] == "async_side_effect_lifecycle_drift")
         self.assertEqual(h["specificity"], "high")
 
+    def test_async_family_transitive_helper_hit_is_medium_not_high(self):
+        # Directness fix (field regression exp126): the async signal is NOT anchored to a
+        # directly-changed symbol (its subject_id "eid-helper" is not the changed symbol's
+        # entity id "eid-1"); it matches only via the file-path fallback (a transitive helper
+        # in the changed file). A transitive-helper suspicion must be "medium", not "high",
+        # so it cannot displace concrete UI-family rows in seat allocation.
+        sym = _sym("handleList", "src/handler.ts", symbol_id="eid-1", lead_id="lead-1")
+        sig = _risk_signal(
+            "unawaited_async_call", "eid-helper", path="src/handler.ts", callee="processBatch"
+        )
+        hyps = self._call(
+            changed_symbols=[sym],
+            direct_callers=[_edge("PageHandler", "handleList", "lead-edge-1")],
+            risk_signals=[sig],
+            review_leads={
+                "changed_symbols": [{"lead_id": "lead-1", "path": "src/handler.ts", "symbol_id": "eid-1"}],
+                "direct_callers": [{"lead_id": "lead-edge-1"}],
+            },
+        )
+        h = next(h for h in hyps if h["risk_type"] == "async_side_effect_lifecycle_drift")
+        self.assertEqual(
+            h["specificity"], "medium",
+            "transitive-helper async hit (path-matched, not a changed-symbol hit) must be medium",
+        )
+
     def test_swallowed_exception_family_carries_specificity_high(self):
         sym = _sym("savePayment", "payments/processor.py", symbol_id="eid-se-1", lead_id="lead-se-1")
         sig = _risk_signal("swallowed_exception", "eid-se-1", path="payments/processor.py", qualname="savePayment")

@@ -125,7 +125,54 @@ _PENALTY_EXTERNAL_CALL_TARGET = -3.0
 _PENALTY_BOTH_PATHS_TEST = -2.0
 _PENALTY_MODULE_ROOT_TARGET = -2.0
 _BOOST_CONCRETE_FAILURE_MODE = 3.0
-_BOOST_CAUSE_IN_CHANGED_PROD_FILE = 2.0
+# Lowered from 2.0 so a high-specificity claim WITHOUT coords (see _SPECIFICITY_BOOST)
+# can outrank a generic/low-specificity claim WITH coords, per the claim-strength contract.
+# The cause-in-changed-prod-file signal is a locality signal, not a claim-strength signal;
+# a concrete named-invariant family should not be beaten purely because it lacks a coord hit.
+_BOOST_CAUSE_IN_CHANGED_PROD_FILE = 1.0
+
+# Claim strength as a first-class score input (structural, NOT keyword-derived).
+# Both scales read the EXISTING row fields the producers already stamp:
+#   - specificity: assigned per family/row at generation (_FAMILY_SPECIFICITY / directness
+#     override). "high" = a concrete named invariant on a directly-changed symbol; "low" =
+#     a generic contract-drift suspicion; "medium" = convention/transitive-grade.
+#   - confidence:  the producer vocab is {"strong","medium","weak"} (see _CONFIDENCE_RANK).
+# Neutral-middle policy: a row MISSING (or carrying an unrecognized value for) either field
+# gets the MIDDLE weight, never a penalty — absence of metadata is not weakness. So an
+# unstamped row scores identically to a "medium" row on that axis and is neither rescued
+# nor punished for the gap.
+#
+# Magnitude bound (keeps rule 4 intact): max claim boost = _SPECIFICITY_BOOST["high"]
+# (1.5) + _CONFIDENCE_BOOST["strong"] (0.5) = 2.0, which does not exceed the smallest
+# noise penalty magnitude (2.0). So a noisy row (external/module-root callee, both-test
+# paths) can never be lifted ABOVE a clean peer by claim strength alone: -3.0 + 2.0 < 0,
+# and -2.0 + 2.0 = 0.0 stays at or below a clean neutral peer (0.75). Noise stays dominant.
+_SPECIFICITY_BOOST: dict[str, float] = {"high": 1.5, "medium": 0.75, "low": 0.0}
+_SPECIFICITY_NEUTRAL = 0.75
+_CONFIDENCE_BOOST: dict[str, float] = {"strong": 0.5, "medium": 0.25, "weak": 0.0}
+_CONFIDENCE_NEUTRAL = 0.25
+
+
+def _claim_strength_score(row: JsonObject) -> float:
+    """Additive claim-strength contribution from a row's specificity + confidence fields.
+
+    Structural only: reads the two stamped fields, maps each through a bounded weight table,
+    and applies the neutral-middle fallback for missing/unrecognized values. No claim-text
+    inspection, no keyword lists.
+    """
+    spec = row.get("specificity")
+    spec_score = (
+        _SPECIFICITY_BOOST[spec]
+        if isinstance(spec, str) and spec in _SPECIFICITY_BOOST
+        else _SPECIFICITY_NEUTRAL
+    )
+    conf = row.get("confidence")
+    conf_score = (
+        _CONFIDENCE_BOOST[conf]
+        if isinstance(conf, str) and conf in _CONFIDENCE_BOOST
+        else _CONFIDENCE_NEUTRAL
+    )
+    return spec_score + conf_score
 
 
 def _path_of(ref: JsonObject | None) -> str:
@@ -190,6 +237,12 @@ def _structural_noise_score(
     # Boost 2: cause path is a production file that the PR changed.
     if cause_path and not _is_test_file(cause_path) and cause_path in changed_file_set:
         score += _BOOST_CAUSE_IN_CHANGED_PROD_FILE
+
+    # Claim strength (specificity + confidence): a first-class score input so a
+    # high-specificity claim carrying no cause coords still outranks a generic
+    # suspicion-grade claim that happens to carry coords. Bounded below the smallest
+    # noise penalty so it can never rescue a noisy row (see _claim_strength_score).
+    score += _claim_strength_score(row)
 
     return score
 
@@ -428,7 +481,11 @@ def _make_hypothesis(
     cause: JsonObject | None = None,
     consequence: JsonObject | None = None,
     negative_checks: list[str] | None = None,
+    specificity: str | None = None,
 ) -> JsonObject:
+    # specificity defaults to the family class; a family that can distinguish a DIRECT
+    # changed-symbol hit from a TRANSITIVE-helper hit passes a per-row override (e.g. the
+    # async-lifecycle family downgrades a transitive-helper suspicion to "medium").
     row: JsonObject = {
         "risk_type": risk_type,
         "confidence": confidence,
@@ -436,7 +493,7 @@ def _make_hypothesis(
         "evidence_refs": evidence_refs,
         "source_checks": source_checks,
         "supporting_lead_ids": supporting_lead_ids,
-        "specificity": _FAMILY_SPECIFICITY.get(risk_type, "low"),
+        "specificity": specificity or _FAMILY_SPECIFICITY.get(risk_type, "low"),
     }
     if concrete_invariant is not None:
         row["concrete_invariant"] = concrete_invariant
@@ -1223,6 +1280,23 @@ def _signal_matches_changed_context(
     return False
 
 
+def _signal_is_direct_changed_symbol(
+    signal: JsonObject,
+    changed_entity_ids: set[str],
+) -> bool:
+    """Return True when the signal is anchored to a DIRECTLY-changed symbol entity.
+
+    Directness = the signal's subject_id is one of the PR's changed-symbol entity ids
+    (not merely a co-located helper matched by file path). This is the structural
+    distinction the async-lifecycle family uses to set specificity: a direct hit is a
+    concrete named-invariant claim on changed code ("high"); a hit that resolves only via
+    the file-path fallback is a transitive-helper suspicion that must not claim "high".
+    No claim-text inspection.
+    """
+    subject_id = signal.get("subject_id")
+    return isinstance(subject_id, str) and subject_id in changed_entity_ids
+
+
 def _evidence_refs_from_risk_signals(signals: list[JsonObject]) -> list[JsonObject]:
     """Build evidence_refs from risk signal evidence bytes_refs."""
     refs: list[JsonObject] = []
@@ -1353,6 +1427,16 @@ def _async_side_effect_lifecycle_drift(
     lead_ids = _lead_ids_for_signal_subjects(matching, review_leads)
     has_direct_edge = bool(direct_callers or direct_callees)
     confidence = "medium" if (lead_ids and has_direct_edge) else "weak"
+    # Specificity reflects DIRECTNESS, not the family alone: a signal anchored to a
+    # directly-changed symbol is a concrete named-invariant claim on changed code ("high");
+    # a signal that matched only via the file-path fallback is a transitive-helper
+    # suspicion ("may not be coupled") and must not claim "high". This is the generation-side
+    # fix for the field regression where a transitive-helper async hit emitted "high" and
+    # displaced concrete UI-family rows in seat allocation.
+    is_direct = any(
+        _signal_is_direct_changed_symbol(sig, changed_entity_ids) for sig in matching
+    )
+    specificity = "high" if is_direct else "medium"
     source_checks = [
         "Trace each flagged call site; verify the async call is awaited or its result is reconciled with any paired persistent-state change.",
         "Check whether the mutation path that contains the async call has a compensating rollback or retry if the async work fails.",
@@ -1403,6 +1487,7 @@ def _async_side_effect_lifecycle_drift(
         cause=cause or None,
         consequence=consequence or None,
         negative_checks=negative_checks,
+        specificity=specificity,
     )
 
 

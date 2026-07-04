@@ -5,9 +5,11 @@ import unittest
 from source.kg.product.review_hypotheses import (
     _BOOST_CAUSE_IN_CHANGED_PROD_FILE,
     _BOOST_CONCRETE_FAILURE_MODE,
+    _CONFIDENCE_NEUTRAL,
     _PENALTY_BOTH_PATHS_TEST,
     _PENALTY_EXTERNAL_CALL_TARGET,
     _PENALTY_MODULE_ROOT_TARGET,
+    _SPECIFICITY_NEUTRAL,
     _structural_noise_score,
     apply_structural_noise_downranking,
 )
@@ -17,6 +19,14 @@ from source.kg.product.review_hypotheses import (
 # STRUCTURE (KG entity kind, path segments, claim shape), not on any name/keyword list.
 
 _EMPTY = frozenset()
+
+# Claim-strength baseline: every row without stamped specificity/confidence fields earns
+# the neutral-middle claim-strength contribution (absence of metadata is NOT weakness). The
+# _guard_row/_moved_row fixtures below stamp neither field, so each score below carries this
+# constant baseline on TOP of the structural penalty/boost under test. Expressing the
+# expected value as (structural_term + _NEUTRAL_CLAIM) proves the penalty/boost magnitude is
+# unchanged and that claim strength is purely additive.
+_NEUTRAL_CLAIM = _SPECIFICITY_NEUTRAL + _CONFIDENCE_NEUTRAL
 
 
 def _guard_row(*, target_kind: str = "", target_urn: str = "", cause: dict | None = None,
@@ -59,46 +69,54 @@ class TestExternalCallTargetPenalty(unittest.TestCase):
     def test_positive_builtin_target_penalized(self) -> None:
         # ExternalSymbol == language builtin callee (structural kind, not a name match).
         row = _guard_row(target_kind="ExternalSymbol", target_urn="urn:external-symbol:x")
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _PENALTY_EXTERNAL_CALL_TARGET)
+        self.assertEqual(
+            _structural_noise_score(row, _EMPTY, _EMPTY),
+            _PENALTY_EXTERNAL_CALL_TARGET + _NEUTRAL_CLAIM,
+        )
 
     def test_positive_external_package_target_penalized(self) -> None:
         row = _guard_row(target_kind="ExternalPackage", target_urn="urn:external-package:pkg_root")
         # ExternalPackage triggers BOTH the external-call and the module-root penalties.
         self.assertEqual(
             _structural_noise_score(row, _EMPTY, _EMPTY),
-            _PENALTY_EXTERNAL_CALL_TARGET + _PENALTY_MODULE_ROOT_TARGET,
+            _PENALTY_EXTERNAL_CALL_TARGET + _PENALTY_MODULE_ROOT_TARGET + _NEUTRAL_CLAIM,
         )
 
     def test_negative_codesymbol_target_not_penalized(self) -> None:
-        # Inversion: same row shape, only the entity KIND differs → no penalty.
+        # Inversion: same row shape, only the entity KIND differs → no penalty (only baseline).
         row = _guard_row(target_kind="CodeSymbol", target_urn="urn:code-symbol:foo")
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _NEUTRAL_CLAIM)
 
     def test_negative_changed_symbol_overlap_suppresses_penalty(self) -> None:
         # Overlap = the target URN references a symbol the PR itself changed → not noise.
         row = _guard_row(target_kind="ExternalSymbol", target_urn="urn:external-symbol:foo_helper")
         self.assertEqual(
-            _structural_noise_score(row, _EMPTY, frozenset({"foo_helper"})), 0.0
+            _structural_noise_score(row, _EMPTY, frozenset({"foo_helper"})), _NEUTRAL_CLAIM
         )
 
     def test_negative_non_call_risk_type_not_penalized(self) -> None:
         # A non-call risk type with the same kind field must not fire this rule.
         row = {"risk_type": "test_reference_removed_drift", "target_entity_kind": "ExternalSymbol",
                "target_urn": "urn:external-symbol:x", "derivation": "deterministic_static"}
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _NEUTRAL_CLAIM)
 
     def test_positive_moved_row_external_callee_penalized_despite_symbol_destination(self) -> None:
         # Moved-call destination is a CodeSymbol but the moved CALL's callee is an
         # ExternalSymbol (builtin) → penalty keys on the callee, not the destination.
         row = _moved_row(target_kind="CodeSymbol", callee_kind="ExternalSymbol",
                          callee_urn="urn:external-symbol:x")
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _PENALTY_EXTERNAL_CALL_TARGET)
+        self.assertEqual(
+            _structural_noise_score(row, _EMPTY, _EMPTY),
+            _PENALTY_EXTERNAL_CALL_TARGET + _NEUTRAL_CLAIM,
+        )
 
     def test_negative_moved_row_external_callee_overlap_suppresses(self) -> None:
         # Inversion: the external callee URN references a PR-changed symbol → not noise.
         row = _moved_row(target_kind="CodeSymbol", callee_kind="ExternalSymbol",
                          callee_urn="urn:external-symbol:foo_helper")
-        self.assertEqual(_structural_noise_score(row, _EMPTY, frozenset({"foo_helper"})), 0.0)
+        self.assertEqual(
+            _structural_noise_score(row, _EMPTY, frozenset({"foo_helper"})), _NEUTRAL_CLAIM
+        )
 
 
 class TestBothPathsTestPenalty(unittest.TestCase):
@@ -110,16 +128,19 @@ class TestBothPathsTestPenalty(unittest.TestCase):
             cause={"path": "tests/test_mod_a.py", "line_start": 3},
             consequence={"path": "src/__tests__/mod_b.spec.ts", "line_start": 9},
         )
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _PENALTY_BOTH_PATHS_TEST)
+        self.assertEqual(
+            _structural_noise_score(row, _EMPTY, _EMPTY),
+            _PENALTY_BOTH_PATHS_TEST + _NEUTRAL_CLAIM,
+        )
 
     def test_negative_only_cause_is_test_path(self) -> None:
-        # Inversion: consequence is production → rule must NOT fire.
+        # Inversion: consequence is production → rule must NOT fire (only baseline).
         row = _guard_row(
             target_kind="CodeSymbol",
             cause={"path": "tests/test_mod_a.py", "line_start": 3},
             consequence={"path": "src/mod_b.py", "line_start": 9},
         )
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _NEUTRAL_CLAIM)
 
     def test_negative_both_production_paths(self) -> None:
         row = _guard_row(
@@ -127,7 +148,7 @@ class TestBothPathsTestPenalty(unittest.TestCase):
             cause={"path": "src/mod_a.py", "line_start": 3},
             consequence={"path": "src/mod_b.py", "line_start": 9},
         )
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _NEUTRAL_CLAIM)
 
 
 class TestModuleRootTargetPenalty(unittest.TestCase):
@@ -137,7 +158,10 @@ class TestModuleRootTargetPenalty(unittest.TestCase):
         # CodeModule == a bare module root (entity kind, not segment counting).
         # Legacy shape (target-only, no distinct callee) resolves via the target_* fallback.
         row = _moved_row(target_kind="CodeModule")
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _PENALTY_MODULE_ROOT_TARGET)
+        self.assertEqual(
+            _structural_noise_score(row, _EMPTY, _EMPTY),
+            _PENALTY_MODULE_ROOT_TARGET + _NEUTRAL_CLAIM,
+        )
 
     def test_positive_module_root_callee_penalized_despite_symbol_destination(self) -> None:
         # DEFECT LOCK: the moved-call DESTINATION is a normal CodeSymbol (target_*), but the
@@ -145,18 +169,21 @@ class TestModuleRootTargetPenalty(unittest.TestCase):
         # and never fired; keying on the CALLEE must fire the module-root penalty.
         row = _moved_row(target_kind="CodeSymbol", callee_kind="CodeModule",
                          callee_urn="urn:code-module:pkg_root")
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _PENALTY_MODULE_ROOT_TARGET)
+        self.assertEqual(
+            _structural_noise_score(row, _EMPTY, _EMPTY),
+            _PENALTY_MODULE_ROOT_TARGET + _NEUTRAL_CLAIM,
+        )
 
     def test_negative_symbol_callee_not_penalized_despite_symbol_destination(self) -> None:
-        # Inversion: destination AND callee both CodeSymbol → no module-root penalty.
+        # Inversion: destination AND callee both CodeSymbol → no module-root penalty (baseline).
         row = _moved_row(target_kind="CodeSymbol", callee_kind="CodeSymbol",
                          callee_urn="urn:code-symbol:helper")
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _NEUTRAL_CLAIM)
 
     def test_negative_symbol_target_not_penalized(self) -> None:
         # Inversion: a real CodeSymbol target (legacy, no callee) → no module-root penalty.
         row = _moved_row(target_kind="CodeSymbol")
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _NEUTRAL_CLAIM)
 
 
 class TestConcreteFailureModeBoost(unittest.TestCase):
@@ -165,17 +192,20 @@ class TestConcreteFailureModeBoost(unittest.TestCase):
     def test_positive_unimplemented_members_boosted(self) -> None:
         row = {"risk_type": "abstract_contract_unimplemented", "derivation": "deterministic_static",
                "unimplemented_members": ["do_thing", "do_other"]}
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _BOOST_CONCRETE_FAILURE_MODE)
+        self.assertEqual(
+            _structural_noise_score(row, _EMPTY, _EMPTY),
+            _BOOST_CONCRETE_FAILURE_MODE + _NEUTRAL_CLAIM,
+        )
 
     def test_negative_no_failure_mode_field(self) -> None:
-        # Inversion: same derivation, no concrete-failure-mode structure → no boost.
+        # Inversion: same derivation, no concrete-failure-mode structure → no boost (baseline).
         row = {"risk_type": "abstract_contract_unimplemented", "derivation": "deterministic_static"}
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _NEUTRAL_CLAIM)
 
     def test_negative_empty_members_list(self) -> None:
         row = {"risk_type": "abstract_contract_unimplemented", "derivation": "deterministic_static",
                "unimplemented_members": []}
-        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), 0.0)
+        self.assertEqual(_structural_noise_score(row, _EMPTY, _EMPTY), _NEUTRAL_CLAIM)
 
 
 class TestChangedProdFileCauseBoost(unittest.TestCase):
@@ -186,19 +216,21 @@ class TestChangedProdFileCauseBoost(unittest.TestCase):
                          consequence={"path": "src/mod_b.py", "line_start": 9})
         self.assertEqual(
             _structural_noise_score(row, frozenset({"src/mod_a.py"}), _EMPTY),
-            _BOOST_CAUSE_IN_CHANGED_PROD_FILE,
+            _BOOST_CAUSE_IN_CHANGED_PROD_FILE + _NEUTRAL_CLAIM,
         )
 
     def test_negative_cause_not_in_changed_files(self) -> None:
-        # Inversion: cause path is production but NOT changed by this PR → no boost.
+        # Inversion: cause path is production but NOT changed by this PR → no boost (baseline).
         row = _guard_row(target_kind="CodeSymbol", cause={"path": "src/mod_a.py", "line_start": 3})
-        self.assertEqual(_structural_noise_score(row, frozenset({"src/other.py"}), _EMPTY), 0.0)
+        self.assertEqual(
+            _structural_noise_score(row, frozenset({"src/other.py"}), _EMPTY), _NEUTRAL_CLAIM
+        )
 
     def test_negative_test_file_cause_not_boosted(self) -> None:
         # A changed TEST file cause must not earn the production-file boost.
         row = _guard_row(target_kind="CodeSymbol", cause={"path": "tests/test_mod_a.py", "line_start": 3})
         self.assertEqual(
-            _structural_noise_score(row, frozenset({"tests/test_mod_a.py"}), _EMPTY), 0.0
+            _structural_noise_score(row, frozenset({"tests/test_mod_a.py"}), _EMPTY), _NEUTRAL_CLAIM
         )
 
 
@@ -477,6 +509,111 @@ class TestRealPipelineModuleRootCalleeMovedRowLosesSeat(unittest.TestCase):
         score = score_hypothesis_row(row, ["svc/core.py"], [])
         # No module-root penalty applied (score is strictly above the penalty floor).
         self.assertGreater(score, _PENALTY_MODULE_ROOT_TARGET)
+
+
+class TestClaimStrengthIsFirstClassScoreInput(unittest.TestCase):
+    """Claim strength (specificity + confidence) is an additive, structural score input.
+
+    All rows use generic synthetic names; the rules key on the stamped specificity/confidence
+    FIELDS, never on claim text. Reproduces the exp126 seat-geometry flip: a weak generic row
+    that carries cause coords must NOT outrank a high-specificity row that carries none.
+    """
+
+    def _row(self, rt: str, *, specificity=None, confidence=None, cause=None):
+        row: dict = {"risk_type": rt, "derivation": "deterministic_static", "hypothesis_id": rt}
+        if specificity is not None:
+            row["specificity"] = specificity
+        if confidence is not None:
+            row["confidence"] = confidence
+        if cause is not None:
+            row["cause"] = cause
+        return row
+
+    _CHANGED_PROD = frozenset({"src/mod_a.py"})
+    _COORD_CAUSE = {"path": "src/mod_a.py", "line_start": 1}
+
+    def test_high_specificity_without_coords_outranks_generic_with_coords(self) -> None:
+        # exp126 geometry: the WEAK generic lifecycle-style row carries cause coords in a
+        # changed prod file (+boost); the high-specificity UI-family row carries NO coords.
+        # Claim strength must still put the high-specificity row on top.
+        generic_with_coords = self._row(
+            "generic_drift", specificity="low", confidence="weak", cause=self._COORD_CAUSE
+        )
+        high_no_coords = self._row(
+            "ui_family_drift", specificity="high", confidence="medium"
+        )
+        s_generic = _structural_noise_score(generic_with_coords, self._CHANGED_PROD, _EMPTY)
+        s_high = _structural_noise_score(high_no_coords, self._CHANGED_PROD, _EMPTY)
+        self.assertGreater(
+            s_high, s_generic,
+            f"high-specificity/no-coords ({s_high}) must outrank generic/coords ({s_generic})",
+        )
+
+    def test_high_specificity_with_coords_stays_on_top(self) -> None:
+        # A high-specificity row that ALSO carries coords must still be the top of the three.
+        generic_with_coords = self._row(
+            "generic_drift", specificity="low", confidence="weak", cause=self._COORD_CAUSE
+        )
+        high_no_coords = self._row("ui_family_drift", specificity="high", confidence="medium")
+        high_with_coords = self._row(
+            "concrete_drift", specificity="high", confidence="strong", cause=self._COORD_CAUSE
+        )
+        scores = {
+            r["risk_type"]: _structural_noise_score(r, self._CHANGED_PROD, _EMPTY)
+            for r in (generic_with_coords, high_no_coords, high_with_coords)
+        }
+        top = max(scores, key=scores.get)
+        self.assertEqual(top, "concrete_drift", f"scores={scores}")
+        self.assertGreater(scores["ui_family_drift"], scores["generic_drift"], scores)
+
+    def test_missing_fields_get_neutral_middle_not_a_penalty(self) -> None:
+        # A row missing BOTH fields must score identically to an explicit "medium"/"medium"
+        # row — absence of metadata is neutral, never a penalty.
+        bare = self._row("bare_drift")
+        explicit_mid = self._row("mid_drift", specificity="medium", confidence="medium")
+        self.assertEqual(
+            _structural_noise_score(bare, _EMPTY, _EMPTY),
+            _structural_noise_score(explicit_mid, _EMPTY, _EMPTY),
+        )
+
+    def test_noise_penalty_dominates_high_specificity_no_rescue(self) -> None:
+        # Rule 4: a NOISY row (external-callee) with the strongest possible claim strength
+        # must still rank BELOW a clean neutral peer — claim strength cannot rescue noise.
+        noisy_high = _moved_row(
+            target_kind="CodeSymbol", callee_kind="ExternalSymbol", callee_urn="urn:external-symbol:x"
+        )
+        noisy_high["specificity"] = "high"
+        noisy_high["confidence"] = "strong"
+        clean_neutral = self._row("clean_drift")  # no penalty, neutral claim strength
+        s_noisy = _structural_noise_score(noisy_high, _EMPTY, _EMPTY)
+        s_clean = _structural_noise_score(clean_neutral, _EMPTY, _EMPTY)
+        self.assertLess(
+            s_noisy, s_clean,
+            f"noisy row with max claim strength ({s_noisy}) must not outrank clean peer ({s_clean})",
+        )
+
+    def test_seat_geometry_flip_ui_family_wins_over_weak_lifecycle(self) -> None:
+        # Full exp126 mix through the seat comparator surrogate (score desc): given
+        #   {weak lifecycle WITH coords, two UI-family rows WITHOUT coords but high spec,
+        #    a semantic row}
+        # the UI-family rows must win the top seats over the weak lifecycle row.
+        weak_lifecycle = self._row(
+            "async_lifecycle_generic", specificity="low", confidence="weak", cause=self._COORD_CAUSE
+        )
+        ui_a = self._row("component_render_drift", specificity="high", confidence="medium")
+        ui_b = self._row("hook_gate_drift", specificity="high", confidence="medium")
+        semantic = self._row("semantic_diff", specificity="medium", confidence="medium")
+        rows = [weak_lifecycle, ui_a, ui_b, semantic]
+        ranked = sorted(
+            rows,
+            key=lambda r: -_structural_noise_score(r, self._CHANGED_PROD, _EMPTY),
+        )
+        top_two = {r["risk_type"] for r in ranked[:2]}
+        self.assertEqual(
+            top_two, {"component_render_drift", "hook_gate_drift"},
+            f"UI-family rows must take the top two seats; ranked="
+            f"{[(r['risk_type'], _structural_noise_score(r, self._CHANGED_PROD, _EMPTY)) for r in ranked]}",
+        )
 
 
 if __name__ == "__main__":
