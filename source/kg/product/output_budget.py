@@ -1123,6 +1123,44 @@ def plan_hypothesis_seats(
     return list(plan["ordered_types"])[:limit]
 
 
+def _sort_hypotheses_by_seat_plan_rows(
+    hypotheses: list[JsonObject],
+    seat_plan: JsonObject | None,
+) -> list[JsonObject]:
+    """Order hypotheses by (family_rank, is_not_representative, original_index).
+
+    Shared ranking used by BOTH _hypothesis_first_compact_packet (seating fill) AND
+    _rank_hypotheses_by_seat_plan (restore order). Within each risk-type family the
+    seat-plan representative row comes first; ties among non-representatives preserve
+    original list order. Families absent from the plan sort after all seated families.
+    When no plan is threaded or the plan carries no ordered_types, original order is kept.
+    """
+    keep_order = [rt for rt in _list_value((seat_plan or {}).get("ordered_types")) if isinstance(rt, str)]
+    if not keep_order:
+        return list(hypotheses)
+    keep_rank = {rt: idx for idx, rt in enumerate(keep_order)}
+    fallback_rank = len(keep_order)
+    rep_ids: dict[str, str] = {}
+    if isinstance(seat_plan, dict):
+        ri = seat_plan.get("representative_id")
+        if isinstance(ri, dict):
+            rep_ids = {str(k): str(v) for k, v in ri.items()}
+    pairs = sorted(
+        enumerate(hypotheses),
+        key=lambda pair: (
+            keep_rank.get(str(pair[1].get("risk_type")), fallback_rank),
+            # representative (is_not_rep=0) before others (is_not_rep=1) within its family
+            0 if (
+                isinstance(pair[1], dict)
+                and rep_ids.get(str(pair[1].get("risk_type")), "") != ""
+                and str(pair[1].get("hypothesis_id") or "") == rep_ids.get(str(pair[1].get("risk_type")), "")
+            ) else 1,
+            pair[0],  # original index for determinism
+        ),
+    )
+    return [h for _, h in pairs]
+
+
 def _lowest_scored_hypothesis_index(
     hypotheses: list[JsonObject],
     keep_rank: dict[str, int],
@@ -1402,13 +1440,13 @@ def _hypothesis_first_compact_packet(
         )
     keep_order = [rt for rt in _list_value(seat_plan.get("ordered_types")) if isinstance(rt, str)]
     keep_rank = {rt: idx for idx, rt in enumerate(keep_order)}
-    # Fill in seat-plan keep-order (best-scored family first), preserving each family's list
-    # order within the group. Families not in the plan (defensive: unseen risk types) sort
-    # after all seated families, keeping their original relative order.
+    # Fill in seat-plan keep-order: representative first within its family, then by original
+    # index. This ensures a low-score first row in a family never displaces its representative.
+    # Families not in the plan (defensive: unseen risk types) sort after all seated families.
     fallback_rank = len(keep_order)
-    seated_hyps = sorted(
-        (h for h in original_hypotheses if isinstance(h, dict)),
-        key=lambda h: keep_rank.get(str(h.get("risk_type")), fallback_rank),
+    seated_hyps = _sort_hypotheses_by_seat_plan_rows(
+        [h for h in original_hypotheses if isinstance(h, dict)],
+        seat_plan,
     )
     hypotheses: list[JsonObject] = []
     packet["review_hypotheses"] = hypotheses
@@ -4487,21 +4525,14 @@ def _rank_hypotheses_by_seat_plan(
     hypotheses: list[JsonObject],
     seat_plan: JsonObject | None,
 ) -> list[JsonObject]:
-    """Order hypotheses by the shared seat plan's keep-order (best-scored family first).
+    """Order hypotheses by the shared seat plan's keep-order (representative first within family).
 
-    Mirrors the ranking _hypothesis_first_compact_packet seats by, so restore consumes the
-    SAME order the compactor did. Families not in the plan (or when no plan is threaded)
-    keep their original relative order after all seated families. Stable within a family.
+    Delegates to _sort_hypotheses_by_seat_plan_rows so seating and restore consume the
+    SAME order: (family_rank, is_not_representative, original_index). Families not in the
+    plan (or when no plan is threaded) keep their original relative order after all seated
+    families.
     """
-    keep_order = [rt for rt in _list_value((seat_plan or {}).get("ordered_types")) if isinstance(rt, str)]
-    if not keep_order:
-        return list(hypotheses)
-    keep_rank = {rt: idx for idx, rt in enumerate(keep_order)}
-    fallback_rank = len(keep_order)
-    return sorted(
-        hypotheses,
-        key=lambda h: keep_rank.get(str(h.get("risk_type")), fallback_rank),
-    )
+    return _sort_hypotheses_by_seat_plan_rows(hypotheses, seat_plan)
 
 
 def _hypothesis_identity(row: JsonObject) -> object:
