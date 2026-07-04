@@ -4639,6 +4639,7 @@ def _sync_review_quality_status_from_packet(
     *,
     full_pre_cap_hypotheses: list[JsonObject] | None = None,
     max_chars: int | None = None,
+    fund_over_cap: bool = False,
 ) -> None:
     """Recompute review_quality_status counts from the FINAL review_hypotheses in result.
 
@@ -4786,7 +4787,15 @@ def _sync_review_quality_status_from_packet(
     # C1: fund the added inspection_areas/followups inside the hard cap by evicting broad
     # rows if the status object now overshoots. The hard cap always wins over the affordance.
     if max_chars is not None and _current_chars(result) > max_chars:
-        _trim_review_quality_status_to_fit(result, max_chars=max_chars)
+        # fund_over_cap: the hypothesis_first packet routinely sits at/over the cap after
+        # compaction, so trimming inspection_areas first would always erase the C1 honesty
+        # signal. Evict lower-priority rows to fund it (like review_hypothesis_status),
+        # then fall back to trimming the affordance only if the packet still overshoots.
+        if fund_over_cap and isinstance(synced.get("inspection_areas"), dict):
+            _evict_review_rows_to_fit(result, max_chars=max_chars)
+            _sync_review_lead_status_from_packet(result)
+        if _current_chars(result) > max_chars:
+            _trim_review_quality_status_to_fit(result, max_chars=max_chars)
 
 
 def _inspection_area_from_hypothesis(row: JsonObject) -> JsonObject:
@@ -4907,12 +4916,16 @@ _ATTRIBUTION_LABELS_INSTRUCTION = (
 )
 
 
-def _attach_attribution_labels(result: JsonObject, *, max_chars: int) -> None:
+def _attach_attribution_labels(result: JsonObject, *, max_chars: int, fund_over_cap: bool = False) -> None:
     """Attach review_answer_packet.attribution_labels — a compact affordance at the top of
     the answer packet listing the returned hypothesis labels plus a cite instruction.
 
     Computed from the FINAL top-level review_hypotheses so the labels exactly match the
-    rows the packet returned. Dropped if it would push the packet over the hard cap.
+    rows the packet returned. The affordance is lean (labels + one instruction, typically
+    <300 chars). When ``fund_over_cap`` is True and attaching it pushes the packet over the
+    hard cap, lower-priority rows are evicted to fund it (mirroring review_hypothesis_status);
+    it is dropped only if the packet still overshoots after that eviction. When
+    ``fund_over_cap`` is False the affordance is simply dropped on overshoot (hard cap wins).
     """
     answer_packet = result.get("review_answer_packet")
     if not isinstance(answer_packet, dict):
@@ -4933,9 +4946,16 @@ def _attach_attribution_labels(result: JsonObject, *, max_chars: int) -> None:
         "labels": labels,
         "instruction": _ATTRIBUTION_LABELS_INSTRUCTION,
     }
-    # Hard cap wins over the affordance.
-    if _current_chars(result) > max_chars:
-        answer_packet.pop("attribution_labels", None)
+    if _current_chars(result) <= max_chars:
+        return
+    # Over cap: fund the affordance by evicting lower-priority rows before conceding.
+    if fund_over_cap:
+        _evict_review_rows_to_fit(result, max_chars=max_chars)
+        _sync_review_lead_status_from_packet(result)
+        if _current_chars(result) <= max_chars:
+            return
+    # Hard cap still wins over the affordance.
+    answer_packet.pop("attribution_labels", None)
 
 
 def _finalize_review_hypothesis_budget(
@@ -5038,14 +5058,19 @@ def _finalize_review_hypothesis_budget(
     # Sync review_quality_status counts from the FINAL review_hypotheses so specific/generic
     # counts describe rows actually returned, not the pre-budget set. Also downgrades
     # review_readiness and attaches inspection_areas when high/medium rows were truncated.
+    # fund_over_cap=True: the C1 inspection_areas affordance is a truncation-honesty signal;
+    # like review_hypothesis_status it is funded by evicting lower-priority rows rather than
+    # silently dropped when the hypothesis_first packet already sits at/over the cap.
     _sync_review_quality_status_from_packet(
         result, original_hypotheses, full_pre_cap_hypotheses=full_pre_cap_hypotheses,
-        max_chars=max_chars,
+        max_chars=max_chars, fund_over_cap=True,
     )
     # Attribution-label affordance (C2/rec-6): mirror the returned hypothesis labels to the
     # TOP of the answer packet so downstream reviewer findings can cite them. Recomputed here
-    # (after all eviction) so labels match the FINAL returned rows. Kept under the cap.
-    _attach_attribution_labels(result, max_chars=max_chars)
+    # (after all eviction) so labels match the FINAL returned rows. Funded by evicting
+    # lower-priority rows so it survives even when the hypothesis_first packet is at/over cap;
+    # dropped only if the packet still overshoots after that eviction (hard cap always wins).
+    _attach_attribution_labels(result, max_chars=max_chars, fund_over_cap=True)
     # Re-mirror top-level changed_symbols from review_leads.changed_symbols.
     # _repair_cluster_coverage and the gated re-interleave both de-alias the two lists.
     # Tandem clipping in _evict_review_rows_to_fit keeps review_leads.changed_symbols in

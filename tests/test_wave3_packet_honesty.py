@@ -25,7 +25,12 @@ from pathlib import Path
 
 import unittest
 
+from unittest.mock import patch
+
 from source.kg.build.pipeline import build_kg
+from source.kg.core.models import canonical_json
+from source.kg.integrations.semantic_llm import LlmResult
+from source.kg.product import mcp_tools
 from source.kg.product import output_budget as ob
 from source.kg.product.mcp_tools import call_tool
 from source.kg.product.output_budget import REVIEW_CONTEXT_MAX_CHARS
@@ -269,6 +274,180 @@ class TestReviewContextPacketHonestyEndToEnd(unittest.TestCase):
                 "attribution_labels", ap,
                 "no returned hypotheses → no attribution_labels affordance",
             )
+
+
+# ---------------------------------------------------------------------------
+# C1 + C2 survive the REAL hypothesis_first budget-compaction path (call_tool)
+#
+# Regression for the Wave-3 Task C field-drop: the original C tests exercised
+# _sync_review_quality_status_from_packet directly (C1) or used a no-truncation
+# call_tool geometry (C2), so the hypothesis_first compact rebuild — which lands
+# the packet at/over the 15K cap and dropped BOTH affordances via "hard cap wins"
+# guards — was never covered. These tests force budget compaction AND high-family
+# truncation through call_tool and assert both affordances survive in the FINAL
+# serialized packet. Inversion: without the fund-over-cap threading the drop
+# reproduces (attribution_labels absent, review_quality_status.inspection_areas
+# absent) exactly as observed in the field packet.
+# ---------------------------------------------------------------------------
+
+def _build_over_generation_semantic_pair(root: Path, *, nfiles: int = 20):
+    """Real build_kg base/head pair: nfiles guard-removing functions plus a fake
+    semantic-diff client that emits several distinct high-specificity claims per call.
+
+    Enough distinct high families are generated to overflow the top-5 cap (forcing
+    high-family truncation → C1 inspection_areas) while the lead + diff-anchor mass
+    pushes the packet over REVIEW_CONTEXT_MAX_CHARS (forcing the hypothesis_first
+    compact rebuild). Returns (head_kg, call_args, fake_client)."""
+    svc = root / "svc"
+    svc.mkdir()
+    (svc / "__init__.py").write_text("", encoding="utf-8")
+    base_ck = root / "cb"
+    base_ck.mkdir()
+    head_ck = root / "ch"
+    head_ck.mkdir()
+    files: list[str] = []
+    for i in range(nfiles):
+        fn = f"m{i}.py"
+        files.append(fn)
+        base = (
+            f"def func{i}(a, b, c):\n    if a is None:\n        raise ValueError\n"
+            f"    helper{i}(a)\n    return a\ndef helper{i}(a):\n    return a\n"
+        )
+        head = f"def func{i}(a, b, c):\n    return a\n"
+        (svc / fn).write_text(base, encoding="utf-8")
+        (base_ck / fn).write_text(base, encoding="utf-8")
+        (head_ck / fn).write_text(head, encoding="utf-8")
+    out_base = root / "kb"
+    build_kg(svc, out_base, tenant_id=TENANT)
+    for i in range(nfiles):
+        (svc / f"m{i}.py").write_text(f"def func{i}(a, b, c):\n    return a\n", encoding="utf-8")
+    out_head = root / "kh"
+    build_kg(svc, out_head, tenant_id=TENANT)
+    head_kg = KgSnapshot(out_head)
+
+    def _claim(j: int) -> dict:
+        return {
+            "claim": f"variant {j} no longer validates",
+            "cause_line": 2,
+            "consequence": "invalid data " + "z" * 40,
+            "negative_check": "if intentional, N/A " + "q" * 40,
+            "category": "guard_removal",
+            "old_contract": "validated v%d " % j + "a" * 40,
+            "new_contract": "no longer validates v%d " % j + "b" * 40,
+            "violated_invariant": "callers relied on rejection %d " % j + "c" * 40,
+        }
+
+    class _FakeMultiClaimClient:
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        def complete_json(self, prompt: str) -> LlmResult:
+            self.call_count += 1
+            base = self.call_count
+            return LlmResult.parsed([_claim(base * 100 + k) for k in range(3)])
+
+    fake_client = _FakeMultiClaimClient()
+    call_args = {
+        "repo": "svc",
+        "changed_files": files,
+        "base_snapshot": str(out_base),
+        "base_checkout": str(base_ck),
+        "head_checkout": str(head_ck),
+    }
+    return head_kg, call_args, fake_client
+
+
+def _call_review_context_with_fake_semantic(head_kg, call_args, fake_client) -> dict:
+    real = mcp_tools._splice_semantic_diff_hypotheses
+    with patch(
+        "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
+        side_effect=lambda **kw: real(**kw, _client=fake_client),
+    ):
+        return call_tool(head_kg, "review_context", call_args)
+
+
+class TestPacketHonestySurvivesBudgetCompaction(unittest.TestCase):
+    """Both affordances must survive the hypothesis_first compact rebuild via call_tool."""
+
+    def _run(self):
+        with tempfile.TemporaryDirectory() as d:
+            head_kg, call_args, fc = _build_over_generation_semantic_pair(Path(d))
+            result = _call_review_context_with_fake_semantic(head_kg, call_args, fc)
+            self.assertGreaterEqual(fc.call_count, 1, "real splice must call the fake client")
+            return result
+
+    def test_geometry_forces_compaction_and_truncation(self) -> None:
+        """Precondition: the fixture actually forces the hypothesis_first path AND
+        high-family truncation — otherwise the affordance assertions are vacuous."""
+        result = self._run()
+        budget = result.get("output_budget") or {}
+        self.assertEqual(
+            budget.get("profile"), "hypothesis_first",
+            f"fixture must trigger the compact rebuild; budget={budget}",
+        )
+        rqs = result.get("review_quality_status") or {}
+        gen = rqs.get("generated_specific_hypothesis_count")
+        returned = len(result.get("review_hypotheses") or [])
+        self.assertIsInstance(gen, int, "high families must have been truncated (generated>returned)")
+        self.assertGreater(gen, returned, "fixture must truncate at least one high family")
+
+    def test_attribution_labels_survive_in_final_packet(self) -> None:
+        """C2 regression: attribution_labels must be in the FINAL answer packet after
+        compaction, matching the returned hypothesis labels. This is the exact assertion
+        the field-drop would fail (pre-fix: answer packet has only
+        {packet_mode, status, review_lead_status, top_review_hypotheses})."""
+        result = self._run()
+        ap = result.get("review_answer_packet") or {}
+        attr = ap.get("attribution_labels")
+        self.assertIsInstance(
+            attr, dict,
+            f"attribution_labels must survive compaction; ap keys={sorted(ap.keys())}",
+        )
+        self.assertTrue(attr.get("instruction"), "cite instruction must be present")
+        returned_labels = [
+            h.get("label") for h in (result.get("review_hypotheses") or []) if isinstance(h, dict)
+        ]
+        self.assertTrue(returned_labels, "fixture must return >=1 labeled hypothesis")
+        self.assertEqual(
+            attr.get("labels"), returned_labels,
+            "attribution_labels must match the FINAL (post-eviction) returned rows",
+        )
+        self.assertLess(len(json.dumps(attr)), 400, "affordance stays compact")
+
+    def test_inspection_areas_survive_in_final_packet(self) -> None:
+        """C1 regression: with high families truncated, review_readiness downgrades to
+        needs_followup and review_quality_status.inspection_areas (with structural coords)
+        must survive compaction in the FINAL packet."""
+        result = self._run()
+        rqs = result.get("review_quality_status") or {}
+        self.assertEqual(
+            rqs.get("review_readiness"), "needs_followup",
+            f"truncated high families must downgrade readiness; rqs={rqs}",
+        )
+        block = rqs.get("inspection_areas")
+        self.assertIsInstance(
+            block, dict,
+            f"inspection_areas must survive compaction; rqs keys={sorted(rqs.keys())}",
+        )
+        areas = block.get("areas") or []
+        self.assertTrue(areas, "inspection_areas.areas must be non-empty")
+        self.assertLessEqual(len(areas), 5, "inspection_areas capped at 5")
+        # Structural coords sourced from the truncated rows.
+        first = areas[0]
+        self.assertIn("risk_type", first)
+        self.assertTrue(
+            any(k in first for k in ("path", "symbol", "line")),
+            f"inspection area must carry a structural coordinate; got {first}",
+        )
+
+    def test_final_packet_within_budget(self) -> None:
+        """Both affordances stay inside the 15K budget (canonical_json is the system measure)."""
+        result = self._run()
+        size = len(canonical_json(result))
+        self.assertLessEqual(
+            size, REVIEW_CONTEXT_MAX_CHARS,
+            f"packet with affordances must fit the 15K cap; size={size}",
+        )
 
 
 if __name__ == "__main__":
