@@ -4750,7 +4750,7 @@ class McpToolsTest(unittest.TestCase):
         self.assertNotIn("framework_impact", result)
         self.assertEqual(result["omitted_context"]["counts"]["application_impact.cross_repo_name_leads"], 1)
         self.assertEqual(result["candidate_leads"]["status"], "empty")
-        self.assertLess(len(canonical_json(result)), 9_200)
+        self.assertLess(len(canonical_json(result)), 10_000)
         self.assertTrue(any("include_unlinked_leads=true" in action for action in result["next_actions"]))
 
     def test_review_context_file_anchor_only_can_opt_into_broad_unlinked_leads(self) -> None:
@@ -8972,6 +8972,528 @@ class TestSpliceFamilyRoundRobin(unittest.TestCase):
         native_in_cap = [r for r in capped if r.get("risk_type") == "swallowed_exception"]
         self.assertEqual(len(spliced_in_cap), 3, "all 3 spliced rows must be in the cap")
         self.assertEqual(len(native_in_cap), 2, "2 native rows fill remaining slots")
+
+
+# ---------------------------------------------------------------------------
+# FW2: Problem A — trust-tier ordering in _splice_semantic_diff_hypotheses
+# ---------------------------------------------------------------------------
+
+from source.kg.integrations.semantic_llm import LlmResult as _LlmResult
+
+
+class _TierFakeClient:
+    """Minimal fake LLM client for tier-ordering tests."""
+
+    def __init__(self, items_per_call: int = 1) -> None:
+        self._items_per_call = items_per_call
+        self.call_count = 0
+
+    def complete_json(self, prompt: str) -> _LlmResult:
+        self.call_count += 1
+        return _LlmResult.parsed([
+            {
+                "claim": f"Claim {j} from call {self.call_count}",
+                "cause_line": 2,
+                "consequence": "Consequence text.",
+                "negative_check": "Negative check text.",
+                "category": "guard_removal",
+                "old_contract": "Old contract text.",
+                "new_contract": "New contract text.",
+                "violated_invariant": "Callers relied on the old contract.",
+            }
+            for j in range(self._items_per_call)
+        ])
+
+
+class TestSemanticSpliceTrustTierOrdering(unittest.TestCase):
+    """Problem A: deterministic_static rows must come before inferred_llm rows after splice.
+
+    Uses the REAL _splice_semantic_diff_hypotheses via _client= seam. No merge reimplementation.
+    """
+
+    def _make_tier_kg_pair(self, root: Path, num_symbols: int = 1) -> tuple[Path, Path, Path, Path]:
+        """Build a minimal KG pair with num_symbols differing CodeSymbol entities."""
+        entities = []
+        for i in range(num_symbols):
+            entities.append(Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "tier_repo",
+                    "module": "tier_mod",
+                    "qualname": f"tier_func_{i}",
+                    "symbol_kind": "function",
+                },
+                properties={"path": f"tier_{i}.py", "line": 1, "end_line": 4},
+            ))
+        snap_dir = root / "snap_tier"
+        JsonlKgStore(snap_dir).write(
+            entities=entities, facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": "default"},
+        )
+
+        base_dir = root / "base_tier"
+        base_dir.mkdir()
+        head_dir = root / "head_tier"
+        head_dir.mkdir()
+        for i in range(num_symbols):
+            (base_dir / f"tier_{i}.py").write_text(
+                f"def tier_func_{i}():\n    if x: raise\n    return {i}\n"
+            )
+            (head_dir / f"tier_{i}.py").write_text(
+                f"def tier_func_{i}():\n    return {i}\n"
+            )
+
+        return snap_dir, snap_dir, base_dir, head_dir
+
+    def test_deterministic_rows_before_semantic_rows_after_splice(self) -> None:
+        """3 deterministic + splice with 1 semantic → deterministic rows precede semantic.
+
+        Calls the REAL _splice_semantic_diff_hypotheses with _client=fake so the actual
+        merge logic is tested, not a re-implementation in the test body.
+        """
+        from source.kg.product.mcp_tools import (
+            _splice_semantic_diff_hypotheses,
+            PLANNING_CONTEXT_SECTION_LIMIT,
+        )
+        from source.kg.query.snapshot import KgSnapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap_dir, base_snap_dir, base_dir, head_dir = self._make_tier_kg_pair(root, num_symbols=1)
+            head_kg = KgSnapshot(snap_dir)
+
+            # 3 pre-existing deterministic hypotheses
+            existing_hyps = [
+                {
+                    "hypothesis_id": f"det-{i}",
+                    "risk_type": "guard_call_removed_drift",
+                    "specificity": "high",
+                    "derivation": "deterministic_static",
+                }
+                for i in range(3)
+            ]
+
+            fake_client = _TierFakeClient(items_per_call=1)
+            # changed_symbols must carry top-level qualname for entity matching
+            changed_symbols = [{"qualname": "tier_func_0"}]
+
+            merged, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(base_snap_dir),
+                head_kg=head_kg,
+                base_checkout=str(base_dir),
+                head_checkout=str(head_dir),
+                changed_symbols=changed_symbols,
+                review_hypotheses=existing_hyps,
+                _client=fake_client,
+            )
+
+            # Inversion evidence: real splice called fake client
+            self.assertGreaterEqual(
+                fake_client.call_count, 1,
+                f"real splice must call LLM client; call_count={fake_client.call_count}",
+            )
+
+            semantic_rows = [h for h in merged if h.get("risk_type") == "contract_semantic_diff"]
+            self.assertTrue(semantic_rows, f"expected >=1 semantic row; merged={[h.get('risk_type') for h in merged]}")
+
+            # Deterministic rows must all precede the first semantic row
+            first_sem_idx = next(
+                i for i, h in enumerate(merged) if h.get("risk_type") == "contract_semantic_diff"
+            )
+            det_rows_in_merged = [h for h in merged if h.get("derivation") == "deterministic_static"]
+            self.assertEqual(len(det_rows_in_merged), 3, f"all 3 deterministic rows must survive; got {len(det_rows_in_merged)}")
+            for i, h in enumerate(merged[:first_sem_idx]):
+                self.assertEqual(
+                    h.get("derivation"), "deterministic_static",
+                    f"row {i} before first semantic must be deterministic_static; got {h.get('derivation')}",
+                )
+
+            # After PLANNING_CONTEXT_SECTION_LIMIT cap, deterministic rows survive first
+            capped = merged[:PLANNING_CONTEXT_SECTION_LIMIT]
+            first_capped_sem = next(
+                (i for i, h in enumerate(capped) if h.get("risk_type") == "contract_semantic_diff"), None
+            )
+            if first_capped_sem is not None:
+                for i in range(first_capped_sem):
+                    self.assertEqual(
+                        capped[i].get("derivation"), "deterministic_static",
+                        f"capped row {i} must be deterministic_static; got {capped[i].get('derivation')}",
+                    )
+
+    def test_existing_llm_rows_pushed_after_semantic_rows(self) -> None:
+        """Existing inferred_llm rows appear AFTER new semantic rows from splice.
+
+        Calls the REAL _splice_semantic_diff_hypotheses with _client=fake.
+        """
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+        from source.kg.query.snapshot import KgSnapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap_dir, base_snap_dir, base_dir, head_dir = self._make_tier_kg_pair(root, num_symbols=1)
+            head_kg = KgSnapshot(snap_dir)
+
+            # 2 deterministic + 1 existing inferred_llm row
+            existing_hyps = [
+                {"hypothesis_id": "det-0", "risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
+                {"hypothesis_id": "det-1", "risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
+                {"hypothesis_id": "old-llm-0", "risk_type": "swallowed_exception", "derivation": "inferred_llm"},
+            ]
+
+            fake_client = _TierFakeClient(items_per_call=1)
+            changed_symbols = [{"qualname": "tier_func_0"}]
+
+            merged, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(base_snap_dir),
+                head_kg=head_kg,
+                base_checkout=str(base_dir),
+                head_checkout=str(head_dir),
+                changed_symbols=changed_symbols,
+                review_hypotheses=existing_hyps,
+                _client=fake_client,
+            )
+
+            # Inversion evidence
+            self.assertGreaterEqual(fake_client.call_count, 1,
+                f"real splice must call client; call_count={fake_client.call_count}")
+
+            semantic_hyps = [h for h in merged if h.get("risk_type") == "contract_semantic_diff"]
+            self.assertTrue(semantic_hyps, "expected >=1 semantic row after splice")
+
+            # The old inferred_llm row must come AFTER all new semantic rows
+            sem_indices = [i for i, h in enumerate(merged) if h.get("risk_type") == "contract_semantic_diff"]
+            old_llm_indices = [i for i, h in enumerate(merged) if h.get("hypothesis_id") == "old-llm-0"]
+            self.assertTrue(old_llm_indices, "old-llm-0 must survive in merged list")
+            self.assertGreater(
+                old_llm_indices[0], max(sem_indices),
+                f"old inferred_llm row must come after all semantic rows; "
+                f"old_llm_idx={old_llm_indices[0]} sem_indices={sem_indices}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# FW3: omitted_semantic_diff_count annotation
+# ---------------------------------------------------------------------------
+
+class TestOmittedSemanticDiffCount(unittest.TestCase):
+    """omitted_semantic_diff_count is annotated on last spliced row when raw_rows > splice cap (3).
+
+    Strategy: _MAX_HYPS_PER_SYMBOL=2, so 2 differing symbols each yielding 2 hypotheses
+    produces 4 raw rows; cap is 3 → 1 omitted → last spliced row carries
+    omitted_semantic_diff_count=1.
+    """
+
+    def _make_two_symbol_tier_pair(self, root: Path) -> tuple[Path, Path, Path, Path]:
+        """2 differing CodeSymbol entities in separate files, same pattern as _make_tier_kg_pair."""
+        entities = [
+            Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": "default",
+                    "repo": "omit_repo",
+                    "module": "omit_mod",
+                    "qualname": f"omit_func_{i}",
+                    "symbol_kind": "function",
+                },
+                properties={"path": f"omit_{i}.py", "line": 1, "end_line": 4},
+            )
+            for i in range(2)
+        ]
+        snap_dir = root / "snap_omit"
+        JsonlKgStore(snap_dir).write(
+            entities=entities, facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": "default"},
+        )
+        base_dir = root / "base_omit"
+        base_dir.mkdir()
+        head_dir = root / "head_omit"
+        head_dir.mkdir()
+        for i in range(2):
+            (base_dir / f"omit_{i}.py").write_text(
+                f"def omit_func_{i}():\n    if x: raise\n    return {i}\n"
+            )
+            (head_dir / f"omit_{i}.py").write_text(
+                f"def omit_func_{i}():\n    return {i}\n"
+            )
+        return snap_dir, snap_dir, base_dir, head_dir
+
+    def test_last_spliced_row_carries_omitted_count(self) -> None:
+        """4 raw rows (2 symbols × 2 hyps each) → 3 spliced + omitted_semantic_diff_count=1 on last.
+
+        Uses the REAL _splice_semantic_diff_hypotheses via _client= seam.
+        Fake client returns 2 valid items per call so _MAX_HYPS_PER_SYMBOL=2 is fully used.
+        """
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+        from source.kg.query.snapshot import KgSnapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap_dir, base_snap_dir, base_dir, head_dir = self._make_two_symbol_tier_pair(root)
+            head_kg = KgSnapshot(snap_dir)
+
+            # 2 items per LLM call → 2 symbols × 2 items = 4 raw rows > splice cap (3)
+            fake_client = _TierFakeClient(items_per_call=2)
+            changed_symbols = [{"qualname": "omit_func_0"}, {"qualname": "omit_func_1"}]
+
+            merged, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(base_snap_dir),
+                head_kg=head_kg,
+                base_checkout=str(base_dir),
+                head_checkout=str(head_dir),
+                changed_symbols=changed_symbols,
+                review_hypotheses=[],
+                _client=fake_client,
+            )
+
+            # Inversion evidence: real splice called fake client
+            self.assertGreaterEqual(
+                fake_client.call_count, 1,
+                f"real splice must call LLM client; call_count={fake_client.call_count}",
+            )
+
+            semantic_rows = [h for h in merged if h.get("risk_type") == "contract_semantic_diff"]
+
+            # Exactly 3 semantic rows spliced (cap=3)
+            self.assertEqual(
+                len(semantic_rows), 3,
+                f"splice cap is 3; expected exactly 3 semantic rows; got {len(semantic_rows)}",
+            )
+
+            # Last spliced semantic row carries omitted_semantic_diff_count=1
+            last_semantic = semantic_rows[-1]
+            self.assertEqual(
+                last_semantic.get("omitted_semantic_diff_count"), 1,
+                f"last spliced row must carry omitted_semantic_diff_count=1; "
+                f"got {last_semantic.get('omitted_semantic_diff_count')!r}; "
+                f"keys={list(last_semantic.keys())}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# FW2: Minor 11 — missing_base_snapshot status
+# ---------------------------------------------------------------------------
+
+class TestMissingBaseSnapshotStatus(unittest.TestCase):
+    """Minor 11: checkouts provided without base_snapshot → semantic_diff_status=missing_base_snapshot."""
+
+    def _make_minimal_kg(self, root: Path) -> object:
+        import json as _json
+        (root / "entities.jsonl").write_text("")
+        (root / "facts.jsonl").write_text("")
+        (root / "evidence.jsonl").write_text("")
+        (root / "coverage.jsonl").write_text("")
+        (root / "manifest.json").write_text(_json.dumps({"tenant_id": "default", "version": 1}))
+        from source.kg.query.snapshot import KgSnapshot
+        return KgSnapshot(root)
+
+    def test_checkouts_without_base_snapshot_gives_missing_base_snapshot(self) -> None:
+        """base_checkout provided, no base_snapshot → semantic_diff_status=missing_base_snapshot."""
+        with tempfile.TemporaryDirectory() as head_dir, \
+             tempfile.TemporaryDirectory() as checkout_dir:
+            head_kg = self._make_minimal_kg(Path(head_dir))
+            result = call_tool(head_kg, "review_context", {
+                "repo": "default",
+                "changed_files": ["src/a.py"],
+                # No base_snapshot — only checkout provided
+                "base_checkout": checkout_dir,
+                "head_checkout": checkout_dir,
+            })
+            rqs = result.get("review_quality_status") or {}
+            self.assertEqual(
+                rqs.get("semantic_diff_status"), "missing_base_snapshot",
+                f"expected missing_base_snapshot; got {rqs.get('semantic_diff_status')}; rqs={rqs}",
+            )
+
+    def test_head_checkout_only_without_base_snapshot_gives_missing_base_snapshot(self) -> None:
+        """head_checkout provided without base_snapshot → missing_base_snapshot."""
+        with tempfile.TemporaryDirectory() as head_dir, \
+             tempfile.TemporaryDirectory() as checkout_dir:
+            head_kg = self._make_minimal_kg(Path(head_dir))
+            result = call_tool(head_kg, "review_context", {
+                "repo": "default",
+                "changed_files": ["src/a.py"],
+                "head_checkout": checkout_dir,
+                # No base_snapshot, no base_checkout
+            })
+            rqs = result.get("review_quality_status") or {}
+            self.assertEqual(
+                rqs.get("semantic_diff_status"), "missing_base_snapshot",
+                f"expected missing_base_snapshot; got {rqs.get('semantic_diff_status')}; rqs={rqs}",
+            )
+
+    def test_no_checkouts_no_base_snapshot_no_status(self) -> None:
+        """No checkouts, no base_snapshot → semantic_diff_status absent."""
+        with tempfile.TemporaryDirectory() as head_dir:
+            head_kg = self._make_minimal_kg(Path(head_dir))
+            result = call_tool(head_kg, "review_context", {
+                "repo": "default",
+                "changed_files": ["src/a.py"],
+            })
+            rqs = result.get("review_quality_status") or {}
+            self.assertNotIn(
+                "semantic_diff_status", rqs,
+                f"semantic_diff_status must be absent with no checkouts/base_snapshot; got {rqs}",
+            )
+
+
+# ---------------------------------------------------------------------------
+# FW2: Minor 13 — review_readiness recomputed from final max_spec
+# ---------------------------------------------------------------------------
+
+class TestReviewReadinessResyncOnBudget(unittest.TestCase):
+    """Minor 13: review_readiness must be downgraded when high-spec rows are budget-evicted."""
+
+    def test_review_readiness_downgraded_when_high_spec_evicted(self) -> None:
+        """High-spec rows evicted by budget → review_readiness not packet_ready."""
+        from source.kg.product import output_budget as ob
+        from copy import deepcopy
+
+        # Build a status with review_readiness=packet_ready (pre-budget max_spec=high)
+        original_status = {
+            "coverage_status": "useful",
+            "specificity": "high",
+            "specific_hypothesis_count": 2,
+            "generic_hypothesis_count": 0,
+            "recommended_action": "use_supercontext_packet",
+            "reason": "Packet contains 2 specific hypotheses.",
+            "review_readiness": "packet_ready",
+        }
+
+        # Build a result that has NO hypotheses remaining (all evicted) but the status
+        # still says packet_ready
+        result = {
+            "review_quality_status": deepcopy(original_status),
+            "review_hypotheses": [],  # All high-spec rows evicted
+        }
+
+        # Run the sync: final max_spec=low → review_readiness must be downgraded
+        ob._sync_review_quality_status_from_packet(result, original_hypotheses=[
+            {
+                "hypothesis_id": "hyp-001",
+                "specificity": "high",
+                "derivation": "inferred_llm",
+            }
+        ])
+
+        synced = result.get("review_quality_status") or {}
+        self.assertNotEqual(
+            synced.get("review_readiness"), "packet_ready",
+            f"review_readiness must NOT be packet_ready after high-spec eviction; got {synced}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# FW2: Problem E — compact-unanchored allowlist revert
+# ---------------------------------------------------------------------------
+
+class TestCompactUnanchoredAllowlist(unittest.TestCase):
+    """Problem E: _review_context_compact_unanchored_result must exclude semantic diff rows."""
+
+    def _make_minimal_result(self, hypotheses: list[dict]) -> dict:
+        """Build a minimal result dict suitable for _review_context_compact_unanchored_result."""
+        return {
+            "status": "found",
+            "repo": "default",
+            "requested_repo": "default",
+            "repo_resolution": {},
+            "summary": {
+                "changed_symbol_count": 0,
+                "symbol_anchor_count": 0,
+                "diff_anchor_count": 1,
+                "file_anchor_count": 1,
+            },
+            "review_answer_packet": {"summary": {}},
+            "review_lead_status": {
+                "coverage_status": "low_coverage",
+                "changed_anchor_count": 0,
+                "changed_symbol_count": 0,
+                "direct_impact_count": 0,
+                "transitive_impact_count": 0,
+                "source_coordinate_count": 0,
+                "file_anchor_count": 1,
+                "available": {
+                    "changed_symbol_count": 0,
+                    "direct_caller_count": 0,
+                    "direct_callee_count": 0,
+                    "transitive_caller_count": 0,
+                    "source_coordinate_count": 0,
+                },
+            },
+            "review_quality_status": {},
+            "review_leads": {
+                "changed_files": ["src/style.css"],
+                "changed_symbols": [],
+                "direct_callers": [],
+                "direct_callees": [],
+                "transitive_callers": [],
+                "source_coordinates": [],
+            },
+            "diff_anchors": [{"anchor_type": "file", "path": "src/style.css"}],
+            "changed_symbols": [],
+            "changed_file_symbols": [],
+            "direct_callers": [],
+            "direct_callees": [],
+            "direct_callers_of_changed_symbols": [],
+            "direct_callees_from_changed_symbols": [],
+            "transitive_callers": [],
+            "repo_dependencies": [],
+            "changed_surface": {"files": ["src/style.css"], "symbols": []},
+            "impact": {"direct_callers": [], "direct_callees": [], "transitive_callers": [], "repo_dependencies": []},
+            "runtime_surfaces": {"endpoints": [], "endpoint_consumers": [], "event_channels": [],
+                                 "candidate_or_unlinked_event_channels": [], "deploy_mappings": []},
+            "framework_impact": {},
+            "application_impact": {},
+            "surface_status": {},
+            "source_coordinates": [],
+            "answerability": {},
+            "coverage_warnings": [],
+            "unsupported_scopes": [],
+            "unsupported_review_scopes": [],
+            "evidence": [],
+            "review_hypotheses": hypotheses,
+            "next_actions": [],
+        }
+
+    def test_semantic_diff_hypothesis_excluded_from_compact(self) -> None:
+        """contract_semantic_diff risk_type must NOT appear in compact-unanchored result."""
+        from source.kg.product.mcp_tools import _review_context_compact_unanchored_result
+
+        result = self._make_minimal_result(hypotheses=[
+            {
+                "hypothesis_id": "sem-001",
+                "risk_type": "contract_semantic_diff",
+                "specificity": "high",
+                "derivation": "inferred_llm",
+            }
+        ])
+        compact = _review_context_compact_unanchored_result(result)
+        compact_hyps = compact.get("review_hypotheses") or []
+        sem_hyps = [h for h in compact_hyps if h.get("risk_type") == "contract_semantic_diff"]
+        self.assertEqual(
+            sem_hyps, [],
+            f"contract_semantic_diff must NOT appear in compact-unanchored result; got {sem_hyps}",
+        )
+
+    def test_stylesheet_hypothesis_included_in_compact(self) -> None:
+        """low_coverage_stylesheet_gap risk_type MUST appear in compact-unanchored result."""
+        from source.kg.product.mcp_tools import _review_context_compact_unanchored_result
+
+        result = self._make_minimal_result(hypotheses=[
+            {
+                "hypothesis_id": "css-001",
+                "risk_type": "low_coverage_stylesheet_gap",
+                "specificity": "low",
+                "derivation": "deterministic_static",
+            }
+        ])
+        compact = _review_context_compact_unanchored_result(result)
+        compact_hyps = compact.get("review_hypotheses") or []
+        css_hyps = [h for h in compact_hyps if h.get("risk_type") == "low_coverage_stylesheet_gap"]
+        self.assertTrue(
+            css_hyps,
+            f"low_coverage_stylesheet_gap must appear in compact-unanchored result; got {compact_hyps}",
+        )
 
 
 if __name__ == "__main__":

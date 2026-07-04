@@ -192,6 +192,31 @@ class TestSpecificityField(unittest.TestCase):
         h = next(h for h in hyps if h["risk_type"] == "async_side_effect_lifecycle_drift")
         self.assertEqual(h["specificity"], "high")
 
+    def test_async_family_transitive_helper_hit_is_medium_not_high(self):
+        # Directness fix (field regression exp126): the async signal is NOT anchored to a
+        # directly-changed symbol (its subject_id "eid-helper" is not the changed symbol's
+        # entity id "eid-1"); it matches only via the file-path fallback (a transitive helper
+        # in the changed file). A transitive-helper suspicion must be "medium", not "high",
+        # so it cannot displace concrete UI-family rows in seat allocation.
+        sym = _sym("handleList", "src/handler.ts", symbol_id="eid-1", lead_id="lead-1")
+        sig = _risk_signal(
+            "unawaited_async_call", "eid-helper", path="src/handler.ts", callee="processBatch"
+        )
+        hyps = self._call(
+            changed_symbols=[sym],
+            direct_callers=[_edge("PageHandler", "handleList", "lead-edge-1")],
+            risk_signals=[sig],
+            review_leads={
+                "changed_symbols": [{"lead_id": "lead-1", "path": "src/handler.ts", "symbol_id": "eid-1"}],
+                "direct_callers": [{"lead_id": "lead-edge-1"}],
+            },
+        )
+        h = next(h for h in hyps if h["risk_type"] == "async_side_effect_lifecycle_drift")
+        self.assertEqual(
+            h["specificity"], "medium",
+            "transitive-helper async hit (path-matched, not a changed-symbol hit) must be medium",
+        )
+
     def test_swallowed_exception_family_carries_specificity_high(self):
         sym = _sym("savePayment", "payments/processor.py", symbol_id="eid-se-1", lead_id="lead-se-1")
         sig = _risk_signal("swallowed_exception", "eid-se-1", path="payments/processor.py", qualname="savePayment")
@@ -228,6 +253,76 @@ class TestSpecificityField(unittest.TestCase):
         )
         h = next(h for h in hyps if h["risk_type"] == "hook_gate_render_mismatch")
         self.assertEqual(h["specificity"], "medium")
+
+    def test_component_family_anchors_cause_on_matched_changed_symbol(self):
+        # The detector matched a changed COMPONENT symbol that carries real _symbol_result
+        # coordinates (path/repo/line/end_line). Those coords are the coordinate the detector
+        # matched — they must be attached as cause, not dropped. And because the cause path is
+        # a changed production file, the row must earn the locality boost.
+        from source.kg.product.review_hypotheses import (
+            _BOOST_CAUSE_IN_CHANGED_PROD_FILE,
+            score_hypothesis_row,
+        )
+
+        sym = _sym("ItemList", "src/ItemList.tsx", lead_id="lead-c1")
+        sym.update({"repo": "web", "line": 12, "end_line": 40})
+        hyps = self._call(
+            changed_files=["src/ItemList.tsx"],
+            changed_symbols=[sym],
+            direct_callees=[_edge("ItemList", "Row", "lead-ce1")],
+            review_leads={
+                "changed_symbols": [{"lead_id": "lead-c1", "path": "src/ItemList.tsx"}],
+                "direct_callees": [{"lead_id": "lead-ce1", "path": "src/Row.tsx"}],
+            },
+        )
+        h = next(h for h in hyps if h["risk_type"] == "component_list_render_identity_drift")
+        self.assertIn("cause", h, "matched-symbol coordinate must be attached as cause")
+        self.assertEqual(h["cause"]["path"], "src/ItemList.tsx")
+        self.assertEqual(h["cause"]["line_start"], 12)
+        self.assertEqual(h["cause"]["line_end"], 40)
+        self.assertEqual(h["cause"]["repo"], "web")
+        # Locality boost: cause path is a changed production file → +_BOOST_CAUSE_IN_CHANGED_PROD_FILE.
+        with_coords = score_hypothesis_row(h, ["src/ItemList.tsx"], changed_symbols=[sym])
+        no_cause = {k: v for k, v in h.items() if k != "cause"}
+        without = score_hypothesis_row(no_cause, ["src/ItemList.tsx"], changed_symbols=[sym])
+        self.assertAlmostEqual(with_coords - without, _BOOST_CAUSE_IN_CHANGED_PROD_FILE)
+
+    def test_hook_gate_family_anchors_cause_on_matched_changed_symbol(self):
+        from source.kg.product.review_hypotheses import (
+            _BOOST_CAUSE_IN_CHANGED_PROD_FILE,
+            score_hypothesis_row,
+        )
+
+        sym = _sym("useAuth", "src/useAuth.ts", lead_id="lead-h1")
+        sym.update({"repo": "web", "line": 5, "end_line": 22})
+        hyps = self._call(
+            changed_files=["src/useAuth.ts"],
+            changed_symbols=[sym],
+            direct_callers=[_edge("Dashboard", "useAuth", "lead-he1")],
+            review_leads={
+                "changed_symbols": [{"lead_id": "lead-h1", "path": "src/useAuth.ts"}],
+                "direct_callers": [{"lead_id": "lead-he1", "path": "src/Dashboard.tsx"}],
+            },
+        )
+        h = next(h for h in hyps if h["risk_type"] == "hook_gate_render_mismatch")
+        self.assertIn("cause", h, "matched-symbol coordinate must be attached as cause")
+        self.assertEqual(h["cause"]["path"], "src/useAuth.ts")
+        self.assertEqual(h["cause"]["line_start"], 5)
+        self.assertEqual(h["cause"]["line_end"], 22)
+        with_coords = score_hypothesis_row(h, ["src/useAuth.ts"], changed_symbols=[sym])
+        no_cause = {k: v for k, v in h.items() if k != "cause"}
+        without = score_hypothesis_row(no_cause, ["src/useAuth.ts"], changed_symbols=[sym])
+        self.assertAlmostEqual(with_coords - without, _BOOST_CAUSE_IN_CHANGED_PROD_FILE)
+
+    def test_matched_symbol_cause_does_not_invent_coords_without_path(self):
+        # Do not invent coords: a matched symbol with no path yields no cause.
+        from source.kg.product.review_hypotheses import _matched_symbol_cause
+
+        self.assertIsNone(_matched_symbol_cause({"qualname": "ItemList", "repo": "web"}))
+        # Path-only symbol still yields a usable (path-bearing) cause.
+        self.assertEqual(
+            _matched_symbol_cause({"path": "src/ItemList.tsx"}), {"path": "src/ItemList.tsx"}
+        )
 
     def test_test_locks_carries_specificity_low(self):
         hyps = self._call(

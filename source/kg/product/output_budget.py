@@ -6,6 +6,7 @@ from source.kg.core.models import JsonObject, canonical_json
 from source.kg.product.edge_role import rank_by_review_value
 from source.kg.product.evidence_score import rank_rows, score_key
 from source.kg.product.review_attribution import review_lead_counts
+from source.kg.product.review_hypotheses import score_hypothesis_row
 
 
 # Fleet runtime architecture questions need a compact head-start packet that
@@ -354,7 +355,14 @@ _HARD_CAP_AREA_RESERVE = 4_000
 # Tree keys whose lists are contracts/metadata, never row payloads to shrink.
 # Contracts/metadata: protected anywhere in the tree (small, never row payloads).
 _HARD_CAP_PROTECTED_KEYS = frozenset(
-    {"output_budget", "packet_contract", "claim_contract", "scope_contract", "answerability", "next_actions"}
+    {
+        "output_budget", "packet_contract", "claim_contract", "scope_contract",
+        "answerability", "next_actions",
+        # review_quality_status is a small routing scalar; its nested C1 inspection_areas
+        # block must never be silently row-evicted (truncation would imply absence). Its
+        # own char cost is bounded by _trim_review_quality_status_to_fit.
+        "review_quality_status",
+    }
 )
 # The common evidence index is already bounded by the minimal packet and carries its own
 # truncation markers; protect it only at the TOP level — same-named nested lists (e.g.
@@ -605,6 +613,29 @@ def enforce_review_context_budget(
         max_chars = REVIEW_CONTEXT_BROAD_MAX_CHARS if include_broad_context else REVIEW_CONTEXT_MAX_CHARS
     if not include_broad_context:
         result = _strip_broad_context(result)
+    # Producer-side pre-cap generated counts, if the producer attached them. The packet
+    # already capped review_hypotheses to PLANNING_CONTEXT_SECTION_LIMIT before budgeting,
+    # so original_hypotheses below is the CAPPED set. These counts describe the full
+    # generated set so available_count / available_by_risk_type reflect pre-cap totals and
+    # truncated_by_risk_type includes cap-time drops. Pop it so it never leaks to callers.
+    generated_counts = result.pop("_generated_hypothesis_counts", None)
+    if not isinstance(generated_counts, dict):
+        generated_counts = None
+    # Shared score-driven seat plan threaded from the cap layer. The budget layer reverses
+    # its keep-order for eviction so a lower-scored family (diff-derived or not) drops before
+    # a higher-scored one — the SAME ordering the cap seated by. Pop so it never leaks.
+    seat_plan = result.pop("_hypothesis_seat_plan", None)
+    if not isinstance(seat_plan, dict):
+        seat_plan = None
+    # Full pre-cap hypothesis rows threaded from the producer. Used to build
+    # inspection_areas for high/medium rows truncated at cap AND budget time. Pop so it
+    # never leaks to callers.
+    full_pre_cap = result.pop("_full_pre_cap_hypotheses", None)
+    full_pre_cap_hypotheses = (
+        [row for row in full_pre_cap if isinstance(row, dict)]
+        if isinstance(full_pre_cap, list)
+        else None
+    )
     measured = len(canonical_json(result))
     original_hypotheses = [
         row for row in _list_value(result.get("review_hypotheses")) if isinstance(row, dict)
@@ -618,7 +649,7 @@ def enforce_review_context_budget(
         # Sync mirror and emit status even when no compaction is needed so every packet
         # carries review_hypothesis_status regardless of packet size.
         _finalize_review_hypothesis_budget(
-            result, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+            result, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
         )
         return result
     if not include_broad_context:
@@ -630,9 +661,10 @@ def enforce_review_context_budget(
             max_chars=max_chars,
             measured_chars=measured,
             original_hypotheses=original_hypotheses,
+            seat_plan=seat_plan,
         )
         _finalize_review_hypothesis_budget(
-            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
         )
         if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
             compact["output_budget"]["exceeded_after_minimization"] = True
@@ -664,7 +696,7 @@ def enforce_review_context_budget(
                 truncated_sections=truncated_sections,
             )
             _finalize_review_hypothesis_budget(
-                backfilled, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+                backfilled, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
             )
             return backfilled
     # Even the tightest pass overshot (rare: dominated by non-row content); signal it like
@@ -674,7 +706,7 @@ def enforce_review_context_budget(
     compact = _protect_review_hypotheses_floor(compact, original_hypotheses, max_chars=max_chars)
     if len(canonical_json(compact)) <= max_chars:
         _finalize_review_hypothesis_budget(
-            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
         )
         return compact
     compact = _review_lead_only_budget_packet(
@@ -685,7 +717,7 @@ def enforce_review_context_budget(
         original_hypotheses=original_hypotheses,
     )
     _finalize_review_hypothesis_budget(
-        compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+        compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
     )
     if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
         compact["output_budget"]["exceeded_after_minimization"] = True
@@ -993,6 +1025,182 @@ _COMPACT_PROFILE_RESERVE = 2_200
 _COMPACT_EDGE_RESERVE = 1_200
 _COMPACT_EDGE_FIELDS = ("direct_callers", "direct_callees", "transitive_callers")
 
+# Risk types produced by diff-splice operations (contract_diff, semantic_diff,
+# abstract_contract). Budget truncation must keep at least one row per type when
+# rows of that type were generated, mirroring the reserved-slot guarantee in the
+# mcp_tools splice ordering.
+_DIFF_DERIVED_RISK_TYPES: frozenset[str] = frozenset(
+    {
+        "contract_semantic_diff",
+        "abstract_contract_unimplemented",
+        "guard_call_removed_drift",
+        "responsibility_moved_drift",
+        "test_reference_removed_drift",
+    }
+)
+
+
+_DERIVATION_TIER_RANK: dict[str, int] = {"deterministic_static": 0, "inferred_llm": 1}
+
+
+def _derivation_tier(derivation: str) -> int:
+    """Trust-tier rank used ONLY as a score tiebreak: deterministic > inferred > other."""
+    return _DERIVATION_TIER_RANK.get(derivation, 2)
+
+
+def compute_hypothesis_seat_plan(
+    rows: list[JsonObject],
+    *,
+    changed_files: list[str],
+    changed_symbols: list[JsonObject] | None = None,
+) -> JsonObject:
+    """Compute the single shared score-driven seat plan for the cap AND budget layers.
+
+    Every risk-type family (diff-derived AND non-diff) competes on the same basis. Each
+    family's representative is its best row by structural score (the same
+    score_hypothesis_row used by apply_structural_noise_downranking). Families are ordered by
+    descending representative score; the derivation trust tier (deterministic_static >
+    inferred_llm > other) is a TIEBREAK ONLY on equal scores, then the family's first list
+    position for determinism. There is no separate diff-derived carve-out on either axis:
+    seating AND eviction both consume this one ordering, so they can never diverge.
+
+    Returns a plan object ``{"ordered_types": [...], "scores": {rt: score}, "tiers":
+    {rt: tier_rank}, "representative_index": {rt: idx}, "representative_id": {rt: hid}}``.
+    ``ordered_types`` is keep-order (best first); reverse it for the eviction order
+    (lowest-scored family drops first). ``representative_index``/``representative_id`` identify
+    the exact best-scoring row per family so the cap keeps that row (not the family's first
+    occurrence). The cap seats ``ordered_types[:limit]`` (see plan_hypothesis_seats); the
+    budget layer threads this same plan so both agree.
+    """
+    first_index: dict[str, int] = {}
+    best_score: dict[str, float] = {}
+    derivation_by_type: dict[str, str] = {}
+    # Per-family representative: the best-scoring row's list index and stable hypothesis_id.
+    # The cap keeps this exact row (not the family's first occurrence, which can be a lower-
+    # scored peer in an earlier derivation tier), and the budget layer restores by this id.
+    representative_index: dict[str, int] = {}
+    representative_id: dict[str, str] = {}
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        rt = row.get("risk_type")
+        if rt is None:
+            continue
+        rt = str(rt)
+        score = score_hypothesis_row(row, changed_files, changed_symbols)
+        if rt not in first_index:
+            first_index[rt] = idx
+            best_score[rt] = score
+            derivation_by_type[rt] = str(row.get("derivation") or "")
+            representative_index[rt] = idx
+            representative_id[rt] = str(row.get("hypothesis_id") or "")
+        elif score > best_score[rt]:
+            # Representative is the family's best-scoring row; the tiebreak derivation is
+            # read from that best row so a family whose top row is deterministic seats as one.
+            # On equal scores the earlier row (strict >) stays the representative for determinism.
+            best_score[rt] = score
+            derivation_by_type[rt] = str(row.get("derivation") or "")
+            representative_index[rt] = idx
+            representative_id[rt] = str(row.get("hypothesis_id") or "")
+    ordered = sorted(
+        first_index,
+        key=lambda rt: (
+            -best_score[rt],
+            _derivation_tier(derivation_by_type[rt]),
+            first_index[rt],
+        ),
+    )
+    return {
+        "ordered_types": ordered,
+        "scores": {rt: best_score[rt] for rt in ordered},
+        "tiers": {rt: _derivation_tier(derivation_by_type[rt]) for rt in ordered},
+        "representative_index": {rt: representative_index[rt] for rt in ordered},
+        "representative_id": {rt: representative_id[rt] for rt in ordered},
+    }
+
+
+def plan_hypothesis_seats(
+    rows: list[JsonObject],
+    *,
+    limit: int,
+    changed_files: list[str],
+    changed_symbols: list[JsonObject] | None = None,
+) -> list[str]:
+    """Score-driven seated risk types for ``limit`` slots (thin wrapper on the shared plan).
+
+    Families beyond ``limit`` are dropped (their absence surfaces as truncated_by_risk_type,
+    never silent absence). See compute_hypothesis_seat_plan for the ordering policy.
+    """
+    if limit <= 0:
+        return []
+    plan = compute_hypothesis_seat_plan(
+        rows, changed_files=changed_files, changed_symbols=changed_symbols
+    )
+    return list(plan["ordered_types"])[:limit]
+
+
+def _sort_hypotheses_by_seat_plan_rows(
+    hypotheses: list[JsonObject],
+    seat_plan: JsonObject | None,
+) -> list[JsonObject]:
+    """Order hypotheses by (family_rank, is_not_representative, original_index).
+
+    Shared ranking used by BOTH _hypothesis_first_compact_packet (seating fill) AND
+    _rank_hypotheses_by_seat_plan (restore order). Within each risk-type family the
+    seat-plan representative row comes first; ties among non-representatives preserve
+    original list order. Families absent from the plan sort after all seated families.
+    When no plan is threaded or the plan carries no ordered_types, original order is kept.
+    """
+    keep_order = [rt for rt in _list_value((seat_plan or {}).get("ordered_types")) if isinstance(rt, str)]
+    if not keep_order:
+        return list(hypotheses)
+    keep_rank = {rt: idx for idx, rt in enumerate(keep_order)}
+    fallback_rank = len(keep_order)
+    rep_ids: dict[str, str] = {}
+    if isinstance(seat_plan, dict):
+        ri = seat_plan.get("representative_id")
+        if isinstance(ri, dict):
+            rep_ids = {str(k): str(v) for k, v in ri.items()}
+    pairs = sorted(
+        enumerate(hypotheses),
+        key=lambda pair: (
+            keep_rank.get(str(pair[1].get("risk_type")), fallback_rank),
+            # representative (is_not_rep=0) before others (is_not_rep=1) within its family
+            0 if (
+                isinstance(pair[1], dict)
+                and rep_ids.get(str(pair[1].get("risk_type")), "") != ""
+                and str(pair[1].get("hypothesis_id") or "") == rep_ids.get(str(pair[1].get("risk_type")), "")
+            ) else 1,
+            pair[0],  # original index for determinism
+        ),
+    )
+    return [h for _, h in pairs]
+
+
+def _lowest_scored_hypothesis_index(
+    hypotheses: list[JsonObject],
+    keep_rank: dict[str, int],
+    *,
+    protected: set[int],
+) -> int | None:
+    """Index of the row to evict first: the lowest-scored family (highest keep_rank), then the
+    LAST list position within that family. Reverses the shared seat plan's keep-order so
+    eviction and seating share one ordering. Protected rows (the floor) are never returned.
+    """
+    worst_idx: int | None = None
+    worst_key: tuple[int, int] | None = None
+    fallback_rank = len(keep_rank)
+    for idx, row in enumerate(hypotheses):
+        if id(row) in protected:
+            continue
+        rank = keep_rank.get(str(row.get("risk_type")), fallback_rank)
+        # Higher keep_rank = lower score = evict earlier; within a family, later position first.
+        key = (rank, idx)
+        if worst_key is None or key > worst_key:
+            worst_key = key
+            worst_idx = idx
+    return worst_idx
+
 
 def _lean_review_hypothesis(row: JsonObject) -> JsonObject:
     """Compact-profile hypothesis row: full adjudication fields, deduped coordinates.
@@ -1018,6 +1226,88 @@ def _lean_review_hypothesis(row: JsonObject) -> JsonObject:
     return lean
 
 
+# Ordered compaction stages for a lean hypothesis row when char pressure would otherwise
+# drop the last row of a generated diff family. Each stage trims one optional/verbose
+# field; the load-bearing fields (postable_claim, risk_type, label, hypothesis_id,
+# derivation, cause/consequence coords, concrete_invariant) are never touched. Applied
+# in order across all evictable rows before any family's last row is dropped.
+def _compact_hypothesis_stage(row: JsonObject, stage: int) -> bool:
+    """Apply one compaction stage to a lean hypothesis row in place.
+
+    Returns True if the stage removed content (the row shrank), False otherwise so the
+    caller can advance to the next stage. Stages, in order:
+      0. drop negative_checks beyond the first
+      1. drop negative_checks entirely
+      2. trim source_checks to the first
+      3. drop source_checks entirely
+      4. trim evidence_refs to the first coordinate
+      5. clamp the why prose tail
+    """
+    if stage == 0:
+        negatives = row.get("negative_checks")
+        if isinstance(negatives, list) and len(negatives) > 1:
+            row["negative_checks"] = negatives[:1]
+            return True
+        return False
+    if stage == 1:
+        if "negative_checks" in row:
+            del row["negative_checks"]
+            return True
+        return False
+    if stage == 2:
+        checks = row.get("source_checks")
+        if isinstance(checks, list) and len(checks) > 1:
+            row["source_checks"] = checks[:1]
+            return True
+        return False
+    if stage == 3:
+        if "source_checks" in row:
+            del row["source_checks"]
+            return True
+        return False
+    if stage == 4:
+        refs = row.get("evidence_refs")
+        if isinstance(refs, list) and len(refs) > 1 and row.get("source_spans"):
+            row["evidence_refs"] = refs[:1]
+            return True
+        return False
+    if stage == 5:
+        why = row.get("why")
+        if isinstance(why, str) and len(why) > _WHY_CLAMP_CHARS:
+            row["why"] = why[:_WHY_CLAMP_CHARS]
+            return True
+        return False
+    return False
+
+
+_WHY_CLAMP_CHARS = 240
+_HYPOTHESIS_COMPACT_STAGES = 6
+
+
+def _compact_hypothesis_rows_to_fit(
+    packet: JsonObject,
+    rows: list[JsonObject],
+    *,
+    budget: int,
+    protected_ids: set[int],
+) -> bool:
+    """Shrink already-kept hypothesis rows in staged order until ``packet`` fits ``budget``.
+
+    Trims optional/verbose fields (per _compact_hypothesis_stage) on every non-protected
+    row before any diff family's last row is dropped. Returns True if the packet now fits.
+    """
+    if _current_chars(packet) <= budget:
+        return True
+    for stage in range(_HYPOTHESIS_COMPACT_STAGES):
+        for row in rows:
+            if id(row) in protected_ids:
+                continue
+            if _compact_hypothesis_stage(row, stage):
+                if _current_chars(packet) <= budget:
+                    return True
+    return _current_chars(packet) <= budget
+
+
 _TIGHT_ANCHOR_KEYS = ("lead_id", "repo", "path", "qualname", "display_name", "line", "end_line")
 
 
@@ -1026,7 +1316,7 @@ def _tight_cluster_anchor(row: JsonObject) -> JsonObject:
     return {key: row[key] for key in _TIGHT_ANCHOR_KEYS if row.get(key) is not None}
 
 
-_SLIM_MIRROR_HYPOTHESIS_KEYS = ("hypothesis_id", "risk_type", "specificity", "confidence", "postable_claim")
+_SLIM_MIRROR_HYPOTHESIS_KEYS = ("hypothesis_id", "label", "risk_type", "specificity", "confidence", "postable_claim", "derivation")
 
 
 def _slim_mirror_hypothesis(row: JsonObject) -> JsonObject:
@@ -1045,6 +1335,7 @@ def _hypothesis_first_compact_packet(
     max_chars: int,
     measured_chars: int,
     original_hypotheses: list[JsonObject],
+    seat_plan: JsonObject | None = None,
 ) -> JsonObject:
     """Compose the B4 hypothesis-first compact packet in priority order.
 
@@ -1059,6 +1350,13 @@ def _hypothesis_first_compact_packet(
     Broad application/runtime/framework sections are never included. The caller runs
     _finalize_review_hypothesis_budget afterwards for mirror sync, cluster repair,
     hypothesis status, and the P2 truncation summary.
+
+    ``seat_plan`` is the shared score-driven plan the cap layer seated by. When char
+    pressure forces dropping seated hypothesis rows, families are evicted in ASCENDING
+    representative-score order (lowest-scored family first) — reversing the plan's keep-order
+    — with derivation tier and list position as tiebreaks only. Diff-derived vs non-diff is
+    NOT a separate eviction axis. Compact-before-evict still runs first: optional/verbose
+    fields are trimmed on kept rows before any family's last row is dropped.
     """
     review_leads = result.get("review_leads") if isinstance(result.get("review_leads"), dict) else {}
     lead_status = result.get("review_lead_status") if isinstance(result.get("review_lead_status"), dict) else {}
@@ -1141,15 +1439,62 @@ def _hypothesis_first_compact_packet(
     hypothesis_budget = max(1, fill_budget - anchor_cost - _COMPACT_EDGE_RESERVE)
     anchor_budget = max(1, fill_budget - _COMPACT_EDGE_RESERVE)
 
-    # Tier 2: hypotheses. The first is the floor (always kept); the rest are budget-checked
-    # against the hypothesis tier budget so anchors and edges are never starved.
+    # Tier 2: hypotheses, seated by the SHARED score-driven plan and evicted by its reverse.
+    # The cap threads its plan (score-ordered, diff-derived and non-diff competing on one
+    # basis); recompute only when it is absent (standalone callers/fixtures). The budget layer
+    # must NOT recompute from review_leads.changed_symbols — those are sliced to
+    # PLANNING_CONTEXT_SECTION_LIMIT, so recomputed scores could diverge from the cap's.
+    seat_changed_files = _list_value(review_leads.get("changed_files"))
+    seat_changed_symbols = [
+        row for row in _list_value(review_leads.get("changed_symbols")) if isinstance(row, dict)
+    ]
+    if seat_plan is None:
+        seat_plan = compute_hypothesis_seat_plan(
+            original_hypotheses,
+            changed_files=seat_changed_files,
+            changed_symbols=seat_changed_symbols,
+        )
+    keep_order = [rt for rt in _list_value(seat_plan.get("ordered_types")) if isinstance(rt, str)]
+    keep_rank = {rt: idx for idx, rt in enumerate(keep_order)}
+    # Fill in seat-plan keep-order: representative first within its family, then by original
+    # index. This ensures a low-score first row in a family never displaces its representative.
+    # Families not in the plan (defensive: unseen risk types) sort after all seated families.
+    fallback_rank = len(keep_order)
+    seated_hyps = _sort_hypotheses_by_seat_plan_rows(
+        [h for h in original_hypotheses if isinstance(h, dict)],
+        seat_plan,
+    )
     hypotheses: list[JsonObject] = []
     packet["review_hypotheses"] = hypotheses
-    for index, hyp in enumerate(original_hypotheses):
-        hypotheses.append(_lean_review_hypothesis(hyp))
-        if index > 0 and _current_chars(packet) > hypothesis_budget:
-            hypotheses.pop()
-            break
+    for index, hyp in enumerate(seated_hyps):
+        lean_row = _lean_review_hypothesis(hyp)
+        hypotheses.append(lean_row)
+        # index 0 is the floor: the highest-scored family's row is always kept.
+        if index == 0 or _current_chars(packet) <= hypothesis_budget:
+            continue
+        # Over budget: compact-before-evict — trim optional/verbose fields on every kept row
+        # (protecting the floor row) before dropping any family's last row.
+        if _compact_hypothesis_rows_to_fit(
+            packet,
+            hypotheses,
+            budget=hypothesis_budget,
+            protected_ids={id(hypotheses[0])},
+        ):
+            continue
+        # Still over budget after full compaction. Evict the LOWEST-scored family's last row
+        # first (ascending representative-score order = reverse of the seat plan), never a
+        # separate diff-derived axis. Never evict the floor row. A dropped family surfaces in
+        # truncated_by_risk_type via _finalize_review_hypothesis_budget, never silent absence.
+        while _current_chars(packet) > hypothesis_budget and len(hypotheses) > 1:
+            evict_idx = _lowest_scored_hypothesis_index(hypotheses, keep_rank, protected={id(hypotheses[0])})
+            if evict_idx is None:
+                break
+            hypotheses.pop(evict_idx)
+            if _current_chars(packet) <= hypothesis_budget:
+                break
+            _compact_hypothesis_rows_to_fit(
+                packet, hypotheses, budget=hypothesis_budget, protected_ids={id(hypotheses[0])}
+            )
 
     # Tier 3: append the pre-computed anchors (budget guard for pathological fixtures
     # where even the anchor set alone exceeds the cap).
@@ -3229,8 +3574,8 @@ def _compact_coordinate(row: JsonObject) -> JsonObject:
 
 def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
     compact: JsonObject = {}
-    for key in ("hypothesis_id", "risk_type", "confidence", "why", "concrete_invariant",
-                "specificity", "postable_claim", "cause", "consequence"):
+    for key in ("hypothesis_id", "label", "risk_type", "confidence", "why", "concrete_invariant",
+                "specificity", "postable_claim", "cause", "consequence", "derivation"):
         if key in row:
             compact[key] = row[key]
     evidence_refs = row.get("evidence_refs")
@@ -3644,7 +3989,12 @@ def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]
     return evicted
 
 
-def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: list[JsonObject]) -> None:
+def _attach_review_hypothesis_status(
+    result: JsonObject,
+    original_hypotheses: list[JsonObject],
+    *,
+    generated_counts: JsonObject | None = None,
+) -> None:
     """Write review_hypothesis_status in-place on result.
 
     Emits the status dict so consumers can distinguish none-generated, budget-dropped,
@@ -3653,18 +4003,45 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
     other rows are evictable, _finalize_review_hypothesis_budget drops it — the hard cap
     always wins over metadata.
 
+    ``original_hypotheses`` is the CAPPED set the budget layer saw (top_review_hypotheses
+    were sliced to PLANNING_CONTEXT_SECTION_LIMIT before budgeting). When the producer
+    attaches pre-cap ``generated_counts`` (available_count + by_risk_type over the FULL
+    generated set), they are preferred for the available-side counts so cap-time drops are
+    reported as truncation rather than silent absence. Absent that, the capped set is used
+    (back-compat for callers/fixtures that do not carry the producer counts).
+
     Fields:
-      available_count — hypotheses generated pre-budget
+      available_count — hypotheses generated pre-budget AND pre-cap
       returned_count — top-level survivors
       answer_packet_returned_count — mirror survivors in review_answer_packet.top_review_hypotheses
       truncated_count — available - returned
       reason — "none_generated" | "budget" | "low_coverage" | null
-      available_risk_types — sorted list of risk_type strings from the pre-budget generated set
+      available_risk_types — sorted list of risk_type strings from the pre-cap generated set
         (not truncated by budget; bounded at 12 entries; empty when no hypotheses generated)
+      available_by_risk_type — counts over ALL generated hypotheses before cap+budget truncation
+      returned_by_risk_type — counts over hypotheses present in the final packet
+      truncated_by_risk_type — available minus returned per type; zero entries omitted
     """
     _MAX_AVAILABLE_RISK_TYPES = 12
-    available = len(original_hypotheses)
-    returned = len([h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)])
+    capped_by_risk_type: dict[str, int] = {}
+    for h in original_hypotheses:
+        if isinstance(h, dict) and h.get("risk_type"):
+            rt = str(h["risk_type"])
+            capped_by_risk_type[rt] = capped_by_risk_type.get(rt, 0) + 1
+    if generated_counts is not None:
+        raw_avail = generated_counts.get("available_count")
+        available = int(raw_avail) if isinstance(raw_avail, int) else len(original_hypotheses)
+        raw_by_type = generated_counts.get("by_risk_type")
+        available_by_risk_type: dict[str, int] = (
+            {str(k): int(v) for k, v in raw_by_type.items() if isinstance(v, int)}
+            if isinstance(raw_by_type, dict)
+            else dict(capped_by_risk_type)
+        )
+    else:
+        available = len(original_hypotheses)
+        available_by_risk_type = dict(capped_by_risk_type)
+    final_hyps = [h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)]
+    returned = len(final_hyps)
     answer_packet = result.get("review_answer_packet")
     if isinstance(answer_packet, dict):
         mirror_hyps = answer_packet.get("top_review_hypotheses")
@@ -3684,9 +4061,17 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
         reason = "budget"
     else:
         reason = None
-    available_risk_types = sorted(
-        {str(h.get("risk_type") or "") for h in original_hypotheses if isinstance(h, dict) and h.get("risk_type")}
-    )[:_MAX_AVAILABLE_RISK_TYPES]
+    available_risk_types = sorted(available_by_risk_type)[:_MAX_AVAILABLE_RISK_TYPES]
+    returned_by_risk_type: dict[str, int] = {}
+    for h in final_hyps:
+        if h.get("risk_type"):
+            rt = str(h["risk_type"])
+            returned_by_risk_type[rt] = returned_by_risk_type.get(rt, 0) + 1
+    truncated_by_risk_type = {
+        rt: available_by_risk_type[rt] - returned_by_risk_type.get(rt, 0)
+        for rt in available_by_risk_type
+        if available_by_risk_type[rt] - returned_by_risk_type.get(rt, 0) > 0
+    }
     result["review_hypothesis_status"] = {
         "available_count": available,
         "returned_count": returned,
@@ -3694,6 +4079,9 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
         "truncated_count": truncated_count,
         "reason": reason,
         "available_risk_types": available_risk_types,
+        "available_by_risk_type": available_by_risk_type,
+        "returned_by_risk_type": returned_by_risk_type,
+        "truncated_by_risk_type": truncated_by_risk_type,
     }
 
 
@@ -4149,12 +4537,38 @@ def _repair_cluster_coverage(
 _REVIEW_HYPOTHESIS_HEADROOM_TARGET = 3
 
 
+def _rank_hypotheses_by_seat_plan(
+    hypotheses: list[JsonObject],
+    seat_plan: JsonObject | None,
+) -> list[JsonObject]:
+    """Order hypotheses by the shared seat plan's keep-order (representative first within family).
+
+    Delegates to _sort_hypotheses_by_seat_plan_rows so seating and restore consume the
+    SAME order: (family_rank, is_not_representative, original_index). Families not in the
+    plan (or when no plan is threaded) keep their original relative order after all seated
+    families.
+    """
+    return _sort_hypotheses_by_seat_plan_rows(hypotheses, seat_plan)
+
+
+def _hypothesis_identity(row: JsonObject) -> object:
+    """Stable identity for dedup: hypothesis_id (always producer-set), then label, then id()."""
+    hid = row.get("hypothesis_id")
+    if isinstance(hid, str) and hid:
+        return ("hid", hid)
+    label = row.get("label")
+    if isinstance(label, str) and label:
+        return ("label", label)
+    return ("obj", id(row))
+
+
 def _restore_hypotheses_up_to_target(
     result: JsonObject,
     original_hypotheses: list[JsonObject],
     *,
     max_chars: int,
     target: int,
+    seat_plan: JsonObject | None = None,
 ) -> set[str]:
     """N2: Evict broad-context rows to fund up to ``target`` compacted hypotheses.
 
@@ -4162,15 +4576,33 @@ def _restore_hypotheses_up_to_target(
     broad context. This step only evicts from broad application/runtime/framework sections
     (and their answer-packet mirrors) — never from lead/coordinate/anchor sections.
     Returns the set of section labels that had rows evicted.
+
+    Restores in the SAME ranked order the compactor seated by (via ``seat_plan``), skipping
+    hypotheses already present (deduped by hypothesis_id, then label, then object identity).
+    This prevents duplicating an already-seated row and prevents restoring a lower-scored row
+    ahead of a higher-scored one when the current rows are not an original-order prefix.
     """
     if not original_hypotheses:
         return set()
     current_hyps = [h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)]
     if len(current_hyps) >= min(target, len(original_hypotheses)):
         return set()
+    present = {_hypothesis_identity(h) for h in current_hyps}
+    ranked = _rank_hypotheses_by_seat_plan(
+        [h for h in original_hypotheses if isinstance(h, dict)], seat_plan
+    )
+    remaining_slots = target - len(current_hyps)
+    to_restore: list[JsonObject] = []
+    for hyp in ranked:
+        if remaining_slots <= 0:
+            break
+        if _hypothesis_identity(hyp) in present:
+            continue
+        to_restore.append(hyp)
+        remaining_slots -= 1
     evicted: set[str] = set()
     # Try to restore hypotheses one by one (compacted), evicting broad context as needed.
-    for hyp in original_hypotheses[len(current_hyps) : target]:
+    for hyp in to_restore:
         compact_hyp = _compact_review_hypothesis(hyp)
         hyp_cost = len(canonical_json(compact_hyp))
         # Evict broad-context rows until there is room for this hypothesis.
@@ -4198,9 +4630,16 @@ def _restore_hypotheses_up_to_target(
 _QUALITY_SPECIFICITY_RANK: dict[str, int] = {"high": 2, "medium": 1, "low": 0}
 
 
+_TRUNCATED_INSPECTION_AREA_CAP = 5
+
+
 def _sync_review_quality_status_from_packet(
     result: JsonObject,
     original_hypotheses: list[JsonObject],
+    *,
+    full_pre_cap_hypotheses: list[JsonObject] | None = None,
+    max_chars: int | None = None,
+    fund_over_cap: bool = False,
 ) -> None:
     """Recompute review_quality_status counts from the FINAL review_hypotheses in result.
 
@@ -4208,6 +4647,14 @@ def _sync_review_quality_status_from_packet(
     packet after all budget passes. When truncation removed high-specificity rows that
     were generated, ``generated_specific_hypothesis_count`` is added so the caller can
     distinguish "none generated" from "generated but truncated".
+
+    C1 (readiness honesty): when high/medium-specificity rows were truncated at cap OR
+    budget time — even if a high/medium row survived — review_readiness is downgraded to
+    ``needs_followup`` and the truncated high/medium rows are converted into compact
+    ``inspection_areas`` (capped, with a remainder count) plus concrete suggested_followups,
+    so truncation never implies the absence of those risks. ``full_pre_cap_hypotheses`` is
+    the producer's full pre-cap set; without it the capped set (``original_hypotheses``) is
+    used as the available set (back-compat for standalone callers/fixtures).
     """
     status = result.get("review_quality_status")
     if not isinstance(status, dict):
@@ -4247,13 +4694,73 @@ def _sync_review_quality_status_from_packet(
             "All generated hypotheses are generic (no signal/delta or convention-specific evidence); "
             "live source inspection will yield higher precision."
         )
+    base_diff_note = status.get("base_diff_status")
+    if base_diff_note == "missing":
+        base_reason = (
+            f"{base_reason} Head-only packet. Contract-diff families are disabled; "
+            "recall expected to be low for ownership/guard/provenance/type-shape changes."
+        )
     synced["reason"] = f"{base_reason} {contract_note}" if contract_note else base_reason
+    # Preserve S1 measurement-validity fields through the sync rewrite.
+    # review_readiness is recomputed from FINAL max_spec (Minor 13 fix) — not blindly preserved.
+    for _s1_key in (
+        "base_diff_status",
+        "suggested_setup",
+        "suggested_followups",
+        "semantic_diff_status",
+        "semantic_diff_stats",
+        "abstract_contract_status",
+    ):
+        if _s1_key in status:
+            synced[_s1_key] = status[_s1_key]
+    # C1: identify high/medium rows truncated at cap OR budget time. The available set is
+    # the producer's full pre-cap list when threaded; otherwise the capped set. Returned
+    # rows are matched by stable hypothesis_id so cap-time and budget-time drops both count.
+    available_hyps = (
+        [h for h in full_pre_cap_hypotheses if isinstance(h, dict)]
+        if full_pre_cap_hypotheses is not None
+        else [h for h in original_hypotheses if isinstance(h, dict)]
+    )
+    returned_ids = {
+        str(h.get("hypothesis_id"))
+        for h in final_hyps
+        if isinstance(h, dict) and h.get("hypothesis_id")
+    }
+    truncated_specific_rows = [
+        h
+        for h in available_hyps
+        if str(h.get("specificity") or "low") in ("high", "medium")
+        and str(h.get("hypothesis_id")) not in returned_ids
+    ]
+    truncated_high_rows = [
+        h for h in truncated_specific_rows if str(h.get("specificity") or "low") == "high"
+    ]
+
+    # Minor 13 + C1: recompute review_readiness from the final (post-budget) max_spec and
+    # base_diff_status. Pre-budget max_spec may have been "high" (packet_ready) but after
+    # truncation the surviving rows may be low, so readiness must reflect actual content.
+    # C1: even when a high/medium row SURVIVED, downgrade packet_ready → needs_followup if
+    # any high/medium row was truncated — a partial packet is not ready to review from alone.
+    if base_diff_note == "missing" and max_spec not in ("high", "medium"):
+        synced["review_readiness"] = "base_snapshot_required"
+    elif max_spec in ("high", "medium"):
+        synced["review_readiness"] = (
+            "needs_followup" if truncated_specific_rows else "packet_ready"
+        )
+    else:
+        # Preserve needs_followup/plain_review_better from status — those routing decisions depend
+        # on suggested_followups content and remain valid post-budget.
+        # Do NOT preserve "packet_ready" when max_spec is now low (stale from pre-budget status).
+        orig_readiness = status.get("review_readiness", "plain_review_better")
+        synced["review_readiness"] = (
+            orig_readiness if orig_readiness != "packet_ready" else "plain_review_better"
+        )
     # Honesty: if truncation removed high-specificity rows that were generated, record the
     # pre-budget count so the caller can distinguish "none generated" from "truncated away".
     orig_specific = sum(
         1
-        for h in original_hypotheses
-        if isinstance(h, dict) and str(h.get("specificity") or "low") in ("high", "medium")
+        for h in available_hyps
+        if str(h.get("specificity") or "low") in ("high", "medium")
     )
     if orig_specific > specific_count:
         synced["generated_specific_hypothesis_count"] = orig_specific
@@ -4264,7 +4771,205 @@ def _sync_review_quality_status_from_packet(
             )
     elif "generated_specific_hypothesis_count" in synced:
         del synced["generated_specific_hypothesis_count"]
+
+    # C1: convert truncated high/medium rows into compact inspection_areas + concrete
+    # followups so truncation never implies absence. Only when readiness actually downgraded.
+    if synced.get("review_readiness") == "needs_followup" and truncated_specific_rows:
+        _attach_truncated_hypothesis_followups(
+            synced,
+            truncated_specific_rows=truncated_specific_rows,
+            truncated_high_rows=truncated_high_rows,
+        )
+    else:
+        synced.pop("inspection_areas", None)
+
     result["review_quality_status"] = synced
+    # C1: fund the added inspection_areas/followups inside the hard cap by evicting broad
+    # rows if the status object now overshoots. The hard cap always wins over the affordance.
+    if max_chars is not None and _current_chars(result) > max_chars:
+        # fund_over_cap: the hypothesis_first packet routinely sits at/over the cap after
+        # compaction, so trimming inspection_areas first would always erase the C1 honesty
+        # signal. Evict lower-priority rows to fund it (like review_hypothesis_status),
+        # then fall back to trimming the affordance only if the packet still overshoots.
+        if fund_over_cap and isinstance(synced.get("inspection_areas"), dict):
+            _evict_review_rows_to_fit(result, max_chars=max_chars)
+            _sync_review_lead_status_from_packet(result)
+        if _current_chars(result) > max_chars:
+            _trim_review_quality_status_to_fit(result, max_chars=max_chars)
+
+
+def _inspection_area_from_hypothesis(row: JsonObject) -> JsonObject:
+    """Compact inspection_area from a truncated hypothesis row.
+
+    Structural fields only (no text parsing): coords sourced from the row's cause, then
+    consequence, then first source_span. Shape: {repo, path, line, symbol/qualname (when
+    available), risk_type, search_terms}. Empty coord keys are omitted so the row stays lean.
+    """
+    coord: JsonObject = {}
+    for candidate in (row.get("cause"), row.get("consequence")):
+        if isinstance(candidate, dict):
+            coord = candidate
+            break
+    if not coord:
+        spans = row.get("source_spans")
+        if isinstance(spans, list) and spans and isinstance(spans[0], dict):
+            coord = spans[0]
+    area: JsonObject = {"risk_type": str(row.get("risk_type") or "")}
+    repo = coord.get("repo")
+    if repo:
+        area["repo"] = str(repo)
+    path = coord.get("path")
+    if path:
+        area["path"] = str(path)
+    line = coord.get("line_start")
+    if line is None:
+        line = coord.get("line")
+    if isinstance(line, int):
+        area["line"] = line
+    symbol = coord.get("qualname") or coord.get("qualified_name")
+    if symbol:
+        area["symbol"] = str(symbol)
+    label = row.get("label")
+    if label:
+        area["label"] = str(label)
+    search_terms: list[str] = []
+    if symbol:
+        search_terms.append(str(symbol))
+    callee = coord.get("callee") or coord.get("call")
+    if callee:
+        search_terms.append(str(callee))
+    if search_terms:
+        area["search_terms"] = search_terms
+    return area
+
+
+def _attach_truncated_hypothesis_followups(
+    synced: JsonObject,
+    *,
+    truncated_specific_rows: list[JsonObject],
+    truncated_high_rows: list[JsonObject],
+) -> None:
+    """Populate inspection_areas (capped, with remainder count) and merge concrete
+    suggested_followups for truncated high-specificity families onto ``synced`` in place."""
+    areas = [
+        _inspection_area_from_hypothesis(h)
+        for h in truncated_specific_rows[:_TRUNCATED_INSPECTION_AREA_CAP]
+    ]
+    if areas:
+        block: JsonObject = {"areas": areas}
+        remaining = len(truncated_specific_rows) - len(areas)
+        if remaining > 0:
+            block["omitted_count"] = remaining
+        synced["inspection_areas"] = block
+    # One concrete followup per truncated high-specificity family (re-run narrowed).
+    existing_followups = [
+        f for f in _list_value(synced.get("suggested_followups")) if isinstance(f, dict)
+    ]
+    seen_families = {
+        str(f.get("risk_type")) for f in existing_followups if f.get("risk_type")
+    }
+    new_followups: list[JsonObject] = []
+    for row in truncated_high_rows:
+        rt = str(row.get("risk_type") or "")
+        if not rt or rt in seen_families:
+            continue
+        seen_families.add(rt)
+        area = _inspection_area_from_hypothesis(row)
+        path = area.get("path")
+        symbol = area.get("symbol")
+        anchor = symbol or path or rt
+        new_followups.append({
+            "tool": "review_context",
+            "risk_type": rt,
+            "why": (
+                f"Truncated high-specificity {rt} hypothesis on {anchor}; re-run review_context "
+                "narrowed to that path/symbol to surface it and its evidence in full."
+            ),
+        })
+    if new_followups:
+        synced["suggested_followups"] = existing_followups + new_followups
+
+
+def _trim_review_quality_status_to_fit(result: JsonObject, *, max_chars: int) -> None:
+    """Shrink the C1 review_quality_status affordances until the packet fits the hard cap.
+
+    review_quality_status is in _HARD_CAP_PROTECTED_KEYS, so _evict_review_rows_to_fit cannot
+    shrink it; this is the only place its bounded C1 affordances (inspection_areas, then
+    suggested_followups) are trimmed. Ladder, cheapest-honesty-loss first:
+      1. Evict inspection_area rows (tracking omitted_count) then drop the block.
+      2. Trim suggested_followups oldest/lowest-value first: keep at most 1, then drop all.
+    The hard-cap guarantee always wins over these affordances."""
+    status = result.get("review_quality_status")
+    if not isinstance(status, dict):
+        return
+    block = status.get("inspection_areas")
+    if isinstance(block, dict):
+        areas = [a for a in _list_value(block.get("areas")) if isinstance(a, dict)]
+        while areas and _current_chars(result) > max_chars:
+            areas.pop()
+            block["omitted_count"] = int(block.get("omitted_count") or 0) + 1
+            block["areas"] = areas
+        if not areas or _current_chars(result) > max_chars:
+            status.pop("inspection_areas", None)
+    # suggested_followups next: trim oldest/lowest-value (list head) first down to at most 1,
+    # then drop the key entirely. The followups are ordered producer-first (oldest first), so
+    # popping index 0 sheds the lowest-value entry while keeping the freshest single followup.
+    if _current_chars(result) > max_chars:
+        followups = [f for f in _list_value(status.get("suggested_followups")) if isinstance(f, dict)]
+        while len(followups) > 1 and _current_chars(result) > max_chars:
+            followups.pop(0)
+            status["suggested_followups"] = followups
+        if followups and _current_chars(result) > max_chars:
+            status.pop("suggested_followups", None)
+
+
+# C2/rec-6: instruction telling ANY consuming agent (any harness) to cite the labels in
+# findings that rely on them, so downstream reviewer TPs carry measurable attribution.
+_ATTRIBUTION_LABELS_INSTRUCTION = (
+    "Cite the matching label in any review finding that relies on a returned hypothesis."
+)
+
+
+def _attach_attribution_labels(result: JsonObject, *, max_chars: int, fund_over_cap: bool = False) -> None:
+    """Attach review_answer_packet.attribution_labels — a compact affordance at the top of
+    the answer packet listing the returned hypothesis labels plus a cite instruction.
+
+    Computed from the FINAL top-level review_hypotheses so the labels exactly match the
+    rows the packet returned. The affordance is lean (labels + one instruction, typically
+    <300 chars). When ``fund_over_cap`` is True and attaching it pushes the packet over the
+    hard cap, lower-priority rows are evicted to fund it (mirroring review_hypothesis_status);
+    it is dropped only if the packet still overshoots after that eviction. When
+    ``fund_over_cap`` is False the affordance is simply dropped on overshoot (hard cap wins).
+    """
+    answer_packet = result.get("review_answer_packet")
+    if not isinstance(answer_packet, dict):
+        return
+    labels: list[str] = []
+    seen: set[str] = set()
+    for h in _list_value(result.get("review_hypotheses")):
+        if not isinstance(h, dict):
+            continue
+        label = h.get("label")
+        if isinstance(label, str) and label and label not in seen:
+            seen.add(label)
+            labels.append(label)
+    if not labels:
+        answer_packet.pop("attribution_labels", None)
+        return
+    answer_packet["attribution_labels"] = {
+        "labels": labels,
+        "instruction": _ATTRIBUTION_LABELS_INSTRUCTION,
+    }
+    if _current_chars(result) <= max_chars:
+        return
+    # Over cap: fund the affordance by evicting lower-priority rows before conceding.
+    if fund_over_cap:
+        _evict_review_rows_to_fit(result, max_chars=max_chars)
+        _sync_review_lead_status_from_packet(result)
+        if _current_chars(result) <= max_chars:
+            return
+    # Hard cap still wins over the affordance.
+    answer_packet.pop("attribution_labels", None)
 
 
 def _finalize_review_hypothesis_budget(
@@ -4273,6 +4978,9 @@ def _finalize_review_hypothesis_budget(
     *,
     original_review_leads: JsonObject,
     max_chars: int,
+    generated_counts: JsonObject | None = None,
+    seat_plan: JsonObject | None = None,
+    full_pre_cap_hypotheses: list[JsonObject] | None = None,
 ) -> None:
     """Sync the answer-packet mirror, attach review_hypothesis_status, and keep under the cap.
 
@@ -4310,6 +5018,7 @@ def _finalize_review_hypothesis_budget(
         original_hypotheses,
         max_chars=max_chars,
         target=_REVIEW_HYPOTHESIS_HEADROOM_TARGET,
+        seat_plan=seat_plan,
     )
     if broad_evicted:
         _sync_review_lead_status_from_packet(result)
@@ -4319,14 +5028,14 @@ def _finalize_review_hypothesis_budget(
     # Sync mirror within budget: keep as many top-level hypotheses as fit in the mirror,
     # starting from the highest-ranked (first). If none fit, mirror is empty — recorded in status.
     _sync_review_hypothesis_mirror_within_budget(result, max_chars=max_chars)
-    _attach_review_hypothesis_status(result, original_hypotheses)
+    _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
     # The truncated_sections bookkeeping itself costs chars, so iterate until stable.
     for _ in range(5):
         evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
         if not evicted:
             break
         _sync_review_lead_status_from_packet(result)
-        _attach_review_hypothesis_status(result, original_hypotheses)
+        _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
         budget = result.get("output_budget")
         if isinstance(budget, dict):
             budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
@@ -4334,11 +5043,11 @@ def _finalize_review_hypothesis_budget(
     # approximately size-neutral, so re-run the eviction/status cycle if the cap moved.
     if _repair_cluster_coverage(result, original_review_leads, original_hypotheses, max_chars=max_chars):
         _sync_review_lead_status_from_packet(result)
-        _attach_review_hypothesis_status(result, original_hypotheses)
+        _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
         evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
         if evicted:
             _sync_review_lead_status_from_packet(result)
-            _attach_review_hypothesis_status(result, original_hypotheses)
+            _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
             budget = result.get("output_budget")
             if isinstance(budget, dict):
                 budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
@@ -4354,14 +5063,34 @@ def _finalize_review_hypothesis_budget(
     # bulk, so it may be funded by evicting low-priority rows (leads last); any lead rows
     # it evicts become part of the omitted counts it reports.
     _attach_truncation_summary_within_budget(
-        result, original_review_leads, original_hypotheses, max_chars=max_chars
+        result, original_review_leads, original_hypotheses, max_chars=max_chars,
+        generated_counts=generated_counts,
     )
     # The funding eviction above may have dropped further lead rows; reconcile again so
     # hypotheses never cite lead_ids that no longer exist in the packet.
     _reconcile_hypothesis_lead_ids(result)
+    # Attribution-label affordance (C2/rec-6): fund FIRST — it is tiny (<300 chars) and
+    # must be unconditional whenever any hypothesis rows are returned.  Running it before
+    # _sync_review_quality_status_from_packet ensures inspection_areas never starves it by
+    # consuming all eviction slack.  Hard cap still wins: labels are dropped only if the
+    # packet overshoots after its own eviction pass.
+    _attach_attribution_labels(result, max_chars=max_chars, fund_over_cap=True)
     # Sync review_quality_status counts from the FINAL review_hypotheses so specific/generic
-    # counts describe rows actually returned, not the pre-budget set.
-    _sync_review_quality_status_from_packet(result, original_hypotheses)
+    # counts describe rows actually returned, not the pre-budget set. Also downgrades
+    # review_readiness and attaches inspection_areas when high/medium rows were truncated.
+    # fund_over_cap=True: the C1 inspection_areas affordance is a truncation-honesty signal;
+    # like review_hypothesis_status it is funded by evicting lower-priority rows rather than
+    # silently dropped when the hypothesis_first packet already sits at/over the cap.
+    # Runs AFTER attribution_labels so inspection_areas shrinks before labels are ever evicted.
+    _sync_review_quality_status_from_packet(
+        result, original_hypotheses, full_pre_cap_hypotheses=full_pre_cap_hypotheses,
+        max_chars=max_chars, fund_over_cap=True,
+    )
+    # The two fund_over_cap passes above (_attach_attribution_labels and the quality-status
+    # sync) can evict further lead rows to fund their affordances. Reconcile once more so no
+    # surviving hypothesis cites a lead_id absent from the final review_leads. Reconciliation
+    # only removes stale ids (shrink-or-equal), so it can never breach the cap.
+    _reconcile_hypothesis_lead_ids(result)
     # Re-mirror top-level changed_symbols from review_leads.changed_symbols.
     # _repair_cluster_coverage and the gated re-interleave both de-alias the two lists.
     # Tandem clipping in _evict_review_rows_to_fit keeps review_leads.changed_symbols in
@@ -4374,6 +5103,44 @@ def _finalize_review_hypothesis_budget(
         _rl_cs = _rl["changed_symbols"]
         if isinstance(result.get("changed_symbols"), list):
             result["changed_symbols"] = list(_rl_cs)
+    # Final hard-cap fallback: the cap is a CONTRACT the review-context lead gate and packet
+    # consumers rely on. _sync_review_quality_status_from_packet can grow the protected
+    # review_quality_status (suggested_followups + inspection_areas) after the last generic
+    # eviction pass, and those keys are in _HARD_CAP_PROTECTED_KEYS so _evict_review_rows_to_fit
+    # cannot shrink them. Trim the bounded status affordances until the packet fits.
+    if max_chars is not None and _current_chars(result) > max_chars:
+        _trim_review_quality_status_to_fit(result, max_chars=max_chars)
+        # attribution_labels is the LAST affordance dropped: it is funded first above and is
+        # the most valuable head-start affordance, so it survives every status trim. But it IS
+        # droppable — it fit at attach time, then review_quality_status growth can push the
+        # packet over the cap. If trimming the status affordances is not enough, drop the
+        # labels and re-measure BEFORE declaring the packet irreducible; otherwise the packet
+        # would be marked exceeded_after_minimization with a droppable affordance still present.
+        if _current_chars(result) > max_chars:
+            answer_packet = result.get("review_answer_packet")
+            if isinstance(answer_packet, dict) and "attribution_labels" in answer_packet:
+                answer_packet.pop("attribution_labels", None)
+        # Invariant enforcement. A residual overshoot is legitimate ONLY when irreducible
+        # protected content (e.g. the floor-of-1 review_hypotheses row) alone exceeds the
+        # cap — that case is flagged via output_budget.exceeded_after_minimization, never
+        # silently hidden. But an overshoot caused by the trimmable status affordances or the
+        # droppable attribution_labels affordance is a BUG: after the trim ladder, neither
+        # may remain when the packet is still over the cap.
+        if _current_chars(result) > max_chars:
+            _status = result.get("review_quality_status")
+            if isinstance(_status, dict):
+                assert "suggested_followups" not in _status and "inspection_areas" not in _status, (
+                    "review packet over hard cap with trimmable status affordances still "
+                    f"present: {sorted(k for k in ('suggested_followups', 'inspection_areas') if k in _status)}"
+                )
+            _ap = result.get("review_answer_packet")
+            if isinstance(_ap, dict):
+                assert "attribution_labels" not in _ap, (
+                    "review packet over hard cap with droppable attribution_labels still present"
+                )
+            budget = result.get("output_budget")
+            if isinstance(budget, dict):
+                budget["exceeded_after_minimization"] = True
 
 
 # Changed-symbol anchor lists are never evicted to fund the truncation summary: the
@@ -4457,6 +5224,7 @@ def _attach_truncation_summary_within_budget(
     original_hypotheses: list[JsonObject],
     *,
     max_chars: int,
+    generated_counts: JsonObject | None = None,
 ) -> None:
     """Attach output_budget.truncation_summary without ever exceeding the cap.
 
@@ -4495,7 +5263,7 @@ def _attach_truncation_summary_within_budget(
             if not evicted:
                 return
             _sync_review_lead_status_from_packet(result)
-            _attach_review_hypothesis_status(result, original_hypotheses)
+            _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
             budget = result.get("output_budget")
             if not isinstance(budget, dict):
                 return
@@ -4522,7 +5290,7 @@ def _attach_truncation_summary_within_budget(
                 break
         if funding_evicted:
             _sync_review_lead_status_from_packet(result)
-            _attach_review_hypothesis_status(result, original_hypotheses)
+            _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
             budget = result.get("output_budget")
             if isinstance(budget, dict):
                 budget["truncated_sections"] = sorted(

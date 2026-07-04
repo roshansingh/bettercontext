@@ -17,6 +17,8 @@ from source.kg.product.output_budget import (
     COMPACT_AUTHZ_INSPECTION_REF_LIMIT,
     PLANNING_CONTEXT_ANCHORED_MAX_CHARS,
     REVIEW_CONTEXT_BROAD_MAX_CHARS,
+    _DIFF_DERIVED_RISK_TYPES,
+    compute_hypothesis_seat_plan,
     enforce_planning_context_budget,
     enforce_review_context_budget,
     enforce_reverse_impact_budget,
@@ -25,11 +27,13 @@ from source.kg.product.output_budget import (
 from source.kg.product.edge_role import annotate_edge_roles, build_edge_role_index, rank_by_review_value
 from source.kg.product.review_attribution import (
     add_review_lead_ids,
+    hypothesis_label,
     review_available_counts,
     review_lead_counts,
 )
 from source.kg.product.review_hypotheses import (
     _FAMILY_SPECIFICITY,
+    apply_structural_noise_downranking,
     review_hypotheses_for_context,
 )
 from source.kg.product.runtime_architecture import ENDPOINT_PATH_SHAPE_MATCH_BASIS, runtime_architecture_packet
@@ -2358,9 +2362,25 @@ def _review_context_properties() -> JsonObject:
             "type": "string",
             "description": (
                 "Optional path to a base KG snapshot directory. When provided and loadable, runs a contract-diff "
-                "against the current snapshot and splices guard_call_removed_drift / responsibility_moved_drift / "
-                "test_reference_removed_drift hypotheses (specificity=high) into the review_hypotheses pipeline. "
+                "against the current snapshot and splices guard_call_removed_drift / responsibility_moved_drift "
+                "(specificity=high) and test_reference_removed_drift (specificity=medium; a test-surface concern) "
+                "hypotheses into the review_hypotheses pipeline. "
                 "Tenant mismatch or unloadable base snapshot is reported in review_quality_status.reason, never an error."
+            ),
+        },
+        "base_checkout": {
+            "type": "string",
+            "description": (
+                "Optional path to a base git checkout directory (the pre-PR source tree). "
+                "Required together with head_checkout and base_snapshot to activate semantic contract-diff (S2). "
+                "When all three are present, the LLM analyzes symbol body-text changes for semantic contract violations."
+            ),
+        },
+        "head_checkout": {
+            "type": "string",
+            "description": (
+                "Optional path to a head git checkout directory (the post-PR source tree). "
+                "Required together with base_checkout and base_snapshot to activate semantic contract-diff (S2)."
             ),
         },
     }
@@ -2730,6 +2750,8 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     include_deploy_blockers = _optional_bool(arguments, "include_deploy_blockers", default=False)
     include_unlinked_leads = _optional_bool(arguments, "include_unlinked_leads", default=False)
     base_snapshot_dir = _optional_string(arguments, "base_snapshot")
+    base_checkout = _optional_string(arguments, "base_checkout")
+    head_checkout = _optional_string(arguments, "head_checkout")
 
     changed_symbols: list[JsonObject] = []
     range_filters = _changed_ranges_by_path(changed_ranges)
@@ -3033,15 +3055,96 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
             changed_files=changed_files,
             review_hypotheses=review_hypotheses,
         )
-    # Cap the top-level list to PLANNING_CONTEXT_SECTION_LIMIT (5). The splice
-    # inserts high-specificity rows at the front so the specifics-first partition is
-    # already correct; slicing here preserves that order while bounding the list.
-    review_hypotheses = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
+    abstract_contract_status: str | None = None
+    if base_snapshot_dir and base_checkout and head_checkout:
+        # Deterministic abstract-base reparenting detector. Runs before the LLM
+        # semantic splice so its deterministic_static rows front-rank ahead of
+        # inferred_llm rows (same trust-tier ordering as the contract-diff splice).
+        review_hypotheses, abstract_contract_status = _splice_abstract_contract_hypotheses(
+            base_snapshot_dir=base_snapshot_dir,
+            head_kg=kg,
+            base_checkout=base_checkout,
+            head_checkout=head_checkout,
+            changed_symbols=changed_symbols,
+            review_hypotheses=review_hypotheses,
+        )
+    semantic_diff_status: str | None = None
+    semantic_diff_stats: "JsonObject | None" = None
+    if base_snapshot_dir and base_checkout and head_checkout:
+        _splice_stats: dict = {}
+        review_hypotheses, semantic_diff_status = _splice_semantic_diff_hypotheses(
+            base_snapshot_dir=base_snapshot_dir,
+            head_kg=kg,
+            base_checkout=base_checkout,
+            head_checkout=head_checkout,
+            changed_symbols=changed_symbols,
+            review_hypotheses=review_hypotheses,
+            _stats_out=_splice_stats,
+        )
+        if _splice_stats:
+            semantic_diff_stats = _splice_stats
+    elif base_snapshot_dir:
+        semantic_diff_status = "missing_checkouts"
+    elif base_checkout or head_checkout:
+        # Minor 11: checkouts provided without a base_snapshot — note the missing dependency.
+        semantic_diff_status = "missing_base_snapshot"
+    # Cap the top-level list to PLANNING_CONTEXT_SECTION_LIMIT (5). The splice inserts
+    # high-specificity rows at the front so the specifics-first partition is already
+    # correct; the reservation cap preserves that order while guaranteeing at least one
+    # row per generated diff-derived risk type survives the slice (deterministic families
+    # ranked above inferred_llm) — the cap-time twin of the budget-time survival rule, so
+    # a generated diff family is never dropped before by-risk-type truncation counts run.
+    # Capture the by-risk-type counts of the FULL generated set BEFORE the cap. The
+    # cap below discards extra generated rows, so the post-cap list underreports what
+    # was generated. The budget layer's status computation prefers these producer-side
+    # counts for available_count/available_by_risk_type so truncated_by_risk_type
+    # includes cap-time drops (not just budget-time drops).
+    generated_hypothesis_counts = _generated_hypothesis_counts(review_hypotheses)
+    # Full pre-cap hypothesis rows (private): the budget layer uses these to build
+    # inspection_areas for truncated high/medium rows dropped at cap AND budget time.
+    # Popped and never leaked to callers (see enforce_review_context_budget).
+    full_pre_cap_hypotheses = [row for row in review_hypotheses if isinstance(row, dict)]
+    # Structural noise downranking: stably reorder within each derivation trust tier so
+    # low-value deterministic rows (builtin/module-root call moves, test-only cause and
+    # consequence) sink below high-value peers (concrete failure modes, changed-prod-file
+    # causes) before the reservation cap claims scarce slots. Does not cross tier
+    # boundaries and does not change cap/budget semantics (a sibling task owns floors).
+    review_hypotheses = apply_structural_noise_downranking(
+        review_hypotheses, changed_files, changed_symbols_in_scope
+    )
+    # Compute the score-driven seat plan ONCE over the full pre-cap set (with the full,
+    # un-sliced changed_files/changed_symbols so scoring is authoritative), then thread the
+    # SAME plan to the cap and, via the packet, to the budget layer. Both consume one
+    # ordering so cap seating and budget eviction can never diverge again.
+    hypothesis_seat_plan = compute_hypothesis_seat_plan(
+        review_hypotheses,
+        changed_files=changed_files,
+        changed_symbols=changed_symbols_in_scope,
+    )
+    review_hypotheses = _cap_review_hypotheses_reserving_diff_families(
+        review_hypotheses,
+        PLANNING_CONTEXT_SECTION_LIMIT,
+        changed_files=changed_files,
+        changed_symbols=changed_symbols_in_scope,
+        seat_plan=hypothesis_seat_plan,
+    )
     review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
+    if base_snapshot_dir:
+        _base_diff_status = "active" if contract_diff_note is None else "failed"
+    elif changed_ranges:
+        _base_diff_status = "missing"
+    else:
+        _base_diff_status = None
     review_quality_status = _build_review_quality_status(
         review_hypotheses=review_hypotheses,
         coverage_status=review_lead_packet["review_lead_status"].get("coverage_status", ""),
         contract_diff_note=contract_diff_note,
+        base_diff_status=_base_diff_status,
+        semantic_diff_status=semantic_diff_status,
+        semantic_diff_stats=semantic_diff_stats,
+        abstract_contract_status=abstract_contract_status,
+        changed_ranges=changed_ranges,
+        changed_symbols=changed_symbols_in_scope,
     )
     result = {
         "status": status,
@@ -3107,6 +3210,15 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         ),
         "review_hypotheses": review_hypotheses,
         "next_actions": next_actions,
+        # Producer-side pre-cap generated counts (private; consumed and removed by the
+        # review budget layer's hypothesis-status computation, never surfaced to callers).
+        "_generated_hypothesis_counts": generated_hypothesis_counts,
+        # Shared score-driven seat plan (private; consumed and removed by the review budget
+        # layer so budget-time eviction reverses the SAME ordering the cap seated by).
+        "_hypothesis_seat_plan": hypothesis_seat_plan,
+        # Full pre-cap hypothesis rows (private; consumed and removed by the review budget
+        # layer to build inspection_areas for truncated high/medium rows).
+        "_full_pre_cap_hypotheses": full_pre_cap_hypotheses,
     }
     if _review_context_should_compact_unanchored(
         changed_ranges=changed_ranges,
@@ -3131,6 +3243,12 @@ def _build_review_quality_status(
     review_hypotheses: list[JsonObject],
     coverage_status: str,
     contract_diff_note: str | None = None,
+    base_diff_status: str | None = None,
+    semantic_diff_status: str | None = None,
+    semantic_diff_stats: "JsonObject | None" = None,
+    abstract_contract_status: str | None = None,
+    changed_ranges: list[JsonObject] | None = None,
+    changed_symbols: list[JsonObject] | None = None,
 ) -> JsonObject:
     """Build the review_quality_status scalar object emitted alongside review_lead_status.
 
@@ -3142,6 +3260,9 @@ def _build_review_quality_status(
       recommended_action — "use_supercontext_packet" when high or medium, else "use_live_followups_or_plain_review"
       reason — short explanation
       contract_diff_note — present only when a base_snapshot was provided; carries load/tenant status
+      base_diff_status — "missing" | "active" | "failed"; present when changed_ranges supplied
+      review_readiness — routing field: packet_ready | needs_followup | plain_review_better | base_snapshot_required
+      suggested_followups — bounded list (<=3) of concrete follow-up suggestions; present on low-specificity packets
     """
     specific_count = 0
     generic_count = 0
@@ -3149,7 +3270,8 @@ def _build_review_quality_status(
     for h in review_hypotheses:
         if not isinstance(h, dict):
             continue
-        # Contract-diff families always injected as "high" specificity; other families use _FAMILY_SPECIFICITY
+        # Spliced rows carry their own specificity (see _CONTRACT_DIFF_SPECIFICITY); other
+        # families fall back to _FAMILY_SPECIFICITY.
         spec = h.get("specificity") or _FAMILY_SPECIFICITY.get(str(h.get("risk_type") or ""), "low")
         if spec in ("high", "medium"):
             specific_count += 1
@@ -3169,9 +3291,41 @@ def _build_review_quality_status(
             "All generated hypotheses are generic (no signal/delta or convention-specific evidence); "
             "live source inspection will yield higher precision."
         )
+    if base_diff_status == "missing":
+        reason = (
+            f"{reason} Head-only packet. Contract-diff families are disabled; "
+            "recall expected to be low for ownership/guard/provenance/type-shape changes."
+        )
     if contract_diff_note:
         # Coverage-honest: base_snapshot problems surface in the reason, never as errors.
         reason = f"{reason} {contract_diff_note}"
+
+    # review_readiness routing
+    # Minor 12 fix: compute _build_suggested_followups ONCE with include_base_build
+    # correct for the emission path. The first call was previously a boolean gate only
+    # (no include_base_build). Compute the full version once and reuse for both gate
+    # and emission.
+    # include_base_build=True when base_diff_status=="missing" (changed_ranges present
+    # but no base_snapshot supplied). The review_readiness branch below separately gates
+    # on has_changed_ranges to select "base_snapshot_required" vs "needs_followup".
+    has_changed_ranges = bool(changed_ranges)
+    if max_spec not in ("high", "medium"):
+        # Compute once; reused for both gate and emission.
+        followups = _build_suggested_followups(
+            review_hypotheses=review_hypotheses,
+            changed_symbols=changed_symbols or [],
+            include_base_build=(base_diff_status == "missing"),
+        )
+    else:
+        followups = []
+
+    if max_spec in ("high", "medium"):
+        review_readiness = "packet_ready"
+    elif base_diff_status == "missing" and has_changed_ranges:
+        review_readiness = "base_snapshot_required"
+    else:
+        review_readiness = "needs_followup" if followups else "plain_review_better"
+
     status: JsonObject = {
         "coverage_status": coverage_status,
         "specific_hypothesis_count": specific_count,
@@ -3179,18 +3333,332 @@ def _build_review_quality_status(
         "specificity": max_spec,
         "recommended_action": recommended_action,
         "reason": reason,
+        "review_readiness": review_readiness,
     }
+    if base_diff_status is not None:
+        status["base_diff_status"] = base_diff_status
+        if base_diff_status == "missing":
+            status["suggested_setup"] = "build_base_snapshot_then_retry"
+    if semantic_diff_status is not None:
+        status["semantic_diff_status"] = semantic_diff_status
+    if semantic_diff_stats is not None:
+        status["semantic_diff_stats"] = semantic_diff_stats
+    if abstract_contract_status is not None:
+        status["abstract_contract_status"] = abstract_contract_status
     if contract_diff_note is not None:
         status["contract_diff_note"] = contract_diff_note
+
+    # suggested_followups: only on low-specificity packets
+    if max_spec not in ("high", "medium") and followups:
+        status["suggested_followups"] = followups
+
     return status
 
 
-# Contract-diff families treated as "high" specificity when spliced into review_hypotheses.
+def _build_suggested_followups(
+    *,
+    review_hypotheses: list[JsonObject],
+    changed_symbols: list[JsonObject],
+    include_base_build: bool = False,
+) -> list[JsonObject]:
+    """Build bounded (<=3) list of concrete follow-up suggestions for low-specificity packets.
+
+    Deterministic templates over real data — no fabrication.
+    """
+    followups: list[JsonObject] = []
+    if include_base_build:
+        followups.append({
+            "why": (
+                "Build a base_snapshot for the PR base SHA, then pass base_snapshot to review_context. "
+                "This activates contract-diff families (guard_call_removed_drift, responsibility_moved_drift, "
+                "test_reference_removed_drift) which detect ownership/guard/provenance changes."
+            ),
+            "action": "build_base_snapshot_then_retry",
+        })
+    # Emit find_callers followups for the top changed symbols that have a qualname.
+    seen: set[str] = set()
+    for sym in changed_symbols:
+        if len(followups) >= 3:
+            break
+        qualname = sym.get("qualname") or sym.get("qualified_name") or sym.get("display_name")
+        path = sym.get("path")
+        if not qualname or not path or qualname in seen:
+            continue
+        seen.add(qualname)
+        followups.append({
+            "tool": "find_callers",
+            "args": {"symbol": qualname},
+            "why": f"Enumerate callers of changed symbol {qualname!r} to find downstream impact.",
+        })
+    return followups[:3]
+
+
+# Contract-diff families spliced into review_hypotheses.
 _CONTRACT_DIFF_FAMILIES = frozenset(
     {"guard_call_removed_drift", "responsibility_moved_drift", "test_reference_removed_drift"}
 )
+# Per-family specificity for spliced contract-diff rows. A removed/moved CALLS edge on a
+# surviving PRODUCTION symbol asserts a concrete production-runtime invariant on changed
+# code → "high". test_reference_removed_drift asserts that a fact from a TEST-classified
+# path was removed — a test-surface (coverage) concern, never a production-runtime
+# invariant, so it gets at most "medium" (mirrors the test-surface rule in
+# review_hypotheses._FAMILY_SPECIFICITY). Missing entries default "medium" (never "high").
+_CONTRACT_DIFF_SPECIFICITY: dict[str, str] = {
+    "guard_call_removed_drift": "high",
+    "responsibility_moved_drift": "high",
+    "test_reference_removed_drift": "medium",
+}
 # Maximum contract-diff hypotheses to splice per family (avoid packet explosion).
 _CONTRACT_DIFF_SPLICE_CAP = 3
+
+# Abstract-contract detector: deterministic_static family (reparent → abstract base
+# with unimplemented abstract members). Spliced alongside the other deterministic rows.
+_ABSTRACT_CONTRACT_SPLICE_CAP = 3
+
+
+def _generated_hypothesis_counts(review_hypotheses: list[JsonObject]) -> JsonObject:
+    """Producer-side counts of the FULL generated hypothesis set, before any cap.
+
+    Consumed by the review budget layer to compute available_count /
+    available_by_risk_type / available_risk_types against everything the producer
+    generated — the post-cap list underreports generated evidence. Private packet
+    field (``_generated_hypothesis_counts``), stripped before the packet is returned.
+    """
+    by_risk_type: dict[str, int] = {}
+    for row in review_hypotheses:
+        if isinstance(row, dict) and row.get("risk_type"):
+            rt = str(row["risk_type"])
+            by_risk_type[rt] = by_risk_type.get(rt, 0) + 1
+    return {
+        "available_count": len(review_hypotheses),
+        "by_risk_type": by_risk_type,
+    }
+
+
+def _cap_review_hypotheses_reserving_diff_families(
+    review_hypotheses: list[JsonObject],
+    limit: int,
+    *,
+    changed_files: list[str] | None = None,
+    changed_symbols: list[JsonObject] | None = None,
+    seat_plan: JsonObject | None = None,
+) -> list[JsonObject]:
+    """Cap the top-level hypothesis list to ``limit`` while guaranteeing that the highest
+    structural-value families each keep a representative row.
+
+    A naive ``review_hypotheses[:limit]`` can evict an entire generated family before
+    budget pinning or the by-risk-type truncation counts ever run — the pre-budget
+    "generated" set fed to _attach_review_hypothesis_status is exactly this already-capped
+    list, so a family dropped here becomes invisible (no returned row, no
+    truncated_by_risk_type entry). This is the cap-time twin of the budget-time survival
+    rule in output_budget._hypothesis_first_compact_packet: both seat families by the same
+    score-driven policy (output_budget.plan_hypothesis_seats).
+
+    Seat policy (shared with the budget layer via output_budget.plan_hypothesis_seats):
+    every family — diff-derived AND non-diff — competes for the ``limit`` slots on its best
+    row's structural score. Families are seated in descending representative score; the
+    derivation trust tier (deterministic_static > inferred_llm > other) is a tiebreak only
+    on equal scores, then first list position. There is no separate non-diff seat: a
+    high-value non-diff family wins a seat by score. When distinct generated families exceed
+    ``limit``, the lowest-scoring families are left out; their absence surfaces as nonzero
+    truncated_by_risk_type entries downstream, never as silent absence.
+
+    The representative row the seat plan scored the family by (its best-scoring row, NOT
+    the family's first occurrence — which can be a lower-scored peer in an earlier
+    derivation tier) is kept per seated family; any leftover slots are filled by the
+    highest-ranked remaining rows.
+    """
+    if limit <= 0:
+        return []
+    # Consume the caller-threaded shared plan when provided so the cap and the budget layer
+    # seat/evict off ONE ordering; recompute only when called standalone (tests/fixtures).
+    if seat_plan is None:
+        seat_plan = compute_hypothesis_seat_plan(
+            review_hypotheses,
+            changed_files=changed_files or [],
+            changed_symbols=changed_symbols,
+        )
+    ordered_types = list(seat_plan.get("ordered_types") or [])
+    seated_types = set(ordered_types[:limit])
+    representative_index = seat_plan.get("representative_index") or {}
+
+    kept_ids: set[int] = set()
+    # Keep the seat plan's representative row (the family's best-scoring row) per seated
+    # family; fall back to first occurrence only if the representative index is missing.
+    seen: set[str] = set()
+    for rt in ordered_types[:limit]:
+        rep_idx = representative_index.get(rt)
+        if isinstance(rep_idx, int) and 0 <= rep_idx < len(review_hypotheses):
+            row = review_hypotheses[rep_idx]
+            if isinstance(row, dict) and str(row.get("risk_type")) == rt:
+                kept_ids.add(id(row))
+                seen.add(rt)
+    for row in review_hypotheses:
+        if not isinstance(row, dict):
+            continue
+        rt = str(row.get("risk_type"))
+        if rt in seated_types and rt not in seen:
+            seen.add(rt)
+            kept_ids.add(id(row))
+    # Fill leftover slots with the highest-ranked remaining rows.
+    for row in review_hypotheses:
+        if len(kept_ids) >= limit:
+            break
+        if isinstance(row, dict) and id(row) not in kept_ids:
+            kept_ids.add(id(row))
+
+    kept = [row for row in review_hypotheses if isinstance(row, dict) and id(row) in kept_ids]
+    # Within a seated family, the representative comes first; other kept rows of that family
+    # follow in existing order. Only reorder inside a family (keeping each family's earliest
+    # slot) — cross-family sequence is preserved for the downstream budget layer.
+    rep_ids = {
+        id(review_hypotheses[idx])
+        for rt, idx in representative_index.items()
+        if isinstance(idx, int) and 0 <= idx < len(review_hypotheses) and rt in seated_types
+    }
+    by_family: dict[str, list[JsonObject]] = {}
+    for row in kept:
+        by_family.setdefault(str(row.get("risk_type")), []).append(row)
+    ordered_rows: list[JsonObject] = list(kept)
+    for rt, rows in by_family.items():
+        if len(rows) < 2:
+            continue
+        rows.sort(key=lambda row: id(row) not in rep_ids)
+        # Write the family's rows back into the slots that family already occupied.
+        family_slots = [s for s, row in enumerate(kept) if str(row.get("risk_type")) == rt]
+        for slot, row in zip(family_slots, rows):
+            ordered_rows[slot] = row
+    return ordered_rows
+
+
+def _resolve_changed_head_entities(
+    head_kg: KgSnapshot,
+    changed_symbols: list[JsonObject],
+) -> list[JsonObject]:
+    """Map changed-symbol rows to head-snapshot CodeSymbol entities.
+
+    Match by composite (normalized_path, qualname) when the changed row has a path;
+    fall back to qualname-only for changed rows that carry no path (e.g. compact rows).
+    Shared by the semantic-diff and abstract-contract splices so both resolve the same
+    entity set from the same changed_symbols input.
+    """
+    head_entities: list[JsonObject] = []
+    composite_keys: set[tuple[str, str]] = set()
+    qname_only_keys: set[str] = set()
+    for s in changed_symbols:
+        qname = str(s.get("qualname") or s.get("qualified_name") or "")
+        if not qname:
+            continue
+        path = str(s.get("path") or "")
+        if path:
+            composite_keys.add((_planning_context_normalize_path(path), qname))
+        else:
+            qname_only_keys.add(qname)
+
+    for entity in head_kg.entities:
+        if entity.get("kind") != "CodeSymbol":
+            continue
+        identity = entity.get("identity") or {}
+        qname = str(identity.get("qualname") or "")
+        if not qname:
+            continue
+        props = entity.get("properties") or {}
+        epath = _planning_context_normalize_path(str(props.get("path") or ""))
+        if epath and (epath, qname) in composite_keys:
+            head_entities.append(entity)
+        elif not epath and qname in qname_only_keys:
+            # Entity has no path in KG — fall back to qualname-only match.
+            head_entities.append(entity)
+        elif qname in qname_only_keys:
+            # Changed row had no path — qualname-only match (documented fallback).
+            head_entities.append(entity)
+    return head_entities
+
+
+def _splice_abstract_contract_hypotheses(
+    *,
+    base_snapshot_dir: str,
+    head_kg: KgSnapshot,
+    base_checkout: str,
+    head_checkout: str,
+    changed_symbols: list[JsonObject],
+    review_hypotheses: list[JsonObject],
+) -> tuple[list[JsonObject], str]:
+    """Run the deterministic abstract-base reparenting detector and splice rows.
+
+    Returns (merged_hypotheses, status). status values:
+      "active"                — detector ran (zero or more rows)
+      "unavailable:<detail>"  — import failure
+      "failed:invalid_base_checkout" / "failed:invalid_head_checkout"
+      "failed:<detail>"       — catch-all (never raises)
+
+    Spliced rows carry derivation="deterministic_static" and are inserted at the
+    FRONT of review_hypotheses (ahead of generic families), mirroring the
+    contract-diff splice — they rank in the same trust tier as the other
+    deterministic contract-diff families.
+    """
+    from pathlib import Path
+
+    try:
+        from source.kg.query.abstract_contract import abstract_contract_diff
+        from source.kg.query.snapshot import KgSnapshot as _KgSnap
+    except ImportError as exc:
+        return review_hypotheses, f"unavailable:{exc}"
+
+    head_entities = _resolve_changed_head_entities(head_kg, changed_symbols)
+    # Only class-kind entities are candidates; skip early when none present.
+    class_entities = [
+        e for e in head_entities
+        if str((e.get("identity") or {}).get("symbol_kind") or "") == "class"
+    ]
+    if not class_entities:
+        return review_hypotheses, "active"
+
+    base_checkout_path = Path(base_checkout)
+    head_checkout_path = Path(head_checkout)
+    if not base_checkout_path.is_dir():
+        return review_hypotheses, "failed:invalid_base_checkout"
+    if not head_checkout_path.is_dir():
+        return review_hypotheses, "failed:invalid_head_checkout"
+
+    try:
+        base_snap = _KgSnap(base_snapshot_dir)
+        raw_rows, _stats = abstract_contract_diff(
+            base_snapshot=base_snap,
+            head_snapshot=head_kg,
+            base_root=base_checkout_path,
+            head_root=head_checkout_path,
+            changed_symbols=class_entities,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return review_hypotheses, f"failed:{exc}"
+
+    if not raw_rows:
+        return review_hypotheses, "active"
+
+    spliced: list[JsonObject] = []
+    for row in raw_rows:
+        if len(spliced) >= _ABSTRACT_CONTRACT_SPLICE_CAP:
+            break
+        if not isinstance(row, dict):
+            continue
+        hypothesis_id = row.get("hypothesis_id")
+        if not hypothesis_id:
+            continue
+        spliced_row = dict(row)
+        spliced_row["label"] = hypothesis_label(str(row.get("risk_type") or ""), hypothesis_id)
+        spliced_row.setdefault("supporting_lead_ids", [])
+        spliced.append(spliced_row)
+
+    if not spliced:
+        return review_hypotheses, "active"
+
+    omitted_count = max(0, len(raw_rows) - _ABSTRACT_CONTRACT_SPLICE_CAP)
+    if omitted_count > 0:
+        spliced[-1] = dict(spliced[-1], omitted_abstract_contract_count=omitted_count)
+
+    # Front-splice: deterministic_static rows rank ahead of generic families.
+    return spliced + review_hypotheses, "active"
 
 
 def _splice_contract_diff_hypotheses(
@@ -3200,19 +3668,21 @@ def _splice_contract_diff_hypotheses(
     changed_files: list[str],
     review_hypotheses: list[JsonObject],
 ) -> tuple[list[JsonObject], str | None]:
-    """Run contract_diff against base_snapshot_dir and splice high-specificity rows.
+    """Run contract_diff against base_snapshot_dir and splice contract-diff rows.
 
     Returns (merged_hypotheses, note_string).
     note_string is None on success; a coverage-honest message on tenant mismatch or
     load failure (never raises).
 
     Spliced rows carry:
-      specificity = "high"
+      specificity = per-family (_CONTRACT_DIFF_SPECIFICITY): "high" for production-edge
+        families (guard/moved), "medium" for the test-surface family
+        (test_reference_removed_drift)
       cause = first before_ref (path + line_start)
       consequence = first after_ref (path + line_start)
       source_spans = up to 4 evidence refs (before_refs + after_refs capped)
       evidence_refs = same as source_spans
-    High-specificity rows are inserted at the front of review_hypotheses so they rank
+    Spliced rows are inserted at the front of review_hypotheses so they rank
     before generic families; existing hypothesis order is preserved after them.
     """
     try:
@@ -3283,11 +3753,38 @@ def _splice_contract_diff_hypotheses(
             negative_checks = [
                 "Verify the removed test reference was superseded by a broader or renamed test that still covers the same invariant; if coverage is maintained, this risk does not apply.",
             ]
+        # Preserve two structural identities from the contract_diff symbol_refs so the
+        # scorer can key on KG entity kind without string-matching names:
+        #
+        #   target_ref  — the "primary" symbol per risk family (kept for rules that key
+        #                 on it). guard row: the removed CALLEE (removed_callee). moved
+        #                 row: the move DESTINATION (moved_to, symbol Y).
+        #   callee_ref  — the moved/removed CALL's actual CALLEE. guard row: the removed
+        #                 CALLEE (removed_callee) — target and callee coincide here.
+        #                 moved row: the shared callee Z (shared_callee), which is the
+        #                 symbol whose invocation moved — NOT the destination Y.
+        #
+        # The call-target noise penalties (builtin/external, bare module/package root)
+        # describe a property of the CALLEE, so they must key on callee_ref. Prior to
+        # this, moved rows fed moved_to (the destination) into target_* and the penalties
+        # saw the destination's kind, never the callee's — so a move whose callee is a
+        # bare CodeModule went un-penalized. Reads symbol_ref kind/urn only; never parses
+        # the concrete_invariant string.
+        target_ref: JsonObject | None = None
+        callee_ref: JsonObject | None = None
+        if risk_type == "guard_call_removed_drift":
+            target_ref = h.get("removed_callee") if isinstance(h.get("removed_callee"), dict) else None
+            callee_ref = target_ref
+        elif risk_type == "responsibility_moved_drift":
+            target_ref = h.get("moved_to") if isinstance(h.get("moved_to"), dict) else None
+            callee_ref = h.get("shared_callee") if isinstance(h.get("shared_callee"), dict) else None
         spliced_row: JsonObject = {
             "hypothesis_id": hypothesis_id,
+            "label": hypothesis_label(risk_type, hypothesis_id),
             "risk_type": risk_type,
-            "specificity": "high",
+            "specificity": _CONTRACT_DIFF_SPECIFICITY.get(risk_type, "medium"),
             "confidence": "medium",
+            "derivation": "deterministic_static",
             "concrete_invariant": h.get("concrete_invariant", ""),
             "why": h.get("why", ""),
             "source_checks": (h.get("source_checks") or [])[:2],
@@ -3296,6 +3793,16 @@ def _splice_contract_diff_hypotheses(
             "evidence_refs": source_spans,
             "source_spans": source_spans,
         }
+        if target_ref is not None:
+            if target_ref.get("kind"):
+                spliced_row["target_entity_kind"] = str(target_ref["kind"])
+            if target_ref.get("urn"):
+                spliced_row["target_urn"] = str(target_ref["urn"])
+        if callee_ref is not None:
+            if callee_ref.get("kind"):
+                spliced_row["callee_entity_kind"] = str(callee_ref["kind"])
+            if callee_ref.get("urn"):
+                spliced_row["callee_urn"] = str(callee_ref["urn"])
         if cause is not None:
             spliced_row["cause"] = cause
         if consequence is not None:
@@ -3338,6 +3845,135 @@ def _splice_contract_diff_hypotheses(
                 last_surviving["omitted_contract_diff_family_count"] = omitted_count
 
     return spliced + review_hypotheses, None
+
+
+# S2: semantic contract-diff splice cap — mirrors contract-diff cap
+_SEMANTIC_DIFF_SPLICE_CAP = 3
+
+
+def _splice_semantic_diff_hypotheses(
+    *,
+    base_snapshot_dir: str,
+    head_kg: KgSnapshot,
+    base_checkout: str,
+    head_checkout: str,
+    changed_symbols: list[JsonObject],
+    review_hypotheses: list[JsonObject],
+    _client: "SemanticDiffLlmClient | None" = None,  # injection seam for tests
+    _stats_out: "dict | None" = None,  # filled with SemanticDiffStats fields when provided
+) -> tuple[list[JsonObject], str]:
+    """Run semantic_contract_diff and splice inferred_llm hypothesis rows.
+
+    Returns (merged_hypotheses, semantic_diff_status).
+    semantic_diff_status values:
+      "active"              — splice ran, rows available (or no differing symbols found)
+      "unavailable[:detail]"— litellm/import not available; detail is the exception string
+      "no_api_key"          — auth/API-key error from the LLM
+      "llm_error"           — all LLM calls failed with non-auth errors
+      "partial"             — at least one call succeeded and at least one failed
+      "failed:<detail>"     — catch-all for unexpected exceptions in the splice body (never raises)
+    High-specificity rows are inserted at front of review_hypotheses.
+
+    _client: optional SemanticDiffLlmClient instance; if None, a real client is constructed.
+    Pass a fake client in tests to exercise the real splice logic without LLM calls.
+    """
+    from pathlib import Path
+
+    try:
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.query.snapshot import KgSnapshot as _KgSnap
+        from source.kg.integrations.semantic_llm import SemanticDiffLlmClient
+    except ImportError as exc:
+        return review_hypotheses, f"unavailable:{exc}"
+
+    # Find head-snapshot CodeSymbol entities corresponding to changed symbols.
+    head_entities = _resolve_changed_head_entities(head_kg, changed_symbols)
+
+    if not head_entities:
+        return review_hypotheses, "active"
+
+    # P1 fix: validate checkout dirs before calling semantic_contract_diff.
+    # A non-directory path (typo, deleted dir, file-instead-of-dir) would silently
+    # read "" for every symbol and return "active" — surface explicit failure instead.
+    base_checkout_path = Path(base_checkout)
+    head_checkout_path = Path(head_checkout)
+    if not base_checkout_path.is_dir():
+        return review_hypotheses, "failed:invalid_base_checkout"
+    if not head_checkout_path.is_dir():
+        return review_hypotheses, "failed:invalid_head_checkout"
+
+    try:
+        base_snap = _KgSnap(base_snapshot_dir)
+        client = _client if _client is not None else SemanticDiffLlmClient()
+        raw_rows, inner_status = semantic_contract_diff(
+            base_snapshot=base_snap,
+            head_snapshot=head_kg,
+            base_root=base_checkout_path,
+            head_root=head_checkout_path,
+            changed_symbols=head_entities,
+            client=client,
+            _stats_out=_stats_out,
+        )
+    except ImportError:
+        return review_hypotheses, "unavailable"
+    except Exception as exc:  # noqa: BLE001
+        return review_hypotheses, f"failed:{exc}"
+
+    # Map inner_status to outer status.
+    # "no_api_key" only drops rows when there are none to preserve; when rows
+    # exist the call was partially successful and we use the rows.
+    # "partial:auth" is emitted by semantic_contract_diff when rows were produced
+    # despite an auth failure — treat it as "partial" at this layer.
+    if inner_status == "no_api_key" and not raw_rows:
+        return review_hypotheses, "no_api_key"
+    if inner_status == "llm_error":
+        return review_hypotheses, "llm_error"
+
+    # Normalize partial:auth → partial for the outer status reported to callers.
+    if inner_status == "partial:auth":
+        inner_status = "partial"
+
+    # For "partial", "no_api_key" (with rows), or "active": splice available rows
+    if not raw_rows:
+        return review_hypotheses, inner_status
+
+    # Cap and splice — mirror the contract-diff round-robin pattern (single family here)
+    spliced: list[JsonObject] = []
+    for row in raw_rows:
+        if len(spliced) >= _SEMANTIC_DIFF_SPLICE_CAP:
+            break
+        if not isinstance(row, dict):
+            continue
+        hypothesis_id = row.get("hypothesis_id")
+        if not hypothesis_id:
+            continue
+        spliced.append(row)
+
+    if not spliced:
+        return review_hypotheses, inner_status
+
+    # Problem A fix: trust-tier ordering — deterministic_static rows before inferred_llm rows.
+    # Semantic rows are inferred_llm high-specificity evidence rows: they rank after
+    # spliced deterministic-static rows (higher tier, same specificity) and BEFORE
+    # generic family rows (derivation None, low-specificity boilerplate).
+    #
+    # Reserved-slot guarantee: the top-hypotheses cap (5) and the review-budget
+    # compaction floor (top 1-3) both keep list prefixes, so a semantic row placed
+    # after every deterministic row is silently erased whenever three or more
+    # deterministic rows exist — truncation would imply absence for the entire
+    # semantic family. Mirror the deterministic splice's family round-robin
+    # (every family gets a slot before any family gets seconds): keep the top 2
+    # deterministic rows first, then the semantic rows, then the remaining rows.
+    # The derivation stamps keep the trust tiers visible in the packet.
+    det_rows = [h for h in review_hypotheses if h.get("derivation") == "deterministic_static"]
+    rest_rows = [h for h in review_hypotheses if h.get("derivation") != "deterministic_static"]
+
+    # Record omitted count (mirrors omitted_contract_diff_family_count pattern in contract splice).
+    omitted_count = max(0, len(raw_rows) - _SEMANTIC_DIFF_SPLICE_CAP)
+    if omitted_count > 0 and spliced:
+        spliced[-1] = dict(spliced[-1], omitted_semantic_diff_count=omitted_count)
+
+    return det_rows[:2] + spliced + det_rows[2:] + rest_rows, inner_status
 
 
 def _review_context_lead_packet(
@@ -3499,10 +4135,20 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
         },
         "repo_dependencies": repo_dependencies,
         "source_coordinates": stamped_source_coordinates,
+        # compact-unanchored path: only stylesheet gap hypotheses; semantic diff is dead-code here
+        # (requires checkouts which are incompatible with the zero-anchor trigger condition)
         "review_hypotheses": [
             h for h in (result.get("review_hypotheses") or [])
             if isinstance(h, dict) and h.get("risk_type") == "low_coverage_stylesheet_gap"
         ],
+        # This zero-anchor path drops every non-stylesheet row, so pre-cap counts
+        # describe only the stylesheet rows actually retained here.
+        "_generated_hypothesis_counts": _generated_hypothesis_counts(
+            [
+                h for h in (result.get("review_hypotheses") or [])
+                if isinstance(h, dict) and h.get("risk_type") == "low_coverage_stylesheet_gap"
+            ]
+        ),
         "answerability": answerability,
         "coverage_warnings": result.get("coverage_warnings", []),
         "unsupported_scopes": result.get("unsupported_scopes", []),
@@ -7002,7 +7648,9 @@ _TOOLS: dict[str, McpTool] = {
             "Use it when you know the changed files and need deterministic static review context before drilling into narrower MCP tools. "
             "Large packets are bounded: when output_budget is present the detail rows were compacted to a coordinate-bearing head start, so inspect source coordinates or call narrower changed_ranges/exact tools for omitted detail. "
             "Does not infer deploy blockers unless explicitly requested, summarize diffs with an LLM, or invent cross-repo and runtime-only impact. "
-            "Read review_hypotheses as candidate source-inspection leads, not proven bugs. If using a hypothesis in a review finding, include its hypothesis_id and supporting lead_id values in the finding metadata when the review harness supports attribution."
+            "Read review_hypotheses as candidate source-inspection leads, not proven bugs. Every finding derived from a SuperContext hypothesis must state either: hypothesis_id=<id> and label=<label> (use the hypothesis.label field, e.g. 'async_side_effect_lifecycle_drift-5745'), or no_supercontext_hypothesis_used=true. This attribution is required for recall measurement; omitting it loses the causal link. "
+            "review_quality_status.review_readiness is the harness routing field: packet_ready means forced packet review is safe; needs_followup means call suggested_followups first; plain_review_better means do normal PR review; base_snapshot_required means build base snapshot and retry before spending model. "
+            "review_quality_status.base_diff_status is 'missing' when no base_snapshot was provided but changed_ranges are present (contract-diff families are disabled); 'active' when base_snapshot loaded successfully; 'failed' when it could not be loaded. Build and pass base_snapshot when base_diff_status is missing to enable ownership/guard/provenance change detection."
         ),
         input_schema=_object_schema(_review_context_properties(), required=["repo", "changed_files"]),
         handler=_review_context,

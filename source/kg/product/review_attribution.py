@@ -62,6 +62,18 @@ def hypothesis_stable_id(
     return f"hypothesis:{risk_type}:{digest}"
 
 
+def hypothesis_label(risk_type: str, hypothesis_id: str) -> str:
+    """Short stable label for attribution: '{risk_type}-{4hex}'.
+
+    Extracts the first 4 hex chars of the hypothesis_id digest (format:
+    'hypothesis:{risk_type}:{16hex}') to form a compact, collision-resistant,
+    human-readable tag. Stable across runs because hypothesis_id is stable.
+    """
+    parts = hypothesis_id.split(":")
+    digest4 = parts[-1][:4] if parts else "0000"
+    return f"{risk_type}-{digest4}"
+
+
 def review_stable_id(prefix: str, row: JsonObject, *, fallback_kind: str) -> str:
     existing = row.get(f"{prefix}_id")
     if isinstance(existing, str) and existing.strip():

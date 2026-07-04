@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from source.kg.core.models import JsonObject
-from source.kg.product.review_attribution import hypothesis_stable_id
+from source.kg.product.review_attribution import hypothesis_label, hypothesis_stable_id
 
 
 def _normalize_path(path: str) -> str:
@@ -45,28 +45,40 @@ _SPECIFIC_CLASS_FAMILIES: frozenset[str] = frozenset(
     }
 )
 
-# B2: Per-family specificity class. "high" = code_risk_signal-driven or A2 contract-diff;
-# "medium" = convention-triggered specific families; "low" = generic families.
-# test_locks_in_regression is "low" by default: it lacks a named runtime invariant in its
-# current form and must not outrank high-specificity families in top_review_hypotheses.
-# It becomes "medium" only if signal/delta-backed evidence attaches (not yet wired).
+# B2: Per-family specificity class. The class is a property of WHAT the family asserts,
+# applied uniformly to every family (not tuned to any one repo or eval):
+#   "high"   = asserts a concrete production-RUNTIME invariant anchored to CHANGED code
+#              (a named behavioural contract on the symbol/edge the PR touched).
+#   "medium" = a convention-grade or indirectly-anchored production concern (triggered by
+#              a naming/structural convention, or asserting a coverage/process concern
+#              about production code rather than a runtime invariant on it).
+#   "low"    = a generic suspicion with no named invariant (broad contract-drift, or a
+#              "we can't see this, inspect manually" coverage-limitation note).
+# TEST-SURFACE families — those whose asserted claim is about the TEST surface (a test
+# reference removed, a test locking in behaviour, a test/config edit masking runtime, a
+# missing test for a destructive op) — describe test-side or coverage concerns, never a
+# production-runtime invariant on the changed code, so they get at MOST "medium".
 _FAMILY_SPECIFICITY: dict[str, str] = {
-    # High: driven by code_risk_signal evidence or A2 contract-diff
+    # High: assert a concrete production-runtime invariant on changed code (signal-driven).
     "async_side_effect_lifecycle_drift": "high",
     "swallowed_exception_state_drift": "high",
     "call_result_identity_comparison_semantics": "high",
-    "destructive_mutation_test_gap": "high",
-    # Medium: convention-triggered specific families
+    # Medium: convention-grade / indirectly-anchored production concerns.
     "component_list_render_identity_drift": "medium",
     "hook_gate_render_mismatch": "medium",
-    "low_coverage_stylesheet_gap": "medium",
-    # Low: test_locks lacks a named runtime invariant; treated low until signal-backed
+    # Medium: test-surface family — asserts a missing-test (coverage) concern on a
+    # destructive production call, not a runtime invariant on the changed code itself.
+    "destructive_mutation_test_gap": "medium",
+    # Low: generic suspicion / coverage-limitation, no named runtime invariant.
+    "low_coverage_stylesheet_gap": "low",
+    # Low: test-surface family — asserts test assertions may lock in a regression.
     "test_locks_in_regression": "low",
-    # Low: generic families
+    # Low: generic contract-drift suspicions.
     "direct_call_contract_drift": "low",
     "framework_contract_drift": "low",
     "runtime_endpoint_or_event_contract_drift": "low",
     "application_surface_contract_drift": "low",
+    # Low: test-surface family — asserts a test/config edit may mask a runtime change.
     "test_or_config_masks_runtime_change": "low",
 }
 
@@ -94,6 +106,240 @@ def _sort_and_cap_hypotheses(hypotheses: list[JsonObject]) -> list[JsonObject]:
     mediums = [h for h in hypotheses if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 1]
     lows = [h for h in hypotheses if _SPEC_RANK.get(str(h.get("specificity") or "low"), 2) == 2]
     return (highs + mediums + lows)[:5]
+
+
+# ---------------------------------------------------------------------------
+# Structural noise downranking (pre-cap reorder within peer groups)
+# ---------------------------------------------------------------------------
+#
+# The splice layer inserts diff-derived rows at the front partitioned strictly by
+# derivation trust tier (deterministic_static, then inferred_llm, then generic rows
+# with no derivation stamp). That tier boundary is intentional and must not be
+# crossed by scoring — a low-value deterministic row still outranks a high-value
+# inferred one. The scorer therefore reorders only WITHIN each derivation peer group,
+# stably (score desc, prior order as tiebreak), so on a large PR a builtin/test-only/
+# module-root call row cannot win a scarce slot ahead of a concrete-failure-mode row.
+#
+# All signals are structural (KG entity kind / path segments / claim shape) — no
+# name lists, no keywords. Constants are additive; the base score is 0.
+
+# Call-target entity kinds that make a removed/moved-call row low-value:
+#   external symbol (e.g. a language builtin) or an external package.
+_LOW_VALUE_CALL_TARGET_KINDS: frozenset[str] = frozenset({"ExternalSymbol", "ExternalPackage"})
+# Entity kinds that represent a bare package/module root rather than a real symbol.
+_MODULE_ROOT_TARGET_KINDS: frozenset[str] = frozenset({"CodeModule", "ExternalPackage"})
+# Risk types whose rows describe a removed or moved CALLS edge (target-bearing).
+_CALL_MOVE_RISK_TYPES: frozenset[str] = frozenset(
+    {"guard_call_removed_drift", "responsibility_moved_drift"}
+)
+
+_PENALTY_EXTERNAL_CALL_TARGET = -3.0
+_PENALTY_BOTH_PATHS_TEST = -2.0
+_PENALTY_MODULE_ROOT_TARGET = -2.0
+_BOOST_CONCRETE_FAILURE_MODE = 3.0
+# Lowered from 2.0 so a high-specificity claim WITHOUT coords (see _SPECIFICITY_BOOST)
+# can outrank a generic/low-specificity claim WITH coords, per the claim-strength contract.
+# The cause-in-changed-prod-file signal is a locality signal, not a claim-strength signal;
+# a concrete named-invariant family should not be beaten purely because it lacks a coord hit.
+_BOOST_CAUSE_IN_CHANGED_PROD_FILE = 1.0
+
+# Claim strength as a first-class score input (structural, NOT keyword-derived).
+# Both scales read the EXISTING row fields the producers already stamp:
+#   - specificity: assigned per family/row at generation (_FAMILY_SPECIFICITY / directness
+#     override). "high" = a concrete named invariant on a directly-changed symbol; "low" =
+#     a generic contract-drift suspicion; "medium" = convention/transitive-grade.
+#   - confidence:  the producer vocab is {"strong","medium","weak"} (see _CONFIDENCE_RANK).
+# Neutral-middle policy: a row MISSING (or carrying an unrecognized value for) either field
+# gets the MIDDLE weight, never a penalty — absence of metadata is not weakness. So an
+# unstamped row scores identically to a "medium" row on that axis and is neither rescued
+# nor punished for the gap.
+#
+# Magnitude bound (keeps rule 4 intact): max claim boost = _SPECIFICITY_BOOST["high"]
+# (1.5) + _CONFIDENCE_BOOST["strong"] (0.5) = 2.0, which does not exceed the smallest
+# noise penalty magnitude (2.0). So a noisy row (external/module-root callee, both-test
+# paths) can never be lifted ABOVE a clean peer by claim strength alone: -3.0 + 2.0 < 0,
+# and -2.0 + 2.0 = 0.0 stays at or below a clean neutral peer (0.75). Noise stays dominant.
+_SPECIFICITY_BOOST: dict[str, float] = {"high": 1.5, "medium": 0.75, "low": 0.0}
+_SPECIFICITY_NEUTRAL = 0.75
+_CONFIDENCE_BOOST: dict[str, float] = {"strong": 0.5, "medium": 0.25, "weak": 0.0}
+_CONFIDENCE_NEUTRAL = 0.25
+
+
+def _claim_strength_score(row: JsonObject) -> float:
+    """Additive claim-strength contribution from a row's specificity + confidence fields.
+
+    Structural only: reads the two stamped fields, maps each through a bounded weight table,
+    and applies the neutral-middle fallback for missing/unrecognized values. No claim-text
+    inspection, no keyword lists.
+    """
+    spec = row.get("specificity")
+    spec_score = (
+        _SPECIFICITY_BOOST[spec]
+        if isinstance(spec, str) and spec in _SPECIFICITY_BOOST
+        else _SPECIFICITY_NEUTRAL
+    )
+    conf = row.get("confidence")
+    conf_score = (
+        _CONFIDENCE_BOOST[conf]
+        if isinstance(conf, str) and conf in _CONFIDENCE_BOOST
+        else _CONFIDENCE_NEUTRAL
+    )
+    return spec_score + conf_score
+
+
+def _path_of(ref: JsonObject | None) -> str:
+    if not isinstance(ref, dict):
+        return ""
+    return _normalize_path(str(ref.get("path") or ""))
+
+
+def _structural_noise_score(
+    row: JsonObject,
+    changed_file_set: frozenset[str],
+    changed_qualnames: frozenset[str],
+) -> float:
+    """Deterministic structural score for one hypothesis row (higher = keep).
+
+    Structural signals only — entity kind, path segments, claim shape. Base 0.
+
+    Penalize:
+      - a removed/moved-call row whose CALLEE resolves to a language builtin or
+        external-package entity, with no changed-symbol overlap (callee URN does not
+        contain a PR-changed qualname) — a call into third-party/builtin code that
+        the PR did not itself touch.
+      - a row whose cause AND consequence are both test-classified paths.
+      - a call-move row whose CALLEE is a bare module/package root entity.
+    Boost:
+      - a row carrying a concrete failure mode in its claim structure
+        (an ``unimplemented_members`` list — e.g. abstract-contract rows).
+      - a row whose cause path is a production (non-test) file present in the PR's
+        changed files.
+    """
+    score = 0.0
+    risk_type = str(row.get("risk_type") or "")
+    cause_path = _path_of(row.get("cause"))
+    consequence_path = _path_of(row.get("consequence"))
+    # The builtin/external and module-root penalties describe a property of the moved/
+    # removed call's CALLEE, so they key on callee_entity_kind/callee_urn. For a guard
+    # row the callee coincides with target; for a moved row the callee (shared_callee Z)
+    # differs from target_entity_kind (the move destination Y) — keying on target there
+    # was the defect. Fall back to target_* only when a call-move row carries no callee
+    # field (defensive; the splice always sets callee_* for both call-move families).
+    callee_kind = str(row.get("callee_entity_kind") or row.get("target_entity_kind") or "")
+    callee_urn = str(row.get("callee_urn") or row.get("target_urn") or "")
+
+    # Penalty 1: call row whose callee is a builtin/external entity with no changed-symbol overlap.
+    if risk_type in _CALL_MOVE_RISK_TYPES and callee_kind in _LOW_VALUE_CALL_TARGET_KINDS:
+        overlaps = bool(callee_urn) and any(q and q in callee_urn for q in changed_qualnames)
+        if not overlaps:
+            score += _PENALTY_EXTERNAL_CALL_TARGET
+
+    # Penalty 2: both cause and consequence are test paths.
+    if cause_path and consequence_path and _is_test_file(cause_path) and _is_test_file(consequence_path):
+        score += _PENALTY_BOTH_PATHS_TEST
+
+    # Penalty 3: call-move row whose callee is a bare module/package root.
+    if risk_type in _CALL_MOVE_RISK_TYPES and callee_kind in _MODULE_ROOT_TARGET_KINDS:
+        score += _PENALTY_MODULE_ROOT_TARGET
+
+    # Boost 1: concrete failure mode carried in the claim structure.
+    if row.get("unimplemented_members"):
+        score += _BOOST_CONCRETE_FAILURE_MODE
+
+    # Boost 2: cause path is a production file that the PR changed.
+    if cause_path and not _is_test_file(cause_path) and cause_path in changed_file_set:
+        score += _BOOST_CAUSE_IN_CHANGED_PROD_FILE
+
+    # Claim strength (specificity + confidence): a first-class score input so a
+    # high-specificity claim carrying no cause coords still outranks a generic
+    # suspicion-grade claim that happens to carry coords. Bounded below the smallest
+    # noise penalty so it can never rescue a noisy row (see _claim_strength_score).
+    score += _claim_strength_score(row)
+
+    return score
+
+
+def _structural_score_inputs(
+    changed_files: list[str],
+    changed_symbols: list[JsonObject] | None,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Build the (changed_file_set, changed_qualnames) frozensets the scorer consumes.
+
+    Shared by apply_structural_noise_downranking and score_hypothesis_row so the peer-group
+    reorder and the seat-allocation policy score rows against the exact same inputs.
+    """
+    changed_file_set = frozenset(
+        _normalize_path(str(p)) for p in changed_files if isinstance(p, str) and p
+    )
+    changed_qualnames = frozenset(
+        str(s.get("qualname") or s.get("qualified_name") or "")
+        for s in (changed_symbols or [])
+        if isinstance(s, dict) and (s.get("qualname") or s.get("qualified_name"))
+    )
+    return changed_file_set, changed_qualnames
+
+
+def score_hypothesis_row(
+    row: JsonObject,
+    changed_files: list[str],
+    changed_symbols: list[JsonObject] | None = None,
+) -> float:
+    """Public structural score for one hypothesis row (higher = keep).
+
+    Wraps the same _structural_noise_score used by apply_structural_noise_downranking so
+    seat allocation (output_budget.plan_hypothesis_seats) and the peer-group reorder share
+    one scoring rule. See _structural_noise_score for the signal definitions.
+    """
+    changed_file_set, changed_qualnames = _structural_score_inputs(changed_files, changed_symbols)
+    return _structural_noise_score(row, changed_file_set, changed_qualnames)
+
+
+def apply_structural_noise_downranking(
+    hypotheses: list[JsonObject],
+    changed_files: list[str],
+    changed_symbols: list[JsonObject] | None = None,
+) -> list[JsonObject]:
+    """Stable-reorder rows by structural score WITHIN each (derivation, risk_type) peer group.
+
+    Peer group is (derivation trust tier, risk_type family). The scorer reorders only
+    among rows of the SAME tier AND SAME family, writing them back into the exact
+    positions that family's rows already occupied. This preserves two existing
+    invariants the downstream cap depends on:
+      - the derivation trust-tier partition (deterministic_static, then inferred_llm,
+        then generic) — a row never crosses a tier boundary; and
+      - the family interleaving the splice round-robin built — so which diff-derived
+        families sit in the pre-cap prefix is unchanged, and the cap's per-family
+        survival guarantee (_cap_review_hypotheses_reserving_diff_families) still holds.
+    Within a family, a noisy row (builtin/external or module-root call target, test-only
+    cause+consequence) sinks below a higher-signal peer of the same family; a boosted
+    row (concrete failure mode, changed-prod-file cause) rises. Ties keep prior order.
+    Does not cap or drop rows.
+    """
+    changed_file_set, changed_qualnames = _structural_score_inputs(changed_files, changed_symbols)
+
+    # Group original list indices by (derivation, risk_type). Rows are reordered only
+    # among their group's own positions, so the sequence of group-slots is preserved.
+    groups: dict[tuple[str, str], list[int]] = {}
+    for idx, row in enumerate(hypotheses):
+        if not isinstance(row, dict):
+            continue
+        key = (str(row.get("derivation") or ""), str(row.get("risk_type") or ""))
+        groups.setdefault(key, []).append(idx)
+
+    reordered = list(hypotheses)
+    for positions in groups.values():
+        if len(positions) < 2:
+            continue
+        ranked = sorted(
+            positions,
+            key=lambda i: (
+                -_structural_noise_score(hypotheses[i], changed_file_set, changed_qualnames),
+                i,  # stable tiebreak: prior order
+            ),
+        )
+        for slot, src in zip(positions, ranked):
+            reordered[slot] = hypotheses[src]
+    return reordered
 
 
 def review_hypotheses_for_context(
@@ -247,7 +493,11 @@ def _make_hypothesis(
     cause: JsonObject | None = None,
     consequence: JsonObject | None = None,
     negative_checks: list[str] | None = None,
+    specificity: str | None = None,
 ) -> JsonObject:
+    # specificity defaults to the family class; a family that can distinguish a DIRECT
+    # changed-symbol hit from a TRANSITIVE-helper hit passes a per-row override (e.g. the
+    # async-lifecycle family downgrades a transitive-helper suspicion to "medium").
     row: JsonObject = {
         "risk_type": risk_type,
         "confidence": confidence,
@@ -255,7 +505,7 @@ def _make_hypothesis(
         "evidence_refs": evidence_refs,
         "source_checks": source_checks,
         "supporting_lead_ids": supporting_lead_ids,
-        "specificity": _FAMILY_SPECIFICITY.get(risk_type, "low"),
+        "specificity": specificity or _FAMILY_SPECIFICITY.get(risk_type, "low"),
     }
     if concrete_invariant is not None:
         row["concrete_invariant"] = concrete_invariant
@@ -270,7 +520,9 @@ def _make_hypothesis(
     source_spans = _source_spans_from_evidence_refs(evidence_refs)
     if source_spans:
         row["source_spans"] = source_spans
-    row["hypothesis_id"] = hypothesis_stable_id(risk_type, supporting_lead_ids, evidence_refs)
+    hypothesis_id = hypothesis_stable_id(risk_type, supporting_lead_ids, evidence_refs)
+    row["hypothesis_id"] = hypothesis_id
+    row["label"] = hypothesis_label(risk_type, hypothesis_id)
     return row
 
 
@@ -671,6 +923,34 @@ def _short_name(sym: JsonObject) -> str:
     return str(sym.get("name") or "")
 
 
+def _matched_symbol_cause(sym: JsonObject) -> JsonObject | None:
+    """Build a cause coordinate from the symbol the detector matched.
+
+    Reads only the coordinate fields the symbol row already carries (from
+    _symbol_result: repo/path/line/end_line) and maps them to the cause envelope
+    (repo/path/line_start/line_end). Never fabricates: if the matched symbol has no
+    path, no cause is emitted. This is a dead-metadata fix — the family already
+    resolved this exact symbol to build its evidence_refs and postable_claim; the
+    coordinate it matched must not be dropped from the scored cause field.
+    """
+    cause: JsonObject = {}
+    repo = sym.get("repo")
+    if repo is not None:
+        cause["repo"] = repo
+    path = sym.get("path")
+    if path is not None:
+        cause["path"] = path
+    line = sym.get("line")
+    if line is not None:
+        cause["line_start"] = line
+    end_line = sym.get("end_line")
+    if end_line is not None:
+        cause["line_end"] = end_line
+    # A cause anchored to nothing is useless (and the changed-prod-file boost keys on
+    # cause path); require a path before emitting.
+    return cause if "path" in cause else None
+
+
 def _is_component_symbol(sym: JsonObject) -> bool:
     name = _short_name(sym)
     path = sym.get("path") or ""
@@ -775,14 +1055,16 @@ def _component_list_render_identity_drift(
     negative_checks = [
         "If the component renders a static list with stable keys and no memoization dependency changed, identity drift is unlikely.",
     ]
-    # Build postable_claim from first component symbol
+    # Build postable_claim + cause from first component symbol (the one the detector matched).
     postable_claim: str | None = None
+    cause: JsonObject | None = None
     if component_syms:
         first_comp = _short_name(component_syms[0])
         if first_comp:
             postable_claim = (
                 f"{first_comp} has changed; verify list keys and child rendering identity are stable."
             )
+        cause = _matched_symbol_cause(component_syms[0])
     return _make_hypothesis(
         risk_type="component_list_render_identity_drift",
         confidence=confidence,
@@ -792,6 +1074,7 @@ def _component_list_render_identity_drift(
         supporting_lead_ids=lead_ids[:10],
         negative_checks=negative_checks,
         postable_claim=postable_claim,
+        cause=cause,
     )
 
 
@@ -891,14 +1174,16 @@ def _hook_gate_render_mismatch(
     negative_checks = [
         "If the hook's return shape is unchanged and only its internal implementation changed, render gate mismatch is unlikely.",
     ]
-    # postable_claim from first hook symbol
+    # postable_claim + cause from first hook symbol (the one the detector matched).
     postable_claim: str | None = None
+    cause: JsonObject | None = None
     if hook_syms:
         first_hook = _short_name(hook_syms[0])
         if first_hook:
             postable_claim = (
                 f"{first_hook} return contract may have shifted; components consuming it may render incorrectly."
             )
+        cause = _matched_symbol_cause(hook_syms[0])
     return _make_hypothesis(
         risk_type="hook_gate_render_mismatch",
         confidence=confidence,
@@ -908,6 +1193,7 @@ def _hook_gate_render_mismatch(
         supporting_lead_ids=lead_ids[:10],
         negative_checks=negative_checks,
         postable_claim=postable_claim,
+        cause=cause,
     )
 
 
@@ -1040,6 +1326,23 @@ def _signal_matches_changed_context(
     return False
 
 
+def _signal_is_direct_changed_symbol(
+    signal: JsonObject,
+    changed_entity_ids: set[str],
+) -> bool:
+    """Return True when the signal is anchored to a DIRECTLY-changed symbol entity.
+
+    Directness = the signal's subject_id is one of the PR's changed-symbol entity ids
+    (not merely a co-located helper matched by file path). This is the structural
+    distinction the async-lifecycle family uses to set specificity: a direct hit is a
+    concrete named-invariant claim on changed code ("high"); a hit that resolves only via
+    the file-path fallback is a transitive-helper suspicion that must not claim "high".
+    No claim-text inspection.
+    """
+    subject_id = signal.get("subject_id")
+    return isinstance(subject_id, str) and subject_id in changed_entity_ids
+
+
 def _evidence_refs_from_risk_signals(signals: list[JsonObject]) -> list[JsonObject]:
     """Build evidence_refs from risk signal evidence bytes_refs."""
     refs: list[JsonObject] = []
@@ -1170,6 +1473,16 @@ def _async_side_effect_lifecycle_drift(
     lead_ids = _lead_ids_for_signal_subjects(matching, review_leads)
     has_direct_edge = bool(direct_callers or direct_callees)
     confidence = "medium" if (lead_ids and has_direct_edge) else "weak"
+    # Specificity reflects DIRECTNESS, not the family alone: a signal anchored to a
+    # directly-changed symbol is a concrete named-invariant claim on changed code ("high");
+    # a signal that matched only via the file-path fallback is a transitive-helper
+    # suspicion ("may not be coupled") and must not claim "high". This is the generation-side
+    # fix for the field regression where a transitive-helper async hit emitted "high" and
+    # displaced concrete UI-family rows in seat allocation.
+    is_direct = any(
+        _signal_is_direct_changed_symbol(sig, changed_entity_ids) for sig in matching
+    )
+    specificity = "high" if is_direct else "medium"
     source_checks = [
         "Trace each flagged call site; verify the async call is awaited or its result is reconciled with any paired persistent-state change.",
         "Check whether the mutation path that contains the async call has a compensating rollback or retry if the async work fails.",
@@ -1220,6 +1533,7 @@ def _async_side_effect_lifecycle_drift(
         cause=cause or None,
         consequence=consequence or None,
         negative_checks=negative_checks,
+        specificity=specificity,
     )
 
 

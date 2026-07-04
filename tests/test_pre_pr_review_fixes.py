@@ -28,7 +28,9 @@ from source.kg.product.output_budget import (
     _evict_review_rows_to_fit,
     _finalize_review_hypothesis_budget,
     _protect_review_hypotheses_floor,
+    _restore_hypotheses_up_to_target,
     _sync_review_quality_status_from_packet,
+    compute_hypothesis_seat_plan,
     enforce_review_context_budget,
 )
 from source.kg.product.review_attribution import review_lead_counts
@@ -331,6 +333,111 @@ class TestFinalizeReviewHypothesisBudgetHardCapNoEvictable(unittest.TestCase):
             "review_hypothesis_status",
             packet,
             "review_hypothesis_status should be present when budget allows",
+        )
+
+
+class TestHardCapHoldsAfterSuggestedFollowups(unittest.TestCase):
+    """P1: suggested_followups attached by _attach_truncated_hypothesis_followups grow
+    review_quality_status, which is in _HARD_CAP_PROTECTED_KEYS. Before the fix the trim
+    ladder only shrank inspection_areas, so a packet could exit finalize over max_chars.
+    The trim ladder now also drops suggested_followups and a final assertion enforces the
+    cap contract that the review-context lead gate relies on."""
+
+    def _high_hyp(self, risk_type: str, hyp_id: str) -> dict:
+        return {
+            "hypothesis_id": hyp_id,
+            "risk_type": risk_type,
+            "specificity": "high",
+            "confidence": "strong",
+            "why": "Contract drift.",
+            "evidence_refs": [],
+            "source_checks": [],
+            "supporting_lead_ids": [],
+            "cause": {"repo": "svc", "path": f"src/{risk_type}.py", "line_start": 12,
+                      "qualname": f"mod.{risk_type}_fn"},
+            "label": f"H-{risk_type}",
+        }
+
+    def _packet_with_many_truncated_high_families(self):
+        # One high-specificity row survives (drives review_readiness -> needs_followup),
+        # many high families are truncated -> one suggested_followup each.
+        survivor = self._high_hyp("survivor_risk", "hypothesis:survivor:id0000")
+        result = {
+            "status": "found",
+            "review_hypotheses": [survivor],
+            "review_quality_status": {
+                "review_readiness": "packet_ready",
+                "specificity": "high",
+            },
+        }
+        # full_pre_cap set: survivor plus many distinct-family high rows NOT in the packet.
+        truncated = [
+            self._high_hyp(f"trunc_family_{i:02d}", f"hypothesis:trunc:id{i:04d}")
+            for i in range(20)
+        ]
+        full_pre_cap = [survivor] + truncated
+        return result, [survivor], full_pre_cap
+
+    def _affordance_free_size(self):
+        """Size of the finalized packet with ALL status affordances stripped — the
+        irreducible floor the trim ladder can shrink down to."""
+        result, original, full_pre_cap = self._packet_with_many_truncated_high_families()
+        _finalize_review_hypothesis_budget(
+            result, original, original_review_leads={}, max_chars=1_000_000,
+            full_pre_cap_hypotheses=full_pre_cap,
+        )
+        status = result["review_quality_status"]
+        status.pop("suggested_followups", None)
+        status.pop("inspection_areas", None)
+        return len(canonical_json(result))
+
+    def test_followups_overshoot_trimmed_and_cap_holds(self):
+        result, original, full_pre_cap = self._packet_with_many_truncated_high_families()
+        # Tight cap: just above the affordance-free floor so the irreducible status scalars
+        # fit, but the many attached followups (one per truncated family) overshoot even
+        # after inspection_areas are fully removed. Forces the followups trim rung.
+        max_chars = self._affordance_free_size() + 150
+        _finalize_review_hypothesis_budget(
+            result,
+            original,
+            original_review_leads={},
+            max_chars=max_chars,
+            full_pre_cap_hypotheses=full_pre_cap,
+        )
+        final_chars = len(canonical_json(result))
+        # Hard-cap contract: must hold on this exit path.
+        self.assertLessEqual(
+            final_chars, max_chars,
+            f"packet breached hard cap after suggested_followups: {final_chars} > {max_chars}",
+        )
+        status = result.get("review_quality_status")
+        self.assertIsInstance(status, dict)
+        # The affordances were bounded down to fit: at most 1 followup, inspection_areas
+        # trimmed/dropped. (The exact count depends on slack; assert the invariant, not a
+        # magic number.)
+        followups = status.get("suggested_followups") or []
+        self.assertLessEqual(
+            len(followups), 1,
+            f"trim ladder must leave <=1 suggested_followup under a tight cap; got {len(followups)}",
+        )
+
+    def test_inversion_ample_budget_keeps_multiple_followups(self):
+        # Inversion proof: with ample budget the followups are NOT trimmed, proving the
+        # trimming above is driven by the cap, not an unconditional cull.
+        result, original, full_pre_cap = self._packet_with_many_truncated_high_families()
+        _finalize_review_hypothesis_budget(
+            result,
+            original,
+            original_review_leads={},
+            max_chars=100_000,
+            full_pre_cap_hypotheses=full_pre_cap,
+        )
+        status = result.get("review_quality_status")
+        self.assertIsInstance(status, dict)
+        followups = status.get("suggested_followups") or []
+        self.assertGreater(
+            len(followups), 1,
+            "ample budget must retain multiple suggested_followups (inversion of the trim path)",
         )
 
 
@@ -999,6 +1106,83 @@ class TestN2HypothesisHeadroomUnderPressure(unittest.TestCase):
         self.assertGreaterEqual(len(top_hyps), 1, "floor-of-1 must always hold")
 
 
+class TestRestoreUsesRankedOrderNoDuplicates(unittest.TestCase):
+    """P1: _restore_hypotheses_up_to_target consumes the shared seat order and dedups by id.
+
+    Post score-ordering, the seated rows are no longer an original-order prefix, so the old
+    prefix-based restore (original_hypotheses[len(current):target]) could duplicate an
+    already-seated row or restore a lower-scored row ahead of a higher-scored one.
+    """
+
+    @staticmethod
+    def _rows():
+        # low scores -2 (both paths test), mid scores 0 (unchanged prod file), high scores
+        # +2 (cause in a CHANGED prod file). Distinct risk_types so the seat plan ranks the
+        # families high > mid > low.
+        low = {
+            "hypothesis_id": "hyp:low",
+            "risk_type": "rt_low",
+            "derivation": "inferred_llm",
+            "cause": {"path": "tests/test_a.py", "line_start": 1},
+            "consequence": {"path": "tests/test_b.py", "line_start": 1},
+        }
+        high = {
+            "hypothesis_id": "hyp:high",
+            "risk_type": "rt_high",
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/core.py", "line_start": 1},
+        }
+        mid = {
+            "hypothesis_id": "hyp:mid",
+            "risk_type": "rt_mid",
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/other.py", "line_start": 1},
+        }
+        # Original producer order is [low, high, mid] — NOT score order.
+        return [low, high, mid], high, mid, low
+
+    def test_restore_to_target_uses_ranked_order_no_duplicate(self):
+        original, high, mid, low = self._rows()
+        seat_plan = compute_hypothesis_seat_plan(
+            original, changed_files=["src/core.py"], changed_symbols=None
+        )
+        # Precondition: seat plan ranks high before mid before low (score order).
+        self.assertEqual(seat_plan["ordered_types"], ["rt_high", "rt_mid", "rt_low"])
+        # Simulate the compactor having seated only the highest-scored family (high). Because
+        # high is original_hypotheses[1], the OLD prefix restore would append
+        # original_hypotheses[len([high]):2] == original_hypotheses[1:2] == [high] again.
+        result = {"review_hypotheses": [dict(high)]}
+        # Inversion proof: prefix-based restore would duplicate high (it sits at index 1).
+        prefix_next = [h["hypothesis_id"] for h in original[1:2]]
+        self.assertEqual(prefix_next, ["hyp:high"], "inversion: prefix restore re-adds high")
+
+        _restore_hypotheses_up_to_target(
+            result, original, max_chars=100_000, target=2, seat_plan=seat_plan
+        )
+        got = [h["hypothesis_id"] for h in result["review_hypotheses"]]
+        self.assertEqual(got, ["hyp:high", "hyp:mid"], f"expected [high, mid], got {got}")
+        self.assertEqual(len(got), len(set(got)), "no duplicate hypothesis_ids")
+        self.assertNotIn("hyp:low", got, "lowest-scored row must not be restored before mid")
+
+    def test_restore_dedups_when_current_row_not_first_in_original(self):
+        # Current already holds mid (a non-first, non-highest row). Restore to target 3 must
+        # add high and low without re-adding mid.
+        original, high, mid, low = self._rows()
+        seat_plan = compute_hypothesis_seat_plan(
+            original, changed_files=["src/core.py"], changed_symbols=None
+        )
+        result = {"review_hypotheses": [dict(mid)]}
+        _restore_hypotheses_up_to_target(
+            result, original, max_chars=100_000, target=3, seat_plan=seat_plan
+        )
+        got = [h["hypothesis_id"] for h in result["review_hypotheses"]]
+        self.assertEqual(len(got), len(set(got)), f"no duplicates; got {got}")
+        self.assertEqual(got.count("hyp:mid"), 1, "mid not re-added")
+        self.assertEqual(set(got), {"hyp:mid", "hyp:high", "hyp:low"})
+        # Restored rows follow ranked order after the already-present mid.
+        self.assertEqual(got[1:], ["hyp:high", "hyp:low"])
+
+
 class TestN4AvailableRiskTypes(unittest.TestCase):
     """N4: review_hypothesis_status carries available_risk_types (sorted list of generated risk_types)."""
 
@@ -1272,6 +1456,181 @@ class TestTandemClippingCapInvariant(unittest.TestCase):
         entry_size = len(canonical_json(packet))
         result = enforce_review_context_budget(packet, max_chars=cap)
         self._assert_invariants(result, cap, entry_size, "enforce_budget_7544")
+
+
+class TestAttributionLabelsDroppedBeforeIrreducible(unittest.TestCase):
+    """P1: the final hard-cap fallback must drop review_answer_packet.attribution_labels
+    before declaring the packet irreducible (exceeded_after_minimization).
+
+    Repro: attribution_labels fit at attach time; review_quality_status growth/presence then
+    pushes the packet over the cap. After the trim ladder empties the status affordances the
+    packet is STILL over — but only because of the droppable attribution_labels. Before the
+    fix, the fallback trimmed status, saw the packet over cap, and set exceeded_after_minimization
+    with a droppable affordance still present. cap=1440 was verified to be a cap where the label
+    drop is load-bearing: without labels the packet fits, re-adding them breaches, and status
+    carries no trimmable affordances.
+    """
+
+    @staticmethod
+    def _make_packet() -> tuple[dict, list[dict]]:
+        surviving = {
+            "hypothesis_id": "hypothesis:contract_semantic_diff:aaaa000000000001",
+            "label": "H1",
+            "risk_type": "contract_semantic_diff",
+            "specificity": "high",
+            "confidence": "medium",
+            "why": "Risk.",
+            "postable_claim": "claim one",
+            "supporting_lead_ids": [],
+            "evidence_refs": [{"repo": "r", "path": "a.py", "line_start": 1, "line_end": 5}],
+            "source_checks": [],
+        }
+        review_quality_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "review_readiness": "packet_ready",
+            "specificity": "high",
+            "base_diff_status": "present",
+            # Pre-existing (S1) suggested_followups: bulk that the trim ladder can shed, so
+            # once trimmed the ONLY thing keeping the packet over cap is attribution_labels.
+            "suggested_followups": [{"followup": f"f{i}" + ("x" * 60)} for i in range(3)],
+        }
+        packet = {
+            "tool": "review_context",
+            "status": "ok",
+            "review_hypotheses": [surviving],
+            "review_answer_packet": {"top_review_hypotheses": [surviving], "status": "ok"},
+            "review_quality_status": review_quality_status,
+            "review_leads": {
+                "changed_symbols": [], "direct_callers": [], "direct_callees": [],
+                "transitive_callers": [], "source_coordinates": [],
+            },
+            "output_budget": {
+                "truncated": False, "measured_chars": 0, "max_chars": 0, "truncated_sections": [],
+            },
+        }
+        return packet, [surviving]
+
+    def test_labels_dropped_not_declared_irreducible(self):
+        from copy import deepcopy
+        cap = 1_440
+        packet, original_hyps = self._make_packet()
+        _finalize_review_hypothesis_budget(
+            packet, deepcopy(original_hyps), original_review_leads={}, max_chars=cap
+        )
+        size = len(canonical_json(packet))
+        ap = packet["review_answer_packet"]
+        budget = packet["output_budget"]
+        # Fix: packet fits, no irreducible flag, and the droppable affordance is gone.
+        self.assertLessEqual(size, cap, f"packet must fit the hard cap; size={size} cap={cap}")
+        self.assertNotIn(
+            "exceeded_after_minimization", budget,
+            "packet must NOT be declared irreducible when dropping attribution_labels restores the cap",
+        )
+        self.assertNotIn(
+            "attribution_labels", ap,
+            "droppable attribution_labels must be dropped in the final fallback",
+        )
+        # Inversion proof: re-attaching the dropped affordance (the REAL affordance, same
+        # instruction the producer attaches) breaches the cap, so the drop was load-bearing
+        # (not vacuous), and status carries no trimmable affordances.
+        from source.kg.product.output_budget import _ATTRIBUTION_LABELS_INSTRUCTION
+        ap["attribution_labels"] = {"labels": ["H1"], "instruction": _ATTRIBUTION_LABELS_INSTRUCTION}
+        self.assertGreater(
+            len(canonical_json(packet)), cap,
+            "re-attaching attribution_labels must breach the cap (proves the drop was load-bearing)",
+        )
+        status = packet["review_quality_status"]
+        self.assertNotIn("suggested_followups", status)
+        self.assertNotIn("inspection_areas", status)
+
+
+class TestStaleLeadIdsAfterLateFundingEviction(unittest.TestCase):
+    """P2: the fund_over_cap passes (_attach_attribution_labels, quality-status sync) run
+    AFTER the last mid-finalize _reconcile_hypothesis_lead_ids and can evict lead rows to
+    fund their affordances. Without the final reconcile pass, a surviving hypothesis keeps
+    citing the evicted lead_id — a stale reference into a row absent from the packet.
+    """
+
+    @staticmethod
+    def _make_packet(cap_pressure_rows: int = 6) -> tuple[dict, list[dict]]:
+        lead_rows = [
+            {
+                "lead_id": f"lead:changed_symbol:x{i}",
+                "path": f"pkg/mod{i}.py",
+                "symbol": f"func{i}",
+                "detail": "d" * 220,
+            }
+            for i in range(cap_pressure_rows)
+        ]
+        hyp = {
+            "hypothesis_id": "hypothesis:contract_semantic_diff:bbbb000000000001",
+            "label": "H1",
+            "risk_type": "contract_semantic_diff",
+            "specificity": "high",
+            "confidence": "medium",
+            "why": "Risk.",
+            "postable_claim": "claim one",
+            # Cites the LAST lead rows — the ones eviction pops first.
+            "supporting_lead_ids": [f"lead:changed_symbol:x{cap_pressure_rows - 1}",
+                                    "lead:changed_symbol:x0"],
+            "evidence_refs": [{"repo": "r", "path": "a.py", "line_start": 1, "line_end": 5}],
+            "source_checks": [],
+        }
+        packet = {
+            "tool": "review_context",
+            "status": "ok",
+            "review_hypotheses": [hyp],
+            "review_answer_packet": {"top_review_hypotheses": [hyp], "status": "ok"},
+            "review_quality_status": {
+                "coverage_status": "useful",
+                "recommended_action": "use_supercontext_packet",
+                "review_readiness": "packet_ready",
+                "specificity": "high",
+                "base_diff_status": "present",
+            },
+            "review_leads": {
+                "changed_symbols": lead_rows,
+                "direct_callers": [], "direct_callees": [],
+                "transitive_callers": [], "source_coordinates": [],
+            },
+            "output_budget": {
+                "truncated": False, "measured_chars": 0, "max_chars": 0, "truncated_sections": [],
+            },
+        }
+        return packet, [hyp]
+
+    def test_final_hypotheses_cite_only_surviving_leads(self):
+        from copy import deepcopy
+        from source.kg.product.output_budget import _collect_surviving_lead_ids
+
+        cap = 1_900  # tuned: labels/status funding must evict lead rows to fit
+        packet, original_hyps = self._make_packet()
+        _finalize_review_hypothesis_budget(
+            packet, deepcopy(original_hyps), original_review_leads={}, max_chars=cap
+        )
+        surviving = _collect_surviving_lead_ids(packet)
+        # Precondition: the funding passes actually evicted at least one cited lead row —
+        # otherwise this test is vacuous (assert loudly so cap re-tuning is forced).
+        self.assertLess(
+            len(surviving), 6,
+            f"cap={cap} no longer forces lead eviction; re-tune the fixture (surviving={surviving})",
+        )
+        stale_targets = {"lead:changed_symbol:x5", "lead:changed_symbol:x0"} - surviving
+        self.assertTrue(
+            stale_targets,
+            f"fixture must evict at least one CITED lead; surviving={sorted(surviving)}",
+        )
+        for hyps in (packet.get("review_hypotheses") or [],
+                     (packet.get("review_answer_packet") or {}).get("top_review_hypotheses") or []):
+            for hyp in hyps:
+                lead_ids = hyp.get("supporting_lead_ids") or []
+                stale = [lid for lid in lead_ids if lid not in surviving]
+                self.assertEqual(
+                    stale, [],
+                    f"hypothesis {hyp.get('label')!r} cites evicted lead ids {stale}; "
+                    "final reconcile after late funding passes must strip them",
+                )
 
 
 class TestAliasedTandemClipDoesNotDoubleEvict(unittest.TestCase):
