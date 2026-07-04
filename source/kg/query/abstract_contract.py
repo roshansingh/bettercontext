@@ -18,23 +18,29 @@ Mechanism (pure ``ast`` + KG structure; NO regex, NO name/keyword lists):
      using the same fail-closed disambiguation as semantic_contract_diff
      (dotted → exact qualified-suffix match; bare → exactly one candidate;
      ambiguous → skip).
-  4. Parse each resolved base's own file with ``ast``. The base is abstract when
-     its own bases include ``ABC``/``abc.ABC``, or it declares
-     ``metaclass=ABCMeta``, or any member is decorated with
-     ``abstractmethod``/``abc.abstractmethod`` (including stacked
-     ``@property`` + ``@abstractmethod``). Collect the required abstract member
-     names (functions + properties).
+  4. Parse each resolved base's own file with ``ast``. Abc markers are resolved
+     BINDING-AWARE against that file's imports (``_abc_bindings``): ``ABC``/
+     ``ABCMeta``/``abstractmethod`` count only when they actually bind to the ``abc``
+     module (``import abc`` + ``abc.X``, ``import abc as a`` + ``a.X``, or
+     ``from abc import X [as y]``). A locally-defined ``class ABC`` / ``def
+     abstractmethod`` shadows the marker and is treated as non-abc (fail closed). The
+     base is abstract when its own bases include the abc ``ABC``, or it declares
+     ``metaclass=`` an abc ``ABCMeta``, or any member is decorated with the abc
+     ``abstractmethod`` (including stacked ``@property`` + ``@abstractmethod``).
+     Collect the required abstract member names (functions + properties).
   5. ``unimplemented`` = abstract members with no same-name def/assignment in the
      changed subclass body AND not concretely supplied by a PRECEDING base in the MRO.
      Only head bases listed BEFORE the abstract base can satisfy its contract:
      ``getattr`` walks the MRO left-to-right, so for ``class W(Base, Mixin)`` the
      abstract member on ``Base`` resolves to ``Base`` — a later ``Mixin`` does NOT
-     satisfy it. Each preceding base (mixin or concrete parent) is resolved + parsed;
-     its concrete members (def/assign not decorated abstractmethod) are subtracted. If
-     ANY preceding base cannot be resolved or parsed, the row is SUPPRESSED — an unseen
-     preceding base could satisfy the contract, so a high-confidence claim must not
-     survive that uncertainty. Bases listed AFTER the abstract base are irrelevant to it
-     and never suppress the row. Reparenting with no preceding base is never suppressed.
+     satisfy it. Each preceding base (mixin or concrete parent) is resolved + parsed and
+     its concrete members are subtracted THROUGH its own MRO — ``class FullMixin(Impl):
+     pass`` contributes ``Impl``'s implementations too (depth-capped, cycle-guarded). If
+     any base or ancestor in that chain cannot be resolved or parsed AND the resolvable
+     part does not already cover every required member, the row is SUPPRESSED — an unseen
+     ancestor could satisfy the remainder, so a high-confidence claim must not survive
+     that uncertainty. Bases listed AFTER the abstract base are irrelevant to it and never
+     suppress the row. Reparenting with no preceding base is never suppressed.
      Emit a row ONLY when ``unimplemented`` is non-empty. An empty subclass body (only
      ``pass``/``...``/docstring) is a strengthening signal included in the claim.
   6. Best-effort instantiation evidence: scan head-snapshot CALLS facts whose
@@ -62,6 +68,94 @@ if TYPE_CHECKING:
 
 
 _RISK_TYPE = "abstract_contract_unimplemented"
+
+# The three ``abc`` names that carry abstract semantics for this detector.
+_ABC_MARKERS = ("ABC", "ABCMeta", "abstractmethod")
+
+
+@dataclass(frozen=True)
+class _AbcBindings:
+    """Binding-aware ``abc`` marker resolution for one parsed module.
+
+    Leaf-name matching (``rsplit(".", 1)[-1] == "ABC"``) misreads a locally-defined
+    ``class ABC`` or ``def abstractmethod`` as real ``abc`` semantics. This resolves a
+    class-base / decorator name to its ``abc`` marker leaf ONLY when it actually binds
+    to the ``abc`` module:
+
+      * ``import abc`` (+ ``as`` alias)      → the alias is an abc-module name; ``<alias>.X``
+        resolves to marker ``X`` when ``X`` is an abc marker.
+      * ``from abc import ABC/ABCMeta/abstractmethod`` (+ ``as`` alias) → the bound bare
+        name resolves to its abc marker.
+
+    A name that is (re)bound by a module-level ``def``/``class``/assignment shadows any
+    import and is treated as NOT an abc marker (fail closed).
+    """
+
+    #: Module-level names bound to the ``abc`` module (``import abc [as x]``), minus
+    #: any shadowed by a local def/class/assignment.
+    module_aliases: frozenset[str]
+    #: Bare name → abc marker leaf (``from abc import ABC as A`` → ``{"A": "ABC"}``),
+    #: minus any shadowed locally.
+    from_imports: dict[str, str]
+
+    def marker(self, name: str | None) -> str | None:
+        """Return the abc marker leaf (ABC/ABCMeta/abstractmethod) *name* binds to, or None.
+
+        *name* is a source-level base/decorator name from ``_base_name`` (``ast.Name`` →
+        bare, ``ast.Attribute`` → dotted). Fails closed on anything not provably ``abc``.
+        """
+        if name is None:
+            return None
+        if "." in name:
+            prefix, leaf = name.rsplit(".", 1)
+            if prefix in self.module_aliases and leaf in _ABC_MARKERS:
+                return leaf
+            return None
+        return self.from_imports.get(name)
+
+
+def _local_module_bindings(tree: ast.Module) -> set[str]:
+    """Module-level names (re)bound by a ``def``/``class``/assignment.
+
+    Such a binding shadows a same-named ``abc`` import, so the name must not be read as
+    an abc marker. Only top-level statements are considered — nested scopes cannot rebind
+    a module-level import for a class defined at module scope.
+    """
+    names: set[str] = set()
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(stmt.name)
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            names.add(stmt.target.id)
+    return names
+
+
+def _abc_bindings(tree: ast.Module) -> _AbcBindings:
+    """Collect ``abc`` marker bindings for one module (call once per parsed file)."""
+    shadowed = _local_module_bindings(tree)
+    module_aliases: set[str] = set()
+    from_imports: dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                if alias.name == "abc":
+                    module_aliases.add(alias.asname or alias.name)
+        elif isinstance(stmt, ast.ImportFrom) and stmt.module == "abc" and stmt.level == 0:
+            for alias in stmt.names:
+                if alias.name in _ABC_MARKERS:
+                    from_imports[alias.asname or alias.name] = alias.name
+    module_aliases -= shadowed
+    for bound in list(from_imports):
+        if bound in shadowed:
+            del from_imports[bound]
+    return _AbcBindings(
+        module_aliases=frozenset(module_aliases),
+        from_imports=from_imports,
+    )
 
 
 @dataclass(frozen=True)
@@ -198,22 +292,25 @@ def _base_names(class_def: ast.ClassDef) -> list[str]:
     return names
 
 
-def _has_abstractmethod_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """True when any decorator is ``abstractmethod`` or ``abc.abstractmethod``.
+def _has_abstractmethod_decorator(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    bindings: _AbcBindings,
+) -> bool:
+    """True when any decorator binds to ``abc.abstractmethod`` in the enclosing module.
 
-    Covers stacked decorators (``@property`` + ``@abstractmethod``) since every
-    decorator on the node is examined.
+    Binding-aware: a locally-defined ``abstractmethod`` decorator does NOT count. Covers
+    stacked decorators (``@property`` + ``@abstractmethod``) since every decorator on the
+    node is examined.
     """
     for dec in node.decorator_list:
-        name = _base_name(dec)
-        if name is None:
-            continue
-        if name.rsplit(".", 1)[-1] == "abstractmethod":
+        if bindings.marker(_base_name(dec)) == "abstractmethod":
             return True
     return False
 
 
-def _base_is_abstract_and_members(class_def: ast.ClassDef) -> tuple[bool, tuple[str, ...]]:
+def _base_is_abstract_and_members(
+    class_def: ast.ClassDef, bindings: _AbcBindings
+) -> tuple[bool, tuple[str, ...]]:
     """Return (is_abstract, required_member_names) for a base ClassDef.
 
     A base blocks instantiation only when BOTH hold: (a) it declares one or more
@@ -235,14 +332,12 @@ def _base_is_abstract_and_members(class_def: ast.ClassDef) -> tuple[bool, tuple[
     """
     abstract_members: list[str] = []
     for stmt in class_def.body:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and _has_abstractmethod_decorator(stmt):
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and _has_abstractmethod_decorator(stmt, bindings):
             abstract_members.append(stmt.name)
 
-    base_marks_abc = any(
-        (_base_name(b) or "").rsplit(".", 1)[-1] == "ABC" for b in class_def.bases
-    )
+    base_marks_abc = any(bindings.marker(_base_name(b)) == "ABC" for b in class_def.bases)
     metaclass_is_abcmeta = any(
-        kw.arg == "metaclass" and (_base_name(kw.value) or "").rsplit(".", 1)[-1] == "ABCMeta"
+        kw.arg == "metaclass" and bindings.marker(_base_name(kw.value)) == "ABCMeta"
         for kw in class_def.keywords
     )
 
@@ -250,16 +345,18 @@ def _base_is_abstract_and_members(class_def: ast.ClassDef) -> tuple[bool, tuple[
     return is_abstract, tuple(dict.fromkeys(abstract_members))
 
 
-def _concrete_member_names(class_def: ast.ClassDef) -> set[str]:
+def _concrete_member_names(class_def: ast.ClassDef, bindings: _AbcBindings) -> set[str]:
     """Names CONCRETELY defined in a base body (def/assign NOT decorated abstractmethod).
 
     A concrete def or an assignment satisfies an abstract member of the same name via
     the MRO. abstractmethod-decorated defs do NOT count — they re-declare, not satisfy.
+    Binding-aware: only a decorator that binds to ``abc.abstractmethod`` disqualifies a
+    def.
     """
     names: set[str] = set()
     for stmt in class_def.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if not _has_abstractmethod_decorator(stmt):
+            if not _has_abstractmethod_decorator(stmt, bindings):
                 names.add(stmt.name)
         elif isinstance(stmt, ast.Assign):
             for target in stmt.targets:
@@ -329,43 +426,15 @@ def _resolve_base_entity(
     return candidates[0]
 
 
-def _abstract_base_from_entity(
+def _parse_base_entity(
     base_entity: JsonObject,
     head_root: Path,
-) -> _AbstractBase | None:
-    """Parse a resolved base entity's file and return its abstract profile, or None."""
-    identity = base_entity.get("identity") or {}
-    props = base_entity.get("properties") or {}
-    bpath = str(props.get("path") or "")
-    if not bpath:
-        return None
-    qualname = str(identity.get("qualname") or "")
-    source = _read_full_source(head_root, bpath)
-    if source is None:
-        return None
-    raw_line = props.get("line")
-    class_def = _class_def_in_source(
-        source, qualname, line=int(raw_line) if raw_line is not None else None
-    )
-    if class_def is None:
-        return None
-    is_abstract, required = _base_is_abstract_and_members(class_def)
-    if not is_abstract or not required:
-        return None
-    line = raw_line
-    return _AbstractBase(
-        qualname=qualname,
-        path=bpath,
-        line=int(line) if line is not None else None,
-        required_members=required,
-    )
+) -> tuple[ast.Module, ast.ClassDef, str, str, int | None] | None:
+    """Parse a resolved base entity's file once.
 
-
-def _concrete_members_from_entity(base_entity: JsonObject, head_root: Path) -> set[str] | None:
-    """Concrete member names supplied by a resolved base, or None if it cannot be parsed.
-
-    None signals uncertainty: an unreadable file, unsafe path, or class body that does
-    not parse could supply implementations we cannot see, so the caller must fail closed.
+    Returns (module_tree, class_def, path, qualname, line) or None when the path is
+    missing/unsafe, the file is unreadable, or the class def cannot be located. The tree
+    is returned so the caller can build binding-aware ``abc`` marker context for that file.
     """
     identity = base_entity.get("identity") or {}
     props = base_entity.get("properties") or {}
@@ -376,13 +445,96 @@ def _concrete_members_from_entity(base_entity: JsonObject, head_root: Path) -> s
     source = _read_full_source(head_root, bpath)
     if source is None:
         return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
     raw_line = props.get("line")
-    class_def = _class_def_in_source(
-        source, qualname, line=int(raw_line) if raw_line is not None else None
-    )
+    line = int(raw_line) if raw_line is not None else None
+    class_def = _class_def_in_source(source, qualname, line=line)
     if class_def is None:
         return None
-    return _concrete_member_names(class_def)
+    return tree, class_def, bpath, qualname, line
+
+
+def _abstract_base_from_entity(
+    base_entity: JsonObject,
+    head_root: Path,
+) -> _AbstractBase | None:
+    """Parse a resolved base entity's file and return its abstract profile, or None."""
+    parsed = _parse_base_entity(base_entity, head_root)
+    if parsed is None:
+        return None
+    tree, class_def, bpath, qualname, line = parsed
+    is_abstract, required = _base_is_abstract_and_members(class_def, _abc_bindings(tree))
+    if not is_abstract or not required:
+        return None
+    return _AbstractBase(
+        qualname=qualname,
+        path=bpath,
+        line=line,
+        required_members=required,
+    )
+
+
+# Depth cap for the transitive concrete-member walk (fail-closed above it).
+_ANCESTOR_DEPTH_CAP = 5
+
+
+def _transitive_concrete_members(
+    base_entity: JsonObject,
+    head_snapshot: "KgSnapshot",
+    subclass_repo: str,
+    head_root: Path,
+    *,
+    depth: int,
+    visited: set[str],
+) -> tuple[set[str], bool]:
+    """Concrete members supplied by a preceding base THROUGH its own MRO, depth-capped.
+
+    Unions the base's local concrete members with those of its recursively-resolved
+    ancestors, so ``class FullMixin(Impl): pass`` contributes ``Impl``'s implementations
+    (Python's MRO satisfies the contract before construction). Binding-aware
+    abstractmethod classification uses each ancestor file's own import context.
+
+    Returns (supplied, certain). ``supplied`` is the concrete members provable from the
+    resolvable part of the chain. ``certain`` is False when the base or any ancestor
+    cannot be resolved/parsed, on a cycle, or when the depth cap is exceeded — an unseen
+    ancestor could supply more members, so the caller must fail closed unless the certain
+    part already covers every required member. Depth-capped so the walk stays bounded.
+    """
+    if depth > _ANCESTOR_DEPTH_CAP:
+        return set(), False
+    entity_id = str(base_entity.get("entity_id") or "")
+    if entity_id and entity_id in visited:
+        return set(), False
+    if entity_id:
+        visited.add(entity_id)
+
+    parsed = _parse_base_entity(base_entity, head_root)
+    if parsed is None:
+        return set(), False
+    tree, class_def, _bpath, _qualname, _line = parsed
+    bindings = _abc_bindings(tree)
+
+    supplied = _concrete_member_names(class_def, bindings)
+    certain = True
+    for ancestor_name in _base_names(class_def):
+        ancestor_entity = _resolve_base_entity(ancestor_name, head_snapshot, subclass_repo)
+        if ancestor_entity is None:
+            certain = False
+            continue
+        ancestor_members, ancestor_certain = _transitive_concrete_members(
+            ancestor_entity,
+            head_snapshot,
+            subclass_repo,
+            head_root,
+            depth=depth + 1,
+            visited=visited,
+        )
+        supplied |= ancestor_members
+        certain = certain and ancestor_certain
+    return supplied, certain
 
 
 def _read_full_source(root: Path, path: str) -> str | None:
@@ -493,6 +645,16 @@ def abstract_contract_diff(
         if head_source is None or base_source is None:
             continue
 
+        try:
+            head_tree = ast.parse(head_source)
+        except SyntaxError:
+            stats.parse_failures += 1
+            continue
+        # Binding-aware abc markers for the subclass's own file: a locally-defined
+        # ``abstractmethod`` decorator must not read as real abc semantics when
+        # classifying the subclass's members concrete vs abstract-redeclared.
+        head_bindings = _abc_bindings(head_tree)
+
         raw_line = props.get("line")
         head_line = int(raw_line) if raw_line is not None else None
         # head_line is the head-snapshot coordinate; only anchor the head lookup with
@@ -522,8 +684,8 @@ def abstract_contract_diff(
         # @abstractmethod stays abstract and still raises at construction, so it
         # must not count as satisfying the member. Assignments still count as
         # concrete overrides. Mirrors the MRO subtraction path, which already uses
-        # concrete-only collection via _concrete_members_from_entity below.
-        defined = _concrete_member_names(head_class)
+        # concrete-only collection via _transitive_concrete_members below.
+        defined = _concrete_member_names(head_class, head_bindings)
         empty_body = _body_is_empty(head_class)
 
         for base_name in new_bases:
@@ -535,27 +697,32 @@ def abstract_contract_diff(
                 continue
 
             # MRO fail-closed, order-sensitive: getattr walks the MRO left-to-right, so
-            # only bases listed BEFORE this abstract base can supply its members. Resolve
-            # each preceding head base and subtract its concrete members. If ANY preceding
-            # base cannot be resolved or parsed, an unseen implementation could exist —
-            # suppress the row. Bases listed AFTER the abstract base are irrelevant to it.
+            # only bases listed BEFORE this abstract base can supply its members. Each
+            # preceding base contributes its concrete members THROUGH its own MRO (so
+            # ``class FullMixin(Impl): pass`` counts Impl's implementations), depth-capped
+            # with a cycle-guarding visited set. If any base or ancestor in that chain
+            # cannot be resolved/parsed, the walk is uncertain — an unseen implementation
+            # could exist, so suppress unless the resolvable part already satisfies every
+            # required member. Bases listed AFTER the abstract base are irrelevant to it.
             base_index = head_bases.index(base_name)
             preceding_bases = head_bases[:base_index]
             mro_supplied: set[str] = set()
-            suppressed = False
+            preceding_certain = True
             for other_name in preceding_bases:
                 other_entity = _resolve_base_entity(other_name, head_snapshot, subclass_repo)
                 if other_entity is None:
-                    suppressed = True
-                    break
-                concrete = _concrete_members_from_entity(other_entity, head_root)
-                if concrete is None:
-                    suppressed = True
-                    break
+                    preceding_certain = False
+                    continue
+                concrete, certain = _transitive_concrete_members(
+                    other_entity,
+                    head_snapshot,
+                    subclass_repo,
+                    head_root,
+                    depth=0,
+                    visited=set(),
+                )
                 mro_supplied |= concrete
-            if suppressed:
-                stats.mro_suppressed += 1
-                continue
+                preceding_certain = preceding_certain and certain
 
             unimplemented = tuple(
                 m
@@ -563,6 +730,15 @@ def abstract_contract_diff(
                 if m not in defined and m not in mro_supplied
             )
             if not unimplemented:
+                # Every required member satisfied by the subclass or the resolvable MRO
+                # part → no risk, regardless of uncertainty elsewhere.
+                continue
+            if not preceding_certain:
+                # A preceding base (or one of its ancestors) is unresolvable/unparseable
+                # AND the resolvable part does not cover all required members — an unseen
+                # ancestor could supply the remainder, so a high-confidence row must not
+                # survive. Suppress.
+                stats.mro_suppressed += 1
                 continue
 
             row = _build_row(

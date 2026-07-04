@@ -87,6 +87,125 @@ _PARTIAL_MIXIN = (
     "        return x\n"
 )
 
+# --- Fix 1: binding-aware abc-marker fixtures -------------------------------------
+
+# Abstract base using ``from abc import ABC, abstractmethod`` — BARE bound names.
+_ABSTRACT_BASE_FROM_IMPORT = (
+    "from abc import ABC, abstractmethod\n"
+    "\n"
+    "\n"
+    "class BaseThing(ABC):\n"
+    "    @property\n"
+    "    @abstractmethod\n"
+    "    def counter_names(self):\n"
+    "        ...\n"
+    "\n"
+    "    @abstractmethod\n"
+    "    def build_it(self, x):\n"
+    "        ...\n"
+)
+
+# Abstract base using ``from abc import abstractmethod as am`` — ALIASED bound name.
+_ABSTRACT_BASE_ALIASED = (
+    "from abc import ABC\n"
+    "from abc import abstractmethod as am\n"
+    "\n"
+    "\n"
+    "class BaseThing(ABC):\n"
+    "    @property\n"
+    "    @am\n"
+    "    def counter_names(self):\n"
+    "        ...\n"
+    "\n"
+    "    @am\n"
+    "    def build_it(self, x):\n"
+    "        ...\n"
+)
+
+# Shadow: a LOCAL ``class ABC`` masks the abc marker. BaseThing inherits the local ABC
+# (default ``type`` metaclass), so @abstractmethod is inert → subclass is instantiable.
+_SHADOW_LOCAL_ABC = (
+    "from abc import abstractmethod\n"
+    "\n"
+    "\n"
+    "class ABC:\n"
+    "    pass\n"
+    "\n"
+    "\n"
+    "class BaseThing(ABC):\n"
+    "    @property\n"
+    "    @abstractmethod\n"
+    "    def counter_names(self):\n"
+    "        ...\n"
+    "\n"
+    "    @abstractmethod\n"
+    "    def build_it(self, x):\n"
+    "        ...\n"
+)
+
+# Shadow: a LOCAL ``def abstractmethod`` decorator masks the abc marker. Under real
+# abc.ABC the members are decorated by the LOCAL no-op decorator, so they are NOT abstract
+# and the subclass is instantiable.
+_SHADOW_LOCAL_ABSTRACTMETHOD = (
+    "import abc\n"
+    "\n"
+    "\n"
+    "def abstractmethod(fn):\n"
+    "    return fn\n"
+    "\n"
+    "\n"
+    "class BaseThing(abc.ABC):\n"
+    "    @abstractmethod\n"
+    "    def build_it(self, x):\n"
+    "        ...\n"
+)
+
+# Shadow: a LOCAL ``class ABCMeta`` masks the abc marker in ``metaclass=ABCMeta``. The
+# metaclass is the local plain ``type`` subclass, not abc.ABCMeta, so @abc.abstractmethod
+# is inert and the subclass is instantiable.
+_SHADOW_LOCAL_ABCMETA = (
+    "import abc\n"
+    "\n"
+    "\n"
+    "class ABCMeta(type):\n"
+    "    pass\n"
+    "\n"
+    "\n"
+    "class BaseThing(metaclass=ABCMeta):\n"
+    "    @abc.abstractmethod\n"
+    "    def build_it(self, x):\n"
+    "        ...\n"
+)
+
+# --- Fix 2: transitive-ancestor MRO fixtures -------------------------------------
+
+# Concrete impl of BOTH abstract members, used as a further base of a mixin.
+_IMPL_ALL = (
+    "class Impl:\n"
+    "    counter_names = ('a',)\n"
+    "    def build_it(self, x):\n"
+    "        return x\n"
+)
+
+# Concrete impl of only ONE abstract member (build_it), used as a further base.
+_IMPL_SOME = (
+    "class Impl:\n"
+    "    def build_it(self, x):\n"
+    "        return x\n"
+)
+
+# Mixin that supplies NO members locally but inherits from Impl.
+_INHERITING_MIXIN = (
+    "class FullMixin(Impl):\n"
+    "    pass\n"
+)
+
+# Mixin that inherits from an UNRESOLVABLE external base (no class entity in the KG).
+_MIXIN_EXTERNAL_BASE = (
+    "class FullMixin(ExternalUnknown):\n"
+    "    pass\n"
+)
+
 
 def _build_pair(
     tmpdir: Path,
@@ -572,6 +691,168 @@ class TestClassDefLeafCollision(unittest.TestCase):
             _class_def_in_source(source, "Widget"),
             "ambiguous duplicate leaf with no anchor must return None (fail closed)",
         )
+
+
+class TestAbcBindingAware(unittest.TestCase):
+    """Fix 1: abc markers count only when they bind to the real ``abc`` module."""
+
+    def _run(self, base_core: str, head_core: str) -> list[JsonObject]:
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            out_base, out_head, base_ck, head_ck = _build_pair(tmpdir, base_core, head_core)
+            result = _review_context(out_base, out_head, base_ck, head_ck)
+            return _abstract_rows(result)
+
+    def _reparent(self, base_module: str) -> tuple[str, str]:
+        """Base/head core: Widget starts on Concrete, reparented onto BaseThing."""
+        base_core = base_module + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = base_module + _CONCRETE_BASE + (
+            "\n\nclass Widget(BaseThing):\n"
+            "    pass\n"
+        )
+        return base_core, head_core
+
+    def test_from_import_bare_markers_still_emit_row(self) -> None:
+        """Positive: ``from abc import ABC, abstractmethod`` bare names → row emitted."""
+        rows = self._run(*self._reparent(_ABSTRACT_BASE_FROM_IMPORT))
+        self.assertEqual(len(rows), 1, f"from-import bare abc markers → row; got {rows}")
+        claim = str(rows[0].get("postable_claim") or "")
+        self.assertIn("counter_names", claim, f"claim must name counter_names; got {claim!r}")
+        self.assertIn("build_it", claim, f"claim must name build_it; got {claim!r}")
+
+    def test_aliased_abstractmethod_still_emits_row(self) -> None:
+        """Positive: ``from abc import abstractmethod as am`` alias → row emitted."""
+        rows = self._run(*self._reparent(_ABSTRACT_BASE_ALIASED))
+        self.assertEqual(len(rows), 1, f"aliased abstractmethod → row; got {rows}")
+        claim = str(rows[0].get("postable_claim") or "")
+        self.assertIn("counter_names", claim, f"claim must name counter_names; got {claim!r}")
+        self.assertIn("build_it", claim, f"claim must name build_it; got {claim!r}")
+
+    def test_local_abc_class_shadows_marker_no_row(self) -> None:
+        """Negative: local ``class ABC`` shadows the marker → base not abstract → no row.
+
+        Inversion: the same fixture WITHOUT the local ``class ABC`` (i.e.
+        _ABSTRACT_BASE_FROM_IMPORT) is the positive case and emits a row.
+        """
+        rows = self._run(*self._reparent(_SHADOW_LOCAL_ABC))
+        self.assertEqual(rows, [], f"local class ABC shadow → no row; got {rows}")
+
+    def test_local_abstractmethod_decorator_shadows_marker_no_row(self) -> None:
+        """Negative: local ``def abstractmethod`` shadows the marker → no abstract members → no row.
+
+        Inversion: replacing the local decorator with the real ``abc.abstractmethod``
+        (the _ABSTRACT_BASE shape) emits a row.
+        """
+        rows = self._run(*self._reparent(_SHADOW_LOCAL_ABSTRACTMETHOD))
+        self.assertEqual(rows, [], f"local abstractmethod decorator shadow → no row; got {rows}")
+
+    def test_local_abcmeta_metaclass_shadows_marker_no_row(self) -> None:
+        """Negative: local ``class ABCMeta`` used as metaclass → not abc-governed → no row.
+
+        Inversion: pointing the metaclass at the real ``abc.ABCMeta`` would make the base
+        abstract and emit a row.
+        """
+        rows = self._run(*self._reparent(_SHADOW_LOCAL_ABCMETA))
+        self.assertEqual(rows, [], f"local ABCMeta metaclass shadow → no row; got {rows}")
+
+
+class TestAncestorMroWalk(unittest.TestCase):
+    """Fix 2: a preceding base contributes concrete members through its OWN MRO."""
+
+    def _run(self, base_core: str, head_core: str) -> list[JsonObject]:
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            out_base, out_head, base_ck, head_ck = _build_pair(tmpdir, base_core, head_core)
+            result = _review_context(out_base, out_head, base_ck, head_ck)
+            return _abstract_rows(result)
+
+    def test_inherited_impl_satisfies_contract_no_row(self) -> None:
+        """Widget(FullMixin, BaseThing) where FullMixin(Impl) and Impl implements ALL → NO row.
+
+        FullMixin supplies no members locally, but its ancestor Impl does; Python's MRO
+        satisfies BaseThing before construction. Inversion: without the transitive walk
+        the detector sees FullMixin's empty body and falsely flags the instantiable class.
+        """
+        base_core = _ABSTRACT_BASE + _IMPL_ALL + _INHERITING_MIXIN + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _IMPL_ALL + _INHERITING_MIXIN + _CONCRETE_BASE + (
+            "\n\nclass Widget(FullMixin, BaseThing):\n"
+            "    pass\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(rows, [], f"inherited impl satisfies contract → no row; got {rows}")
+
+    def test_inherited_impl_partial_row_lists_only_remainder(self) -> None:
+        """Widget(FullMixin, BaseThing), FullMixin(Impl), Impl implements ONLY build_it.
+
+        The whole chain resolves, so the remainder (counter_names) is provable and the row
+        lists exactly it — the semantics this implementation guarantees when the ancestor
+        chain is fully resolvable. Inversion vs test_inherited_impl_satisfies_contract:
+        Impl dropping counter_names flips no-row to a row naming counter_names.
+        """
+        base_core = _ABSTRACT_BASE + _IMPL_SOME + _INHERITING_MIXIN + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _IMPL_SOME + _INHERITING_MIXIN + _CONCRETE_BASE + (
+            "\n\nclass Widget(FullMixin, BaseThing):\n"
+            "    pass\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(len(rows), 1, f"partial inherited impl → exactly one row; got {rows}")
+        claim = str(rows[0].get("postable_claim") or "")
+        self.assertIn("counter_names", claim, f"claim must name counter_names; got {claim!r}")
+        self.assertNotIn(
+            "build_it", claim,
+            f"build_it is supplied by Impl and must NOT be claimed; got {claim!r}",
+        )
+
+    def test_mixin_with_unresolvable_external_ancestor_suppresses_row(self) -> None:
+        """Widget(FullMixin, BaseThing), FullMixin(ExternalUnknown) — ancestor unresolvable.
+
+        ExternalUnknown has no class entity, so FullMixin's chain is uncertain and it
+        supplies no provable members; the remainder is non-empty → SUPPRESS. Inversion:
+        swapping the external base for the resolvable Impl (satisfying all) yields no row
+        via satisfaction rather than suppression, and swapping to a resolvable base that
+        satisfies nothing would leave the row — either way ORTHOGONAL to this suppression.
+        """
+        base_core = _ABSTRACT_BASE + _MIXIN_EXTERNAL_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _MIXIN_EXTERNAL_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(FullMixin, BaseThing):\n"
+            "    pass\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(rows, [], f"unresolvable ancestor + unsatisfied remainder → suppress; got {rows}")
+
+    def test_single_abstract_base_still_emits_row(self) -> None:
+        """Motivating case protected: plain Widget(BaseThing) with empty body → row emitted.
+
+        No preceding base, no ancestor walk — the ancestor-walk change must not regress the
+        original single-abstract-base detection.
+        """
+        base_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(BaseThing):\n"
+            "    pass\n"
+        )
+        rows = self._run(base_core, head_core)
+        self.assertEqual(len(rows), 1, f"single abstract base → row still emitted; got {rows}")
 
 
 if __name__ == "__main__":
