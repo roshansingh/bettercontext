@@ -8997,6 +8997,9 @@ class _TierFakeClient:
                 "consequence": "Consequence text.",
                 "negative_check": "Negative check text.",
                 "category": "guard_removal",
+                "old_contract": "Old contract text.",
+                "new_contract": "New contract text.",
+                "violated_invariant": "Callers relied on the old contract.",
             }
             for j in range(self._items_per_call)
         ])

@@ -37,15 +37,33 @@ TENANT = "default"
 _SVC2_REPO = "svc2"      # _build_two_snapshot_pair
 _SVC_TWO_REPO = "svc_two"  # _build_two_symbol_snapshot_pair
 
-_FAKE_RESPONSE = [
-    {
+# New schema (wave-3 task B) required keys. Fixtures must carry old_contract,
+# new_contract, violated_invariant in addition to the original five. A concrete
+# violated_invariant makes the row high-specificity; the literal "none" sentinel
+# makes it a context-grade (medium-specificity) BEHAVIOR-DELTA row.
+_DEFAULT_CONTRACT_FIELDS = {
+    "old_contract": "Function validated input before processing.",
+    "new_contract": "Function no longer validates input before processing.",
+    "violated_invariant": "Callers relied on invalid input being rejected.",
+}
+
+
+def _claim(**overrides: Any) -> dict:
+    """Build a schema-complete claim dict; overrides win. violated_invariant may be
+    set to 'none' to produce a BEHAVIOR-DELTA (medium-specificity) fixture."""
+    base = {
         "claim": "Function no longer validates input before processing",
         "cause_line": 3,
         "consequence": "Callers may pass invalid data without receiving an error.",
         "negative_check": "If validation was intentionally removed and callers are trusted, this risk does not apply.",
         "category": "guard_removal",
+        **_DEFAULT_CONTRACT_FIELDS,
     }
-]
+    base.update(overrides)
+    return base
+
+
+_FAKE_RESPONSE = [_claim()]
 
 
 from source.kg.integrations.semantic_llm import LlmResult
@@ -750,13 +768,17 @@ class TestSemanticDiffStringClamping(unittest.TestCase):
             entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
 
             oversized_claim = "x" * 500
-            client = _FakeClient(response=[{
-                "claim": oversized_claim,
-                "cause_line": 2,
-                "consequence": "Some consequence.",
-                "negative_check": "No check.",
-                "category": "guard_removal",
-            }])
+            # violated_invariant="none" → BEHAVIOR-DELTA composition
+            # ("behavior changed: {clamped_claim}"). The clamped claim itself must be
+            # exactly 300 chars (the _CLAMP_CLAIM bound).
+            client = _FakeClient(response=[_claim(
+                claim=oversized_claim,
+                cause_line=2,
+                consequence="Some consequence.",
+                negative_check="No check.",
+                category="guard_removal",
+                violated_invariant="none",
+            )])
 
             rows, status = semantic_contract_diff(
                 base_snapshot=snap,
@@ -767,11 +789,11 @@ class TestSemanticDiffStringClamping(unittest.TestCase):
                 client=client,
             )
             self.assertTrue(rows, "expected at least one row")
+            # The clamped claim (300 x's) must appear in postable_claim; the raw 500
+            # x's must not survive the clamp.
             claim_in_row = rows[0].get("postable_claim", "")
-            self.assertLessEqual(
-                len(claim_in_row), 300,
-                f"postable_claim length must be <=300; got {len(claim_in_row)}",
-            )
+            self.assertIn("x" * 300, claim_in_row, "clamped 300-char claim must be present")
+            self.assertNotIn("x" * 301, claim_in_row, "claim must be clamped to 300 chars")
 
     def test_garbage_item_4x_dropped(self) -> None:
         """Item with claim of length 1500 (>1200 4x limit) is dropped entirely."""
@@ -783,13 +805,13 @@ class TestSemanticDiffStringClamping(unittest.TestCase):
             entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
 
             garbage_claim = "x" * 1500
-            client = _FakeClient(response=[{
-                "claim": garbage_claim,
-                "cause_line": 2,
-                "consequence": "Some consequence.",
-                "negative_check": "No check.",
-                "category": "guard_removal",
-            }])
+            client = _FakeClient(response=[_claim(
+                claim=garbage_claim,
+                cause_line=2,
+                consequence="Some consequence.",
+                negative_check="No check.",
+                category="guard_removal",
+            )])
 
             rows, status = semantic_contract_diff(
                 base_snapshot=snap,
@@ -832,20 +854,21 @@ class TestSemanticDiffStringClamping(unittest.TestCase):
             claim_500 = "y" * 500
 
             two_item_client = _FakeClient(response=[
-                {
-                    "claim": claim_50kb,
-                    "cause_line": 2,
-                    "consequence": "Consequence for 50KB item.",
-                    "negative_check": "No check.",
-                    "category": "guard_removal",
-                },
-                {
-                    "claim": claim_500,
-                    "cause_line": 3,
-                    "consequence": "Consequence for 500-char item.",
-                    "negative_check": "No check.",
-                    "category": "guard_removal",
-                },
+                _claim(
+                    claim=claim_50kb,
+                    cause_line=2,
+                    consequence="Consequence for 50KB item.",
+                    negative_check="No check.",
+                    category="guard_removal",
+                ),
+                _claim(
+                    claim=claim_500,
+                    cause_line=3,
+                    consequence="Consequence for 500-char item.",
+                    negative_check="No check.",
+                    category="guard_removal",
+                    violated_invariant="none",  # BEHAVIOR-DELTA composition
+                ),
             ])
 
             result = _call_tool_with_fake_client(two_item_client, head_kg, {
@@ -867,37 +890,37 @@ class TestSemanticDiffStringClamping(unittest.TestCase):
             hyps = result.get("review_hypotheses") or []
             semantic_hyps = [h for h in hyps if h.get("risk_type") == "contract_semantic_diff"]
 
-            # (b) No hypothesis has postable_claim longer than 300
+            # (b) No hypothesis carries the un-clamped 500-char claim: the clamped claim
+            # component is bounded to _CLAMP_CLAIM (300). postable_claim is a composed
+            # string ("behavior changed: {claim}") so its total length exceeds 300, but
+            # no raw 301-char run of the claim char survives the clamp.
             for h in semantic_hyps:
-                claim_len = len(h.get("postable_claim", ""))
-                self.assertLessEqual(
-                    claim_len, 300,
-                    f"postable_claim length {claim_len} exceeds 300; claim={h.get('postable_claim', '')[:60]!r}",
-                )
+                pc = h.get("postable_claim", "")
+                self.assertNotIn("y" * 301, pc, "claim component must be clamped to 300")
+                self.assertNotIn("x" * 301, pc, "claim component must be clamped to 300")
 
             # (c) 50KB item produced NO row (dropped because claim > _DROP_CLAIM = 1200)
             fifty_kb_rows = [
                 h for h in semantic_hyps
-                if h.get("postable_claim", "").startswith("x" * 50)
+                if "x" * 50 in h.get("postable_claim", "")
             ]
             self.assertEqual(
                 len(fifty_kb_rows), 0,
-                f"50KB claim item must be dropped; found {len(fifty_kb_rows)} rows with x-prefix",
+                f"50KB claim item must be dropped; found {len(fifty_kb_rows)} rows with x-run",
             )
 
-            # (d) 500-char item → postable_claim exactly 300 chars (clamped)
+            # (d) 500-char item → exactly 1 row; the clamped claim (300 y's) is present.
             clamped_rows = [
                 h for h in semantic_hyps
-                if h.get("postable_claim", "").startswith("y")
+                if "y" in h.get("postable_claim", "")
             ]
             self.assertEqual(
                 len(clamped_rows), 1,
                 f"500-char claim item must produce exactly 1 row; got {len(clamped_rows)}",
             )
-            self.assertEqual(
-                len(clamped_rows[0].get("postable_claim", "")), 300,
-                f"clamped postable_claim must be exactly 300 chars; "
-                f"got {len(clamped_rows[0].get('postable_claim', ''))}",
+            self.assertIn(
+                "y" * 300, clamped_rows[0].get("postable_claim", ""),
+                "clamped claim (300 y's) must be present in postable_claim",
             )
 
 
@@ -951,20 +974,20 @@ class TestSemanticDiffClaimDedupe(unittest.TestCase):
 
             shared_claim = "Guard removed from dedupe_func."
             client = _FakeClient(response=[
-                {
-                    "claim": shared_claim,
-                    "cause_line": 2,
-                    "consequence": "Callers may pass None.",
-                    "negative_check": "No check A.",
-                    "category": "guard_removal",   # first item's category — must win
-                },
-                {
-                    "claim": shared_claim,          # IDENTICAL claim text
-                    "cause_line": 3,
-                    "consequence": "Data loss possible.",
-                    "negative_check": "No check B.",
-                    "category": "ownership_moved",  # second item's category — must be dropped
-                },
+                _claim(
+                    claim=shared_claim,
+                    cause_line=2,
+                    consequence="Callers may pass None.",
+                    negative_check="No check A.",
+                    category="guard_removal",   # first item's category — must win
+                ),
+                _claim(
+                    claim=shared_claim,          # IDENTICAL claim text
+                    cause_line=3,
+                    consequence="Data loss possible.",
+                    negative_check="No check B.",
+                    category="ownership_moved",  # second item's category — must be dropped
+                ),
             ])
 
             rows, _status = semantic_contract_diff(
@@ -995,20 +1018,20 @@ class TestSemanticDiffClaimDedupe(unittest.TestCase):
             entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
 
             client = _FakeClient(response=[
-                {
-                    "claim": "Guard removed from dedupe_func.",
-                    "cause_line": 2,
-                    "consequence": "Callers may pass None.",
-                    "negative_check": "No check.",
-                    "category": "guard_removal",
-                },
-                {
-                    "claim": "Return type widened to include None.",  # different claim
-                    "cause_line": 3,
-                    "consequence": "Callers expecting non-None may crash.",
-                    "negative_check": "No check.",
-                    "category": "return_type_widened",
-                },
+                _claim(
+                    claim="Guard removed from dedupe_func.",
+                    cause_line=2,
+                    consequence="Callers may pass None.",
+                    negative_check="No check.",
+                    category="guard_removal",
+                ),
+                _claim(
+                    claim="Return type widened to include None.",  # different claim
+                    cause_line=3,
+                    consequence="Callers expecting non-None may crash.",
+                    negative_check="No check.",
+                    category="return_type_widened",
+                ),
             ])
 
             rows, _status = semantic_contract_diff(
@@ -1167,13 +1190,13 @@ class TestCauseLineUpperClamp(unittest.TestCase):
             snap, base_dir, head_dir = self._make_single_symbol_snap_no_end_line(root)
             entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
 
-            client = _FakeClient(response=[{
-                "claim": "Function contract changed.",
-                "cause_line": 999999,  # Out of range — must be clamped
-                "consequence": "Some consequence.",
-                "negative_check": "No check.",
-                "category": "guard_removal",
-            }])
+            client = _FakeClient(response=[_claim(
+                claim="Function contract changed.",
+                cause_line=999999,  # Out of range — must be clamped
+                consequence="Some consequence.",
+                negative_check="No check.",
+                category="guard_removal",
+            )])
 
             rows, status = semantic_contract_diff(
                 base_snapshot=snap,
@@ -1205,13 +1228,13 @@ class TestCauseLineUpperClamp(unittest.TestCase):
             snap, base_dir, head_dir = self._make_single_symbol_snap_no_end_line(root)
             entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
 
-            client = _FakeClient(response=[{
-                "claim": "Function contract changed.",
-                "cause_line": 7,  # Within range [5, 14]
-                "consequence": "Some consequence.",
-                "negative_check": "No check.",
-                "category": "guard_removal",
-            }])
+            client = _FakeClient(response=[_claim(
+                claim="Function contract changed.",
+                cause_line=7,  # Within range [5, 14]
+                consequence="Some consequence.",
+                negative_check="No check.",
+                category="guard_removal",
+            )])
 
             rows, status = semantic_contract_diff(
                 base_snapshot=snap,
@@ -1694,13 +1717,13 @@ class TestSpliceDuplicateQualname(unittest.TestCase):
             class _LoggingClient:
                 def complete_json(self, prompt: str) -> LlmResult:
                     prompt_log.append(prompt)
-                    return LlmResult.parsed([{
-                        "claim": "Guard removed.",
-                        "cause_line": 2,
-                        "consequence": "Callers may pass None.",
-                        "negative_check": "No check.",
-                        "category": "guard_removal",
-                    }])
+                    return LlmResult.parsed([_claim(
+                        claim="Guard removed.",
+                        cause_line=2,
+                        consequence="Callers may pass None.",
+                        negative_check="No check.",
+                        category="guard_removal",
+                    )])
 
             _, status = _splice_semantic_diff_hypotheses(
                 base_snapshot_dir=str(snap_dir),
@@ -2128,13 +2151,13 @@ class TestDedupeValidationOrder(unittest.TestCase):
                 # Malformed: missing required keys (cause_line, consequence, negative_check, category)
                 {"claim": shared_claim, "garbage_key": "ignored"},
                 # Valid: all required keys present, same claim string
-                {
-                    "claim": shared_claim,
-                    "cause_line": 2,
-                    "consequence": "Callers may pass None.",
-                    "negative_check": "No check.",
-                    "category": "guard_removal",
-                },
+                _claim(
+                    claim=shared_claim,
+                    cause_line=2,
+                    consequence="Callers may pass None.",
+                    negative_check="No check.",
+                    category="guard_removal",
+                ),
             ])
 
             rows, _status = semantic_contract_diff(
@@ -2151,8 +2174,8 @@ class TestDedupeValidationOrder(unittest.TestCase):
                 len(rows), 1,
                 f"valid item after malformed duplicate must survive; got {len(rows)} rows",
             )
-            self.assertEqual(
-                rows[0].get("postable_claim"), shared_claim[:300],
+            self.assertIn(
+                shared_claim[:300], rows[0].get("postable_claim", ""),
                 f"surviving row must carry the shared claim; got {rows[0].get('postable_claim')!r}",
             )
 
@@ -2167,20 +2190,20 @@ class TestDedupeValidationOrder(unittest.TestCase):
 
             shared_claim = "Guard removed from p2_func."
             client = _FakeClient(response=[
-                {
-                    "claim": shared_claim,
-                    "cause_line": 2,
-                    "consequence": "Callers may pass None.",
-                    "negative_check": "No check.",
-                    "category": "guard_removal",   # first — must win
-                },
-                {
-                    "claim": shared_claim,
-                    "cause_line": 3,
-                    "consequence": "Data loss.",
-                    "negative_check": "Other check.",
-                    "category": "ownership_moved",  # second — must be dropped
-                },
+                _claim(
+                    claim=shared_claim,
+                    cause_line=2,
+                    consequence="Callers may pass None.",
+                    negative_check="No check.",
+                    category="guard_removal",   # first — must win
+                ),
+                _claim(
+                    claim=shared_claim,
+                    cause_line=3,
+                    consequence="Data loss.",
+                    negative_check="Other check.",
+                    category="ownership_moved",  # second — must be dropped
+                ),
             ])
 
             rows, _status = semantic_contract_diff(
@@ -3219,13 +3242,13 @@ class TestSemanticSpliceReservedSlot(unittest.TestCase):
 
             class _OneClaimClient:
                 def complete_json(self, prompt: str) -> LlmResult:
-                    return LlmResult.parsed([{
-                        "claim": "Guard removed.",
-                        "cause_line": 2,
-                        "consequence": "Callers may pass None.",
-                        "negative_check": "No check.",
-                        "category": "guard_removal",
-                    }])
+                    return LlmResult.parsed([_claim(
+                        claim="Guard removed.",
+                        cause_line=2,
+                        consequence="Callers may pass None.",
+                        negative_check="No check.",
+                        category="guard_removal",
+                    )])
 
             merged, _status = _splice_semantic_diff_hypotheses(
                 base_snapshot_dir=str(snap_dir),
@@ -3621,6 +3644,370 @@ class TestSemanticDiffStats(unittest.TestCase):
         self.assertEqual(
             synced_rqs["abstract_contract_status"], "active",
             "abstract_contract_status content must be unchanged after budget sync",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Wave-3 Task B: violated_invariant schema — behavior-delta vs violated-invariant
+# ---------------------------------------------------------------------------
+
+class TestViolatedInvariantSchema(unittest.TestCase):
+    """New keys old_contract/new_contract/violated_invariant: classification + composition."""
+
+    def _make_single_symbol_snap(self, root: Path) -> tuple[KgSnapshot, Path, Path]:
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        e = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_vi",
+                "module": "mod.handler",
+                "qualname": "vi_func",
+                "symbol_kind": "function",
+            },
+            properties={"path": "handler.py", "line": 1, "end_line": 3},
+        )
+        snap_dir = root / "snap_vi"
+        JsonlKgStore(snap_dir).write(
+            entities=[e], facts=[], evidence=[], coverage=[],
+            manifest={"version": 1, "tenant_id": TENANT},
+        )
+        snap = KgSnapshot(snap_dir)
+        base_dir = root / "base_vi"
+        base_dir.mkdir()
+        (base_dir / "handler.py").write_text("def vi_func():\n    if x: raise\n    return 1\n")
+        head_dir = root / "head_vi"
+        head_dir.mkdir()
+        (head_dir / "handler.py").write_text("def vi_func():\n    return 1\n")
+        return snap, base_dir, head_dir
+
+    def test_concrete_violated_invariant_is_high_specificity(self) -> None:
+        """A concrete violated_invariant → specificity 'high'; WHY threaded into composition."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _FakeClient(response=[_claim(
+                claim="Guard removed.",
+                violated_invariant="Callers relied on None being rejected.",
+                old_contract="Rejected None input.",
+                new_contract="Accepts None input.",
+            )])
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=client,
+            )
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row.get("specificity"), "high",
+                             f"concrete violated_invariant must be high; got {row.get('specificity')}")
+            # WHY (the violated invariant) surfaces in postable_claim and concrete_invariant.
+            self.assertIn("Callers relied on None being rejected.", row.get("postable_claim", ""))
+            self.assertIn("Callers relied on None being rejected.", row.get("concrete_invariant", ""))
+            self.assertEqual(row.get("violated_invariant"), "Callers relied on None being rejected.")
+            # old/new contract threaded into source_checks.
+            checks = " ".join(row.get("source_checks") or [])
+            self.assertIn("Rejected None input.", checks, "old contract must be in source_checks")
+            self.assertIn("Accepts None input.", checks, "new contract must be in source_checks")
+
+    def test_none_violated_invariant_is_medium_specificity_context(self) -> None:
+        """violated_invariant='none' → specificity 'medium'; postable_claim reads as context."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _FakeClient(response=[_claim(
+                claim="Cancelled reminders are deleted before rescheduling.",
+                violated_invariant="none",
+                old_contract="Old reminders kept.",
+                new_contract="Old reminders deleted before reschedule.",
+            )])
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=client,
+            )
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row.get("specificity"), "medium",
+                             f"'none' violated_invariant must be medium; got {row.get('specificity')}")
+            pc = row.get("postable_claim", "")
+            self.assertTrue(pc.startswith("behavior changed:"),
+                            f"'none' row must read as context; got {pc!r}")
+            # Must NOT assert a violated invariant.
+            self.assertNotIn("violated invariant:", pc,
+                             "context row must not assert a violated invariant")
+
+    def test_empty_violated_invariant_is_medium(self) -> None:
+        """Inversion: empty-string violated_invariant is also a BEHAVIOR-DELTA (medium)."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _FakeClient(response=[_claim(violated_invariant="")])
+            rows, _status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=client,
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].get("specificity"), "medium")
+
+    def test_missing_new_keys_is_parse_miss(self) -> None:
+        """Item missing the new keys → dropped by _REQUIRED_KEYS (no row); NOT defaulted risky.
+
+        Single-item all-invalid response → no parsed rows. With the new schema the
+        item is invalid (missing old_contract/new_contract/violated_invariant), so it
+        produces zero rows — violated_invariant is never silently defaulted.
+        """
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            # Old-schema item: has the original 5 keys but NONE of the new 3.
+            client = _FakeClient(response=[{
+                "claim": "Guard removed.",
+                "cause_line": 2,
+                "consequence": "Callers may pass None.",
+                "negative_check": "No check.",
+                "category": "guard_removal",
+            }])
+            rows, _status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=client,
+            )
+            self.assertEqual(rows, [], "item missing new keys must produce no rows")
+
+    def test_all_missing_new_keys_produces_unparseable_status(self) -> None:
+        """All responses missing new keys → failed:all_responses_unparseable path still works.
+
+        The response parses to a list (parsed_ok), but every item is invalid, so zero
+        rows result. This exercises the new-schema validation drop, not parse_miss;
+        assert zero rows and a non-'active-with-rows' outcome.
+        """
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _AllParseMissClient()  # returns parse_miss for every call
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=client,
+            )
+            self.assertEqual(rows, [])
+            self.assertEqual(status, "failed:all_responses_unparseable",
+                             f"all parse_miss with new schema must still yield the honest status; got {status!r}")
+
+    def test_oversized_new_field_dropped(self) -> None:
+        """violated_invariant > _DROP_VIOLATED_INVARIANT (1200) → item dropped entirely."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _FakeClient(response=[_claim(violated_invariant="z" * 1500)])
+            rows, _status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=client,
+            )
+            self.assertEqual(rows, [], "oversized violated_invariant (>1200) must be dropped")
+
+    def test_oversized_new_field_clamped(self) -> None:
+        """violated_invariant of 500 chars → clamped to 300 in the row."""
+        from source.kg.query.semantic_contract_diff import (
+            semantic_contract_diff,
+            _CLAMP_VIOLATED_INVARIANT,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            client = _FakeClient(response=[_claim(violated_invariant="w" * 500)])
+            rows, _status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=client,
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(
+                len(rows[0].get("violated_invariant", "")), _CLAMP_VIOLATED_INVARIANT,
+                "violated_invariant must be clamped to _CLAMP_VIOLATED_INVARIANT",
+            )
+
+    def test_real_client_behavior_delta_vs_violated_invariant(self) -> None:
+        """Real SemanticDiffLlmClient (patched litellm): both row classes get correct specificity.
+
+        Two symbols; call 1 returns a violated-invariant claim (high), call 2 returns a
+        'none' behavior-delta claim (medium). Exercises the real client typed path.
+        """
+        import sys, json as _json, types
+        from unittest.mock import patch
+        from source.kg.integrations.semantic_llm import SemanticDiffLlmClient
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+        from source.kg.core.models import Entity
+        from source.kg.core.store import JsonlKgStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            entities = []
+            for i in range(2):
+                entities.append(Entity(
+                    kind="CodeSymbol",
+                    identity={
+                        "tenant_id": TENANT, "repo": "repo_rc",
+                        "module": f"mod.m{i}", "qualname": f"rc_func_{i}",
+                        "symbol_kind": "function",
+                    },
+                    properties={"path": f"f{i}.py", "line": 1, "end_line": 3},
+                ))
+            snap_dir = root / "snap_rc"
+            JsonlKgStore(snap_dir).write(
+                entities=entities, facts=[], evidence=[], coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            base_dir = root / "base_rc"; base_dir.mkdir()
+            head_dir = root / "head_rc"; head_dir.mkdir()
+            for i in range(2):
+                (base_dir / f"f{i}.py").write_text(f"def rc_func_{i}():\n    if x: raise\n    return {i}\n")
+                (head_dir / f"f{i}.py").write_text(f"def rc_func_{i}():\n    return {i}\n")
+
+            violated_payload = [_claim(claim="Guard removed.",
+                                       violated_invariant="Callers relied on rejection.")]
+            benign_payload = [_claim(claim="Behavior reordered.", violated_invariant="none")]
+
+            call_state = {"n": 0}
+
+            def _completion(**kwargs):
+                call_state["n"] += 1
+                payload = violated_payload if call_state["n"] == 1 else benign_payload
+
+                class _Msg:
+                    content = _json.dumps(payload)
+
+                class _Choice:
+                    message = _Msg()
+
+                class _Resp:
+                    choices = [_Choice()]
+
+                return _Resp()
+
+            fake = types.ModuleType("litellm")
+            fake.completion = _completion
+            fake.completion_cost = lambda **kw: (_ for _ in ()).throw(Exception("unknown"))
+
+            with patch.dict(sys.modules, {"litellm": fake}):
+                client = SemanticDiffLlmClient(model="fake-model")
+                rows, status = semantic_contract_diff(
+                    base_snapshot=snap, head_snapshot=snap,
+                    base_root=base_dir, head_root=head_dir,
+                    changed_symbols=entity_dicts, client=client,
+                )
+
+            self.assertGreaterEqual(call_state["n"], 2, "real client must be called for both symbols")
+            specs = sorted(r.get("specificity") for r in rows)
+            self.assertEqual(specs, ["high", "medium"],
+                             f"one high + one medium row expected; got {specs}")
+
+
+class TestBehaviorDeltaSeating(unittest.TestCase):
+    """Real-pipeline splice: a behavior-delta row scores below a violated-invariant row
+    with the SAME coords (claim-strength scorer seats it lower)."""
+
+    def test_behavior_delta_seats_below_violated_invariant_same_coords(self) -> None:
+        """Two contract_semantic_diff rows, identical cause coords: high (violated) outranks
+        medium (behavior-delta) after apply_structural_noise_downranking."""
+        from source.kg.product.review_hypotheses import (
+            apply_structural_noise_downranking,
+            score_hypothesis_row,
+        )
+
+        coords = {"path": "src/a.py", "line_start": 5}
+        changed_files = ["src/a.py"]
+
+        violated_row = {
+            "hypothesis_id": "hyp-violated",
+            "risk_type": "contract_semantic_diff",
+            "derivation": "inferred_llm",
+            "specificity": "high",
+            "confidence": "medium",
+            "cause": dict(coords),
+            "consequence": dict(coords),
+            "postable_claim": "X — violated invariant: caller expected rejection.",
+            "violated_invariant": "caller expected rejection.",
+            "evidence_refs": [], "source_spans": [], "supporting_lead_ids": [],
+        }
+        behavior_row = {
+            "hypothesis_id": "hyp-behavior",
+            "risk_type": "contract_semantic_diff",
+            "derivation": "inferred_llm",
+            "specificity": "medium",
+            "confidence": "medium",
+            "cause": dict(coords),
+            "consequence": dict(coords),
+            "postable_claim": "behavior changed: X.",
+            "violated_invariant": "none",
+            "evidence_refs": [], "source_spans": [], "supporting_lead_ids": [],
+        }
+
+        # Direct score comparison: same coords → only specificity differs → high > medium.
+        s_violated = score_hypothesis_row(violated_row, changed_files, None)
+        s_behavior = score_hypothesis_row(behavior_row, changed_files, None)
+        self.assertGreater(
+            s_violated, s_behavior,
+            f"violated-invariant row must score above behavior-delta row; "
+            f"got {s_violated} vs {s_behavior}",
+        )
+
+        # Real reorder within the inferred_llm peer group: pass behavior-delta FIRST so
+        # the reorder must actively move the violated row ahead (not preserve input order).
+        reordered = apply_structural_noise_downranking(
+            [behavior_row, violated_row], changed_files, None,
+        )
+        order = [r.get("hypothesis_id") for r in reordered]
+        self.assertEqual(
+            order[0], "hyp-violated",
+            f"violated-invariant row must seat first; got {order}",
+        )
+
+        # Inversion: two rows with identical specificity keep input order (proves the
+        # reorder is driven by the specificity stamp, not by id/arbitrary tiebreak).
+        behavior_row_2 = dict(behavior_row, hypothesis_id="hyp-behavior-2")
+        same_spec = apply_structural_noise_downranking(
+            [behavior_row, behavior_row_2], changed_files, None,
+        )
+        self.assertEqual(
+            [r.get("hypothesis_id") for r in same_spec],
+            ["hyp-behavior", "hyp-behavior-2"],
+            "equal-specificity rows must preserve input order (stable reorder)",
         )
 
 

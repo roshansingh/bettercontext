@@ -41,8 +41,14 @@ _PROMPT_BODY_TEMPLATE = (
     "Compare the before/after implementation of {qualname}.\n\n"
     "BEFORE:\n{before}\n\nAFTER:\n{after}\n\n"
     "State up to 2 behavioral contract changes as falsifiable claims. "
+    "For each, describe the OLD contract and the NEW contract in one sentence each, "
+    "and name the violated_invariant: the caller-side or persisted-state expectation "
+    "this change can break. If the change looks intended/benign and violates no "
+    'caller-side or persisted-state expectation, set violated_invariant to exactly "none". '
     'JSON array: [{{"claim": "...", "cause_line": <head line no. int>, '
-    '"consequence": "one sentence", "negative_check": "...", "category": "..."}}]\n\n'
+    '"consequence": "one sentence", "negative_check": "...", "category": "...", '
+    '"old_contract": "one sentence", "new_contract": "one sentence", '
+    '"violated_invariant": "one sentence or the literal string none"}}]\n\n'
 )
 
 # Full template (body + format instruction). The instruction must stay LAST in the
@@ -50,19 +56,38 @@ _PROMPT_BODY_TEMPLATE = (
 # in semantic_contract_diff inserts base_context between body and instruction.
 _PROMPT_TEMPLATE = _PROMPT_BODY_TEMPLATE + _PROMPT_FORMAT_INSTRUCTION
 
-_REQUIRED_KEYS = {"claim", "cause_line", "consequence", "negative_check", "category"}
+_REQUIRED_KEYS = {
+    "claim",
+    "cause_line",
+    "consequence",
+    "negative_check",
+    "category",
+    "old_contract",
+    "new_contract",
+    "violated_invariant",
+}
+
+# Exact-string protocol sentinel the prompt prescribes for "no violated invariant".
+# This is a value WE define, not an inference over the model's free text.
+_VIOLATED_INVARIANT_NONE = "none"
 
 # String clamp limits
 _CLAMP_CLAIM = 300
 _CLAMP_CONSEQUENCE = 300
 _CLAMP_NEGATIVE_CHECK = 200
 _CLAMP_CATEGORY = 50
+_CLAMP_OLD_CONTRACT = 300
+_CLAMP_NEW_CONTRACT = 300
+_CLAMP_VIOLATED_INVARIANT = 300
 
 # 4x drop thresholds (items exceeding these are garbage-signalled and dropped)
 _DROP_CLAIM = 1200
 _DROP_CONSEQUENCE = 1200
 _DROP_NEGATIVE_CHECK = 800
 _DROP_CATEGORY = 200
+_DROP_OLD_CONTRACT = 1200
+_DROP_NEW_CONTRACT = 1200
+_DROP_VIOLATED_INVARIANT = 1200
 
 # Auth error substrings (checked on lowercased exception message)
 _AUTH_SUBSTRINGS = ("auth", "unauthorized", "401", "api_key", "apikey")
@@ -533,12 +558,18 @@ def semantic_contract_diff(
             raw_consequence = str(item["consequence"])
             raw_negative_check = str(item["negative_check"])
             raw_category = str(item["category"])
+            raw_old_contract = str(item["old_contract"])
+            raw_new_contract = str(item["new_contract"])
+            raw_violated_invariant = str(item["violated_invariant"])
 
             if (
                 len(raw_claim) > _DROP_CLAIM
                 or len(raw_consequence) > _DROP_CONSEQUENCE
                 or len(raw_negative_check) > _DROP_NEGATIVE_CHECK
                 or len(raw_category) > _DROP_CATEGORY
+                or len(raw_old_contract) > _DROP_OLD_CONTRACT
+                or len(raw_new_contract) > _DROP_NEW_CONTRACT
+                or len(raw_violated_invariant) > _DROP_VIOLATED_INVARIANT
             ):
                 continue
 
@@ -547,6 +578,20 @@ def semantic_contract_diff(
             consequence_text = raw_consequence[:_CLAMP_CONSEQUENCE]
             negative_check = raw_negative_check[:_CLAMP_NEGATIVE_CHECK]
             category = raw_category[:_CLAMP_CATEGORY]
+            old_contract = raw_old_contract[:_CLAMP_OLD_CONTRACT]
+            new_contract = raw_new_contract[:_CLAMP_NEW_CONTRACT]
+            violated_invariant = raw_violated_invariant[:_CLAMP_VIOLATED_INVARIANT]
+
+            # Classification: a row whose violated_invariant is the prescribed "none"
+            # sentinel (exact-string protocol value) or empty is a BEHAVIOR-DELTA row —
+            # it merely describes the new behavior with no caller-side/persisted-state
+            # expectation broken. Such rows are context-grade (medium specificity); rows
+            # with a concrete violated_invariant keep high. The claim-strength scorer
+            # (review_hypotheses) then seats them below high-specificity peers.
+            has_violated_invariant = bool(
+                violated_invariant.strip()
+            ) and violated_invariant.strip().lower() != _VIOLATED_INVARIANT_NONE
+            specificity = "high" if has_violated_invariant else "medium"
 
             # Validate and clamp cause_line to symbol span
             raw_line = item.get("cause_line")
@@ -595,17 +640,42 @@ def semantic_contract_diff(
             from source.kg.product.review_attribution import hypothesis_label
             label = hypothesis_label("contract_semantic_diff", hyp_id)
 
+            # Compose postable_claim / concrete_invariant by class:
+            #   - concrete violated_invariant → surface WHY it's risky (the broken
+            #     caller-side/persisted-state expectation) so the reviewer treats it
+            #     as a hypothesis, not raw context.
+            #   - "none"/empty (BEHAVIOR-DELTA) → phrase as context ("behavior
+            #     changed: ..."), NOT a risk assertion.
+            if has_violated_invariant:
+                postable_claim = f"{claim} — violated invariant: {violated_invariant}"
+                concrete_invariant = (
+                    f"Inferred candidate (requires source verification): "
+                    f"{violated_invariant}"
+                )
+            else:
+                postable_claim = f"behavior changed: {claim}"
+                concrete_invariant = (
+                    f"Inferred candidate (requires source verification): {claim}"
+                )
+
+            # Thread old/new contract into source_checks so the reviewer verifies the
+            # old contract in the base checkout and the new contract in the head.
+            source_checks = [
+                f"Verify: {claim}",
+                f"Check head source at {head_path}:{cause_line} — {consequence_text}",
+                f"Verify old contract holds in base: {old_contract}",
+                f"Verify new contract holds in head: {new_contract}",
+            ]
+
             row: JsonObject = {
                 "hypothesis_id": hyp_id,
                 "label": label,
                 "risk_type": "contract_semantic_diff",
-                "specificity": "high",
+                "specificity": specificity,
                 "confidence": "medium",
                 "derivation": "inferred_llm",
-                "postable_claim": claim,
-                "concrete_invariant": (
-                    f"Inferred candidate (requires source verification): {claim}"
-                ),
+                "postable_claim": postable_claim,
+                "concrete_invariant": concrete_invariant,
                 "why": (
                     f"LLM-inferred behavioral contract change in {qualname} "
                     f"(category: {category}). This is a candidate hypothesis based on "
@@ -613,12 +683,12 @@ def semantic_contract_diff(
                 ),
                 "consequence_text": consequence_text,
                 "negative_checks": [negative_check],
-                "source_checks": [
-                    f"Verify: {claim}",
-                    f"Check head source at {head_path}:{cause_line} — {consequence_text}",
-                ],
+                "source_checks": source_checks,
                 "negative_check": negative_check,
                 "category": category,
+                "old_contract": old_contract,
+                "new_contract": new_contract,
+                "violated_invariant": violated_invariant,
                 "source_spans": source_spans,
                 "evidence_refs": source_spans,
                 "supporting_lead_ids": [],

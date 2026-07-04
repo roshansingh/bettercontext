@@ -983,6 +983,9 @@ class TestContractDiffDerivation(unittest.TestCase):
                 "consequence": "Callers may pass None.",
                 "negative_check": "No check.",
                 "category": "guard_removal",
+                "old_contract": "Rejected None input.",
+                "new_contract": "Accepts None input.",
+                "violated_invariant": "Callers relied on None being rejected.",
             }
         ]
 
