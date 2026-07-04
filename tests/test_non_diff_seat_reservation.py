@@ -1,0 +1,177 @@
+"""B2: the cap/reservation and the budget survival sweep both reserve one seat for the
+best-ranked non-diff-derived hypothesis so diff-derived families can never take ALL slots.
+
+Real-pipeline test through call_tool("review_context"): the fixture over-produces 5+
+diff-derived families across multiple risk types. The base (non-splice) hypothesis
+generator is stubbed to return ONE real-shaped non-diff-derived row (a legitimate seam:
+the stub controls only the producer's base input, never the cap/budget logic under test),
+so the packet has 5+ diff families PLUS 1 high-ranked non-diff row — exactly the geometry
+B2 must handle. The non-diff row must survive the cap AND the budget.
+
+Inversion proof: without the reserved seat, the diff families claim all 5 cap slots and
+the non-diff row is dropped before the budget layer ever sees it.
+"""
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import source.kg.product.mcp_tools as mcp_tools_module
+from source.kg.product.mcp_tools import (
+    PLANNING_CONTEXT_SECTION_LIMIT,
+    _cap_review_hypotheses_reserving_diff_families,
+    call_tool,
+)
+from source.kg.product.output_budget import _DIFF_DERIVED_RISK_TYPES
+from source.kg.query.snapshot import KgSnapshot
+
+from tests.test_hypothesis_risk_type_counts import _build_combined_pair
+
+_NON_DIFF_RISK_TYPE = "swallowed_exception_state_drift"
+
+
+def _non_diff_hypothesis() -> dict:
+    """A real-shaped non-diff-derived hypothesis row (mirrors _make_hypothesis output)."""
+    return {
+        "hypothesis_id": "hypothesis:swallowed_exception_state_drift:00000000deadbeef",
+        "label": "H-swallowed_exception_state_drift",
+        "risk_type": _NON_DIFF_RISK_TYPE,
+        "confidence": "medium",
+        "specificity": "high",
+        "why": "A changed symbol swallows a broad exception whose silent outcome may mask a "
+        "state transition callers depend on.",
+        "postable_claim": "svc.core.alpha swallows a broad exception; the silent outcome may "
+        "mask a state transition callers depend on.",
+        "cause": {"repo": "svc", "path": "core.py", "line_start": 20, "line_end": 24},
+        "consequence": {"repo": "svc", "path": "core.py", "line_start": 20, "line_end": 24},
+        "source_checks": ["Trace each flagged broad-exception handler."],
+        "negative_checks": ["If the handler is intentional and documented, it does not apply."],
+        "evidence_refs": [{"repo": "svc", "path": "core.py", "line_start": 20, "line_end": 24}],
+        "supporting_lead_ids": [],
+    }
+
+
+class TestNonDiffSeatRealPipeline(unittest.TestCase):
+    def _run(self, *, patch_producer: bool):
+        """Run call_tool('review_context'); optionally inject one non-diff base hypothesis.
+
+        Returns (result, pre_cap_types, naive_types).
+        """
+        captured: dict = {}
+        cap_original = mcp_tools_module._cap_review_hypotheses_reserving_diff_families
+
+        def _cap_spy(rows, limit):
+            captured["pre"] = [r.get("risk_type") for r in rows if isinstance(r, dict)]
+            captured["naive"] = [r.get("risk_type") for r in rows[:limit] if isinstance(r, dict)]
+            return cap_original(rows, limit)
+
+        producer_original = mcp_tools_module.review_hypotheses_for_context
+
+        def _producer_stub(**kwargs):
+            base = producer_original(**kwargs)
+            # Inject one real-shaped non-diff row as the base producer output; the real
+            # splices then prepend the diff-derived families ahead of it.
+            return [_non_diff_hypothesis(), *base]
+
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            out_base, out_head, base_ck, head_ck = _build_combined_pair(tmpdir)
+            head_kg = KgSnapshot(out_head)
+            ctx = mock.patch.object(
+                mcp_tools_module, "_cap_review_hypotheses_reserving_diff_families", _cap_spy
+            )
+            with ctx:
+                if patch_producer:
+                    producer_ctx = mock.patch.object(
+                        mcp_tools_module, "review_hypotheses_for_context", _producer_stub
+                    )
+                else:
+                    producer_ctx = mock.patch.object(
+                        mcp_tools_module, "review_hypotheses_for_context", producer_original
+                    )
+                with producer_ctx:
+                    result = call_tool(
+                        head_kg,
+                        "review_context",
+                        {
+                            "repo": "svc",
+                            "changed_files": ["core.py"],
+                            "base_snapshot": str(out_base),
+                            "base_checkout": str(base_ck),
+                            "head_checkout": str(head_ck),
+                        },
+                    )
+        return result, captured["pre"], captured["naive"]
+
+    def test_non_diff_row_survives_cap_and_budget(self):
+        result, pre_types, naive_types = self._run(patch_producer=True)
+
+        # Precondition: the producer over-generates diff families beyond the cap.
+        pre_diff = {rt for rt in pre_types if rt in _DIFF_DERIVED_RISK_TYPES}
+        self.assertGreaterEqual(
+            len(pre_diff), 4,
+            f"fixture must span >=4 diff families; got {pre_diff}",
+        )
+        self.assertGreater(
+            len([rt for rt in pre_types if rt in _DIFF_DERIVED_RISK_TYPES]),
+            PLANNING_CONTEXT_SECTION_LIMIT,
+            f"fixture must over-produce diff rows beyond the cap; pre={pre_types}",
+        )
+        # Precondition: a non-diff row was generated.
+        self.assertIn(
+            _NON_DIFF_RISK_TYPE, pre_types,
+            f"non-diff row must be present pre-cap; pre={pre_types}",
+        )
+
+        # The reserved seat: the non-diff row survives the FINAL packet (cap + budget).
+        returned = [h.get("risk_type") for h in (result.get("review_hypotheses") or [])]
+        self.assertIn(
+            _NON_DIFF_RISK_TYPE, returned,
+            f"non-diff row was evicted; returned={returned}",
+        )
+
+    def test_diff_families_still_present_alongside_non_diff_seat(self):
+        """The non-diff seat takes exactly one slot; the remaining slots still hold diff
+        families, so reserving the seat does not silence diff-derived evidence."""
+        result, _pre, _naive = self._run(patch_producer=True)
+        returned = {h.get("risk_type") for h in (result.get("review_hypotheses") or [])}
+        diff_returned = {rt for rt in returned if rt in _DIFF_DERIVED_RISK_TYPES}
+        self.assertGreaterEqual(
+            len(diff_returned), 3,
+            f"diff families must still occupy most slots; returned={sorted(returned)}",
+        )
+
+    # INVERSION PROOF: cap-layer unit inversion — with the seat, a non-diff row placed
+    # AFTER five distinct diff families is retained; a naive [:limit] slice drops it.
+    def test_cap_inversion_naive_slice_drops_non_diff(self):
+        diff_rows = [
+            {"risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
+            {"risk_type": "responsibility_moved_drift", "derivation": "deterministic_static"},
+            {"risk_type": "test_reference_removed_drift", "derivation": "deterministic_static"},
+            {"risk_type": "abstract_contract_unimplemented", "derivation": "deterministic_static"},
+            {"risk_type": "contract_semantic_diff", "derivation": "inferred_llm"},
+        ]
+        non_diff = {"risk_type": _NON_DIFF_RISK_TYPE, "derivation": None}
+        ordered = [*diff_rows, non_diff]
+
+        naive = {r["risk_type"] for r in ordered[:PLANNING_CONTEXT_SECTION_LIMIT]}
+        self.assertNotIn(
+            _NON_DIFF_RISK_TYPE, naive,
+            "inversion precondition: naive slice must drop the non-diff row",
+        )
+        kept = _cap_review_hypotheses_reserving_diff_families(ordered, PLANNING_CONTEXT_SECTION_LIMIT)
+        kept_types = {r["risk_type"] for r in kept}
+        self.assertIn(
+            _NON_DIFF_RISK_TYPE, kept_types,
+            f"reserved seat must retain the non-diff row; kept={kept_types}",
+        )
+        self.assertEqual(len(kept), PLANNING_CONTEXT_SECTION_LIMIT)
+        # Exactly one non-diff seat: the other four slots are diff families.
+        diff_kept = {rt for rt in kept_types if rt in _DIFF_DERIVED_RISK_TYPES}
+        self.assertEqual(len(diff_kept), PLANNING_CONTEXT_SECTION_LIMIT - 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -391,6 +391,121 @@ class TestSemanticRowBudgetSurvival(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Part B1: compact-before-evict family floor holds under char pressure
+# ---------------------------------------------------------------------------
+
+def _big_diff_hyp(risk_type: str, idx: int) -> dict:
+    """A diff-derived hypothesis row fat enough that four together overflow the
+    hypothesis budget at 15K — but carrying trimmable optional fields (many
+    source_checks / negative_checks / evidence_refs / long why) so compact-before-evict
+    can shrink it rather than dropping the whole family."""
+    h = _make_hyp(risk_type, idx, derivation="deterministic_static")
+    h["postable_claim"] = f"Contract for {risk_type} changed at src/mod_{idx}.py. " * 3
+    h["label"] = f"{risk_type}#{idx}"
+    h["cause"] = {"repo": "repo-test", "path": f"src/mod_{idx}.py", "line_start": 1, "line_end": 4}
+    h["consequence"] = {"repo": "repo-test", "path": f"src/mod_{idx}.py", "line_start": 5, "line_end": 9}
+    h["why"] = f"Detailed rationale for {risk_type}. " + ("analysis " * 120)
+    h["source_checks"] = [
+        {"reason": f"inspect check {j}", "anchor": f"src/mod_{idx}.py", "repo": "repo-test",
+         "path": f"src/mod_{idx}.py", "detail": "verify the invariant holds " * 8}
+        for j in range(6)
+    ]
+    h["negative_checks"] = [
+        {"reason": f"rule out {j}", "detail": "confirm this is not a false positive " * 8}
+        for j in range(6)
+    ]
+    h["evidence_refs"] = [
+        {"repo": "repo-test", "path": f"src/mod_{idx}.py", "line_start": j * 10, "line_end": j * 10 + 5}
+        for j in range(6)
+    ]
+    return h
+
+
+class TestCompactBeforeEvictFamilyFloor(unittest.TestCase):
+    """B1: char pressure that would naively keep only 2 of 4 generated diff families must
+    instead keep >=1 row per family by compacting rows before dropping any family."""
+
+    def _four_family_over_budget_packet(self):
+        diff_types = [
+            "guard_call_removed_drift",
+            "responsibility_moved_drift",
+            "test_reference_removed_drift",
+            "abstract_contract_unimplemented",
+        ]
+        hyps = [_big_diff_hyp(rt, 100 + i) for i, rt in enumerate(diff_types)]
+        packet = _base_packet(hyps, extra_bulk=40)
+        self.assertGreater(
+            len(canonical_json(packet)), REVIEW_CONTEXT_MAX_CHARS,
+            "fixture must start over the 15K compact budget",
+        )
+        return packet, diff_types, hyps
+
+    def test_naive_fill_would_drop_families(self):
+        """Inversion precondition: at the hypothesis budget, four full lean rows do NOT
+        all fit — so a naive prefix fill keeps fewer than four families."""
+        from source.kg.product.output_budget import _lean_review_hypothesis
+        _packet, _diff_types, hyps = self._four_family_over_budget_packet()
+        # Emulate the fill budget geometry: the compact profile funds hypotheses under a
+        # budget well below 15K after reserving anchor/edge/profile headroom. Four full
+        # lean rows must exceed a realistic hypothesis slice, proving naive fill truncates.
+        lean_sizes = [len(canonical_json(_lean_review_hypothesis(h))) for h in hyps]
+        self.assertGreater(
+            sum(lean_sizes), REVIEW_CONTEXT_MAX_CHARS // 2,
+            "fixture rows must be fat enough that naive fill cannot keep all four",
+        )
+
+    def test_all_four_diff_families_survive(self):
+        """The floor: all four generated diff families return >=1 row post-budget."""
+        packet, diff_types, _ = self._four_family_over_budget_packet()
+        result = enforce_review_context_budget(packet)
+        returned_hyps = result.get("review_hypotheses") or []
+        returned_types = {h.get("risk_type") for h in returned_hyps if isinstance(h, dict)}
+        for rt in diff_types:
+            self.assertIn(
+                rt, returned_types,
+                f"diff family {rt!r} was evicted under char pressure; returned={sorted(returned_types)}",
+            )
+
+    def test_budget_respected_after_compaction(self):
+        """Compact-before-evict must not push the packet over the cap."""
+        packet, _, _ = self._four_family_over_budget_packet()
+        result = enforce_review_context_budget(packet)
+        size = len(canonical_json(result))
+        self.assertLessEqual(size, REVIEW_CONTEXT_MAX_CHARS, f"packet {size} exceeds cap")
+
+    def test_load_bearing_fields_preserved_after_compaction(self):
+        """Compaction trims optional fields only — load-bearing fields survive on every row."""
+        packet, _, _ = self._four_family_over_budget_packet()
+        result = enforce_review_context_budget(packet)
+        for h in result.get("review_hypotheses") or []:
+            self.assertIn("risk_type", h)
+            self.assertIn("hypothesis_id", h)
+            self.assertIn("postable_claim", h)
+            self.assertIn("cause", h)
+            self.assertIn("consequence", h)
+
+    def test_dropped_family_would_show_in_truncated_by_risk_type(self):
+        """If a family truly cannot fit even fully compacted, its absence is recorded in
+        truncated_by_risk_type — never silent. Here all fit, so it is zero, but the
+        arithmetic invariant (available - returned) must still hold per family."""
+        packet, _, _ = self._four_family_over_budget_packet()
+        result = enforce_review_context_budget(packet)
+        hs = result.get("review_hypothesis_status", {})
+        avail = hs.get("available_by_risk_type", {})
+        ret = hs.get("returned_by_risk_type", {})
+        trunc = hs.get("truncated_by_risk_type", {})
+        for rt, a in avail.items():
+            self.assertEqual(trunc.get(rt, 0), a - ret.get(rt, 0),
+                             f"truncated_by_risk_type[{rt!r}] must equal available-returned")
+
+    # INVERSION PROOF: if _compact_hypothesis_rows_to_fit is disabled (return False
+    # immediately), the four fat rows cannot all fit and the naive fill + all-or-nothing
+    # pin path drops at least one family — test_all_four_diff_families_survive would fail
+    # because returned_types would omit a diff family. Verified by temporarily making
+    # _compact_hypothesis_rows_to_fit a no-op.
+
+
+# ---------------------------------------------------------------------------
 # Part C: cap-time diff-family reservation (before PLANNING_CONTEXT_SECTION_LIMIT)
 # ---------------------------------------------------------------------------
 

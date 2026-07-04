@@ -1016,6 +1016,67 @@ _DIFF_DERIVED_RISK_TYPES: frozenset[str] = frozenset(
 )
 
 
+def _first_index_by_diff_family(rows: list[JsonObject]) -> dict[str, int]:
+    """First list position of each generated diff-derived risk type.
+
+    List position is the Task-A structural rank order (rows arrive already ordered by
+    apply_structural_noise_downranking then the reservation cap), so a LATER first index
+    means a lower-ranked family — the one that loses a scarce slot.
+    """
+    first: dict[str, int] = {}
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        rt = row.get("risk_type")
+        if rt in _DIFF_DERIVED_RISK_TYPES and rt not in first:
+            first[str(rt)] = idx
+    return first
+
+
+def plan_hypothesis_seats(rows: list[JsonObject], *, limit: int) -> tuple[bool, list[str]]:
+    """Shared seat-allocation policy for the cap and budget layers.
+
+    Given the ranked generated hypothesis rows and a ``limit`` slot count, decide:
+      * whether one seat is reserved for the best-ranked non-diff-derived row (reserved
+        only when at least one non-diff row exists), and
+      * which diff-derived risk-type families get a seat, in keep-priority order.
+
+    Diff families compete for the remaining slots (limit minus the non-diff seat).
+    Within the diff families, deterministic_static rows rank above inferred_llm rows
+    (derivation trust tier); within a tier, the family with the lower structural rank
+    (earlier first index) wins. When diff families exceed the remaining slots, the
+    lowest-ranked families are the ones left out.
+
+    Returns ``(reserve_non_diff_seat, ordered_diff_types)`` where ``ordered_diff_types``
+    is the keep-ordered list of diff risk types that fit; families beyond it are dropped
+    (their absence surfaces as truncated_by_risk_type, never silent absence).
+    """
+    has_non_diff = any(
+        isinstance(row, dict) and row.get("risk_type") not in _DIFF_DERIVED_RISK_TYPES
+        for row in rows
+    )
+    reserve_non_diff_seat = has_non_diff and limit >= 1
+    diff_slots = max(0, limit - (1 if reserve_non_diff_seat else 0))
+    first_index = _first_index_by_diff_family(rows)
+    # Deterministic families before inferred_llm; within a tier, lower structural rank
+    # (earlier first index) wins. derivation is read from the family's first-seen row.
+    derivation_by_type: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rt = row.get("risk_type")
+        if rt in _DIFF_DERIVED_RISK_TYPES and rt not in derivation_by_type:
+            derivation_by_type[str(rt)] = str(row.get("derivation") or "")
+    ordered = sorted(
+        first_index,
+        key=lambda rt: (
+            0 if derivation_by_type.get(rt) == "deterministic_static" else 1,
+            first_index[rt],
+        ),
+    )
+    return reserve_non_diff_seat, ordered[:diff_slots]
+
+
 def _lean_review_hypothesis(row: JsonObject) -> JsonObject:
     """Compact-profile hypothesis row: full adjudication fields, deduped coordinates.
 
@@ -1038,6 +1099,88 @@ def _lean_review_hypothesis(row: JsonObject) -> JsonObject:
     if isinstance(refs, list) and lean.get("source_spans"):
         lean["evidence_refs"] = refs[:2]
     return lean
+
+
+# Ordered compaction stages for a lean hypothesis row when char pressure would otherwise
+# drop the last row of a generated diff family. Each stage trims one optional/verbose
+# field; the load-bearing fields (postable_claim, risk_type, label, hypothesis_id,
+# derivation, cause/consequence coords, concrete_invariant) are never touched. Applied
+# in order across all evictable rows before any family's last row is dropped.
+def _compact_hypothesis_stage(row: JsonObject, stage: int) -> bool:
+    """Apply one compaction stage to a lean hypothesis row in place.
+
+    Returns True if the stage removed content (the row shrank), False otherwise so the
+    caller can advance to the next stage. Stages, in order:
+      0. drop negative_checks beyond the first
+      1. drop negative_checks entirely
+      2. trim source_checks to the first
+      3. drop source_checks entirely
+      4. trim evidence_refs to the first coordinate
+      5. clamp the why prose tail
+    """
+    if stage == 0:
+        negatives = row.get("negative_checks")
+        if isinstance(negatives, list) and len(negatives) > 1:
+            row["negative_checks"] = negatives[:1]
+            return True
+        return False
+    if stage == 1:
+        if "negative_checks" in row:
+            del row["negative_checks"]
+            return True
+        return False
+    if stage == 2:
+        checks = row.get("source_checks")
+        if isinstance(checks, list) and len(checks) > 1:
+            row["source_checks"] = checks[:1]
+            return True
+        return False
+    if stage == 3:
+        if "source_checks" in row:
+            del row["source_checks"]
+            return True
+        return False
+    if stage == 4:
+        refs = row.get("evidence_refs")
+        if isinstance(refs, list) and len(refs) > 1 and row.get("source_spans"):
+            row["evidence_refs"] = refs[:1]
+            return True
+        return False
+    if stage == 5:
+        why = row.get("why")
+        if isinstance(why, str) and len(why) > _WHY_CLAMP_CHARS:
+            row["why"] = why[:_WHY_CLAMP_CHARS]
+            return True
+        return False
+    return False
+
+
+_WHY_CLAMP_CHARS = 240
+_HYPOTHESIS_COMPACT_STAGES = 6
+
+
+def _compact_hypothesis_rows_to_fit(
+    packet: JsonObject,
+    rows: list[JsonObject],
+    *,
+    budget: int,
+    protected_ids: set[int],
+) -> bool:
+    """Shrink already-kept hypothesis rows in staged order until ``packet`` fits ``budget``.
+
+    Trims optional/verbose fields (per _compact_hypothesis_stage) on every non-protected
+    row before any diff family's last row is dropped. Returns True if the packet now fits.
+    """
+    if _current_chars(packet) <= budget:
+        return True
+    for stage in range(_HYPOTHESIS_COMPACT_STAGES):
+        for row in rows:
+            if id(row) in protected_ids:
+                continue
+            if _compact_hypothesis_stage(row, stage):
+                if _current_chars(packet) <= budget:
+                    return True
+    return _current_chars(packet) <= budget
 
 
 _TIGHT_ANCHOR_KEYS = ("lead_id", "repo", "path", "qualname", "display_name", "line", "end_line")
@@ -1173,33 +1316,65 @@ def _hypothesis_first_compact_packet(
             hypotheses.pop()
             break
 
-    # Diff-derived pinning: if budget truncation dropped all rows for a diff-derived
-    # risk_type that was generated, swap in one row of that type — evicting the last
-    # non-diff-derived hypothesis if needed — so truncation never implies absence for
-    # an entire diff family. Mirrors the reserved-slot guarantee from the splice ordering.
+    # Diff-derived pinning with a reserved non-diff seat and compact-before-evict.
+    # Shared policy (plan_hypothesis_seats, same as the cap layer): one seat is reserved
+    # for the best-ranked non-diff row when one exists, the remaining seats go to diff
+    # families (deterministic above inferred_llm, lower structural rank wins), and when a
+    # diff family's last row will not fit we FIRST trim optional/verbose fields on the
+    # already-kept rows (compact-before-evict) so the family is dropped only when even the
+    # fully compacted packet cannot hold it — so char pressure never silently erases a
+    # generated diff family. A dropped family surfaces in truncated_by_risk_type via
+    # _finalize_review_hypothesis_budget, never as silent absence.
+    _reserve_non_diff_seat, _seat_diff_types = plan_hypothesis_seats(
+        original_hypotheses, limit=len(original_hypotheses) or 1
+    )
+    # Protect the best-ranked non-diff row already in the packet so compaction/eviction
+    # for diff families never starves the reserved non-diff seat.
+    protected_non_diff_id: set[int] = set()
+    if _reserve_non_diff_seat:
+        for h in hypotheses:
+            if isinstance(h, dict) and h.get("risk_type") not in _DIFF_DERIVED_RISK_TYPES:
+                protected_non_diff_id.add(id(h))
+                break
     kept_risk_types = {h.get("risk_type") for h in hypotheses if isinstance(h, dict)}
     for orig_hyp in original_hypotheses:
         if not isinstance(orig_hyp, dict):
             continue
         rt = orig_hyp.get("risk_type")
-        if rt not in _DIFF_DERIVED_RISK_TYPES or rt in kept_risk_types:
+        if rt not in _seat_diff_types or rt in kept_risk_types:
             continue
         lean_row = _lean_review_hypothesis(orig_hyp)
         hypotheses.append(lean_row)
         if _current_chars(packet) <= hypothesis_budget:
             kept_risk_types.add(rt)
             continue
-        # Over budget: try swapping out the last non-diff-derived row.
+        # Over budget: compact the already-kept rows (protecting the reserved non-diff
+        # seat and the row just added) before considering a drop.
+        if _compact_hypothesis_rows_to_fit(
+            packet,
+            hypotheses,
+            budget=hypothesis_budget,
+            protected_ids=protected_non_diff_id | {id(lean_row)},
+        ):
+            kept_risk_types.add(rt)
+            continue
+        # Still over budget after full compaction: evict the last non-diff-derived row
+        # that is not the reserved seat, then retry compaction.
         swap_idx = next(
             (i for i in range(len(hypotheses) - 2, -1, -1)
-             if hypotheses[i].get("risk_type") not in _DIFF_DERIVED_RISK_TYPES),
+             if hypotheses[i].get("risk_type") not in _DIFF_DERIVED_RISK_TYPES
+             and id(hypotheses[i]) not in protected_non_diff_id),
             None,
         )
         if swap_idx is not None:
             hypotheses.pop(swap_idx)
-            if _current_chars(packet) <= hypothesis_budget:
+            if _current_chars(packet) <= hypothesis_budget or _compact_hypothesis_rows_to_fit(
+                packet, hypotheses, budget=hypothesis_budget, protected_ids={id(lean_row)}
+            ):
                 kept_risk_types.add(rt)
                 continue
+        # Only now, when even the fully compacted packet cannot hold the family's last
+        # row, drop it — truncated_by_risk_type will record the omission.
         hypotheses.pop()
 
     # Tier 3: append the pre-computed anchors (budget guard for pathological fixtures

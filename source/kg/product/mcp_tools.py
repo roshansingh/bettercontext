@@ -18,6 +18,7 @@ from source.kg.product.output_budget import (
     PLANNING_CONTEXT_ANCHORED_MAX_CHARS,
     REVIEW_CONTEXT_BROAD_MAX_CHARS,
     _DIFF_DERIVED_RISK_TYPES,
+    plan_hypothesis_seats,
     enforce_planning_context_budget,
     enforce_review_context_budget,
     enforce_reverse_impact_budget,
@@ -3415,56 +3416,52 @@ def _cap_review_hypotheses_reserving_diff_families(
     families above inferred_llm rows (derivation tier deterministic_static >
     inferred_llm) when slots are scarce.
 
-    Order: start from the prior ranking prefix ``review_hypotheses[:limit]``; for each
-    generated diff-derived risk type absent from that prefix, splice one row in by
-    evicting the last non-diff-derived row — and, when only diff-derived rows remain,
-    an already-pinned inferred_llm row before a deterministic_static one. When distinct
-    generated diff-derived types exceed ``limit``, the lowest-priority (inferred_llm)
-    types are the ones left out; their absence surfaces as nonzero
-    truncated_by_risk_type entries downstream, never as silent absence.
-    """
-    kept = review_hypotheses[:limit]
-    kept_ids = {id(row) for row in kept}
-    kept_types = {row.get("risk_type") for row in kept if isinstance(row, dict)}
+    Seat policy (shared with the budget layer via output_budget.plan_hypothesis_seats):
+    when at least one non-diff-derived row exists, one of ``limit`` slots is reserved for
+    the best-ranked non-diff row so diff families can never take ALL slots; the remaining
+    slots go to diff families, deterministic_static above inferred_llm, and within a tier
+    the lower structural rank (earlier list position) wins. When distinct generated
+    diff-derived types exceed the remaining slots, the lowest-ranked families are left out;
+    their absence surfaces as nonzero truncated_by_risk_type entries downstream, never as
+    silent absence.
 
-    # First occurrence of each generated diff-derived type, deterministic before inferred.
-    missing_det: list[JsonObject] = []
-    missing_inferred: list[JsonObject] = []
-    seen_types: set[str] = set(t for t in kept_types if t in _DIFF_DERIVED_RISK_TYPES)
+    The kept rows preserve the input relative order. One representative row (first
+    occurrence) is kept per selected diff family; leftover slots after the reserved
+    non-diff seat and the diff seats are filled by the highest-ranked remaining rows.
+    """
+    if limit <= 0:
+        return []
+    reserve_non_diff_seat, diff_types = plan_hypothesis_seats(review_hypotheses, limit=limit)
+    diff_type_set = set(diff_types)
+
+    kept_ids: set[int] = set()
+    # One representative (first occurrence) per selected diff family.
+    seen_diff: set[str] = set()
     for row in review_hypotheses:
-        if not isinstance(row, dict) or id(row) in kept_ids:
+        if not isinstance(row, dict):
             continue
         rt = row.get("risk_type")
-        if rt not in _DIFF_DERIVED_RISK_TYPES or rt in seen_types:
-            continue
-        seen_types.add(rt)
-        if row.get("derivation") == "deterministic_static":
-            missing_det.append(row)
-        else:
-            missing_inferred.append(row)
+        if rt in diff_type_set and rt not in seen_diff:
+            seen_diff.add(str(rt))
+            kept_ids.add(id(row))
+    # Reserved non-diff seat: best-ranked (first) non-diff row.
+    if reserve_non_diff_seat:
+        for row in review_hypotheses:
+            if (
+                isinstance(row, dict)
+                and row.get("risk_type") not in _DIFF_DERIVED_RISK_TYPES
+                and id(row) not in kept_ids
+            ):
+                kept_ids.add(id(row))
+                break
+    # Fill leftover slots with the highest-ranked remaining rows.
+    for row in review_hypotheses:
+        if len(kept_ids) >= limit:
+            break
+        if isinstance(row, dict) and id(row) not in kept_ids:
+            kept_ids.add(id(row))
 
-    for pin in missing_det + missing_inferred:
-        # Evict the lowest-priority evictable row: a non-diff-derived row first, else
-        # an already-pinned inferred_llm row so deterministic families win scarce slots.
-        evict_idx = next(
-            (i for i in range(len(kept) - 1, -1, -1)
-             if not isinstance(kept[i], dict) or kept[i].get("risk_type") not in _DIFF_DERIVED_RISK_TYPES),
-            None,
-        )
-        if evict_idx is None and pin.get("derivation") == "deterministic_static":
-            evict_idx = next(
-                (i for i in range(len(kept) - 1, -1, -1)
-                 if isinstance(kept[i], dict) and kept[i].get("derivation") != "deterministic_static"),
-                None,
-            )
-        if evict_idx is None:
-            # No lower-priority slot to yield — this pin cannot fit; its absence shows
-            # up as a nonzero truncated_by_risk_type entry, not silent absence.
-            continue
-        kept.pop(evict_idx)
-        kept.append(pin)
-
-    return kept
+    return [row for row in review_hypotheses if isinstance(row, dict) and id(row) in kept_ids]
 
 
 def _resolve_changed_head_entities(
