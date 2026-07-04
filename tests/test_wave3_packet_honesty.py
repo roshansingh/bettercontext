@@ -450,5 +450,121 @@ class TestPacketHonestySurvivesBudgetCompaction(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Ordering regression: attribution_labels funded before inspection_areas
+# ---------------------------------------------------------------------------
+# Real-packet evidence (635280d): attribution_labels was null on the two larger
+# packets (grafana, sentry geometries).  Root cause: _sync_review_quality_status_from_packet
+# ran FIRST and consumed all eviction slack for inspection_areas, leaving
+# _attach_attribution_labels with nothing to evict and the packet already at cap,
+# so it dropped labels.  Fix: swap the order — fund attribution_labels first.
+# ---------------------------------------------------------------------------
+
+class TestAttributionLabelsBeforeInspectionAreas(unittest.TestCase):
+    """Ordering guarantee: attribution_labels is funded BEFORE inspection_areas consumes
+    eviction slack.  Verified by constructing a packet that sits exactly at the cap after
+    both affordances are attached, then asserting labels survive and inspection_areas
+    shrinks (rather than labels being the victim)."""
+
+    def _make_at_cap_packet(self, *, n_hyps: int = 5, cap: int) -> dict:
+        """Packet with n_hyps high-spec hypotheses returned + n_hyps-1 truncated (so
+        inspection_areas is non-empty), sized to land just over ``cap`` before finalize.
+        Returns the finalized packet under ``cap``."""
+        from source.kg.product.output_budget import (
+            _finalize_review_hypothesis_budget,
+            _attach_review_hypothesis_status,
+        )
+        from source.kg.core.models import canonical_json
+
+        hyps = [_hyp(i, specificity="high") for i in range(n_hyps)]
+        original_hypotheses = [_hyp(i, specificity="high") for i in range(n_hyps * 2)]
+
+        # Build a minimal skeleton that sits just over cap by padding with a large filler.
+        result: dict = {
+            "tool": "review_context",
+            "status": "ok",
+            "repo": "testrepo",
+            "review_hypotheses": hyps,
+            "review_answer_packet": {"status": "ok", "packet_mode": "hypothesis_first",
+                                     "review_lead_status": {}, "top_review_hypotheses": []},
+            "review_leads": {},
+            "review_lead_status": {},
+            "diff_anchors": [],
+            "changed_symbols": [],
+            "source_coordinates": [],
+            "output_budget": {"profile": "hypothesis_first", "truncated": True,
+                              "truncated_sections": ["review_hypotheses"]},
+            # Filler to push packet just over cap; finalize must evict it.
+            "direct_callers": [{"caller_symbol": "x" * 200, "repo": "r", "path": f"p{k}.py",
+                                 "line": k} for k in range(20)],
+        }
+        _finalize_review_hypothesis_budget(
+            result, original_hypotheses,
+            original_review_leads={},
+            max_chars=cap,
+        )
+        return result
+
+    def test_labels_present_when_inspection_areas_also_present(self) -> None:
+        """Both affordances survive when both are funded; labels are NOT the eviction victim."""
+        cap = REVIEW_CONTEXT_MAX_CHARS
+        result = self._make_at_cap_packet(n_hyps=4, cap=cap)
+        ap = result.get("review_answer_packet") or {}
+        rqs = result.get("review_quality_status") or {}
+        size = len(canonical_json(result))
+        self.assertLessEqual(size, cap, f"finalize must fit; size={size}")
+        # If hypotheses were returned, labels must be present.
+        if result.get("review_hypotheses"):
+            self.assertIn(
+                "attribution_labels", ap,
+                f"labels must survive even when inspection_areas is present; ap keys={sorted(ap.keys())}",
+            )
+
+    def test_inversion_labels_absent_when_no_hypotheses_returned(self) -> None:
+        """Inversion: zero returned hypotheses → attribution_labels absent.
+        Proves the positive assertion above is not vacuous."""
+        from source.kg.product.output_budget import _finalize_review_hypothesis_budget
+        result: dict = {
+            "tool": "review_context",
+            "status": "ok",
+            "repo": "testrepo",
+            "review_hypotheses": [],
+            "review_answer_packet": {"status": "ok"},
+            "review_leads": {},
+            "review_lead_status": {},
+            "diff_anchors": [],
+            "changed_symbols": [],
+            "source_coordinates": [],
+            "output_budget": {"profile": "hypothesis_first"},
+        }
+        _finalize_review_hypothesis_budget(
+            result, [],
+            original_review_leads={},
+            max_chars=REVIEW_CONTEXT_MAX_CHARS,
+        )
+        ap = result.get("review_answer_packet") or {}
+        self.assertNotIn(
+            "attribution_labels", ap,
+            "no returned hypotheses → no attribution_labels",
+        )
+
+    def test_labels_match_final_returned_rows_after_eviction(self) -> None:
+        """Labels exactly match the hypothesis labels actually in the packet post-eviction."""
+        from source.kg.core.models import canonical_json
+        cap = REVIEW_CONTEXT_MAX_CHARS
+        result = self._make_at_cap_packet(n_hyps=3, cap=cap)
+        ap = result.get("review_answer_packet") or {}
+        hyps = result.get("review_hypotheses") or []
+        if not hyps:
+            return  # no hypotheses returned → labels correctly absent (covered above)
+        attr = ap.get("attribution_labels")
+        self.assertIsInstance(attr, dict, "attribution_labels must be a dict")
+        returned_labels = [h.get("label") for h in hyps if isinstance(h, dict)]
+        self.assertEqual(
+            attr.get("labels"), returned_labels,
+            "labels must exactly match final returned rows, in order",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

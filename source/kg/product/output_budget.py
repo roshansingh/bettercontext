@@ -5055,22 +5055,23 @@ def _finalize_review_hypothesis_budget(
     # The funding eviction above may have dropped further lead rows; reconcile again so
     # hypotheses never cite lead_ids that no longer exist in the packet.
     _reconcile_hypothesis_lead_ids(result)
+    # Attribution-label affordance (C2/rec-6): fund FIRST — it is tiny (<300 chars) and
+    # must be unconditional whenever any hypothesis rows are returned.  Running it before
+    # _sync_review_quality_status_from_packet ensures inspection_areas never starves it by
+    # consuming all eviction slack.  Hard cap still wins: labels are dropped only if the
+    # packet overshoots after its own eviction pass.
+    _attach_attribution_labels(result, max_chars=max_chars, fund_over_cap=True)
     # Sync review_quality_status counts from the FINAL review_hypotheses so specific/generic
     # counts describe rows actually returned, not the pre-budget set. Also downgrades
     # review_readiness and attaches inspection_areas when high/medium rows were truncated.
     # fund_over_cap=True: the C1 inspection_areas affordance is a truncation-honesty signal;
     # like review_hypothesis_status it is funded by evicting lower-priority rows rather than
     # silently dropped when the hypothesis_first packet already sits at/over the cap.
+    # Runs AFTER attribution_labels so inspection_areas shrinks before labels are ever evicted.
     _sync_review_quality_status_from_packet(
         result, original_hypotheses, full_pre_cap_hypotheses=full_pre_cap_hypotheses,
         max_chars=max_chars, fund_over_cap=True,
     )
-    # Attribution-label affordance (C2/rec-6): mirror the returned hypothesis labels to the
-    # TOP of the answer packet so downstream reviewer findings can cite them. Recomputed here
-    # (after all eviction) so labels match the FINAL returned rows. Funded by evicting
-    # lower-priority rows so it survives even when the hypothesis_first packet is at/over cap;
-    # dropped only if the packet still overshoots after that eviction (hard cap always wins).
-    _attach_attribution_labels(result, max_chars=max_chars, fund_over_cap=True)
     # Re-mirror top-level changed_symbols from review_leads.changed_symbols.
     # _repair_cluster_coverage and the gated re-interleave both de-alias the two lists.
     # Tandem clipping in _evict_review_rows_to_fit keeps review_leads.changed_symbols in
