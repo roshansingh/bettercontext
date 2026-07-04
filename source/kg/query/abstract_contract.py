@@ -14,10 +14,12 @@ Mechanism (pure ``ast`` + KG structure; NO regex, NO name/keyword lists):
      ``ast.Subscript`` generics with the subscript stripped).
   2. Proceed only when the base-name list CHANGED between base and head — that is
      the reparenting diff trigger.
-  3. Resolve each NEW base name against head-snapshot CodeSymbol class entities
-     using the same fail-closed disambiguation as semantic_contract_diff
-     (dotted → exact qualified-suffix match; bare → exactly one candidate;
-     ambiguous → skip).
+  3. Normalize each NEW base name through the subclass file's import-alias map
+     (``from x import BaseThing as BT`` → ``BaseThing``; ``import x as p`` + ``p.BaseThing``
+     → ``BaseThing``), then resolve against head-snapshot CodeSymbol class entities using
+     the same fail-closed disambiguation as semantic_contract_diff (dotted → exact
+     qualified-suffix match; bare → exactly one candidate; ambiguous/unresolvable → skip).
+     The alias map is collected source-order-aware (imports after the class don't bind).
   4. Parse each resolved base's own file with ``ast``. Abc markers are resolved
      BINDING-AWARE against that file's imports (``_abc_bindings``): ``ABC``/
      ``ABCMeta``/``abstractmethod`` count only when they actually bind to the ``abc``
@@ -114,15 +116,23 @@ class _AbcBindings:
         return self.from_imports.get(name)
 
 
-def _local_module_bindings(tree: ast.Module) -> set[str]:
+def _local_module_bindings(tree: ast.Module, *, before_line: int | None = None) -> set[str]:
     """Module-level names (re)bound by a ``def``/``class``/assignment.
 
     Such a binding shadows a same-named ``abc`` import, so the name must not be read as
     an abc marker. Only top-level statements are considered — nested scopes cannot rebind
     a module-level import for a class defined at module scope.
+
+    Source-order-aware: when ``before_line`` is given (the analyzed class's lineno), only
+    statements that appear BEFORE that line participate. Python evaluates a class's bases
+    and decorators at class-definition time, so a rebinding AFTER the class does not shadow
+    an earlier import for that class (``import abc`` … ``class C(abc.ABC)`` … ``abc = object()``
+    leaves ``C`` abstract). ``before_line=None`` keeps the whole-module behavior.
     """
     names: set[str] = set()
     for stmt in tree.body:
+        if before_line is not None and stmt.lineno >= before_line:
+            continue
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(stmt.name)
         elif isinstance(stmt, ast.Assign):
@@ -134,12 +144,21 @@ def _local_module_bindings(tree: ast.Module) -> set[str]:
     return names
 
 
-def _abc_bindings(tree: ast.Module) -> _AbcBindings:
-    """Collect ``abc`` marker bindings for one module (call once per parsed file)."""
-    shadowed = _local_module_bindings(tree)
+def _abc_bindings(tree: ast.Module, *, before_line: int | None = None) -> _AbcBindings:
+    """Collect ``abc`` marker bindings for one module, relative to one analyzed class.
+
+    ``before_line`` is the analyzed class's lineno: only top-level imports/rebindings that
+    appear BEFORE it bind for that class (Python resolves class bases/decorators at
+    class-definition time, so a later import or reassignment does not participate). Pass
+    ``None`` for whole-module collection.
+    """
+    shadowed = _local_module_bindings(tree, before_line=before_line)
     module_aliases: set[str] = set()
     from_imports: dict[str, str] = {}
     for stmt in tree.body:
+        if before_line is not None and stmt.lineno >= before_line:
+            # An import placed AFTER the class does not bind for it either.
+            continue
         if isinstance(stmt, ast.Import):
             for alias in stmt.names:
                 if alias.name == "abc":
@@ -156,6 +175,62 @@ def _abc_bindings(tree: ast.Module) -> _AbcBindings:
         module_aliases=frozenset(module_aliases),
         from_imports=from_imports,
     )
+
+
+def _import_alias_map(tree: ast.Module, *, before_line: int | None = None) -> dict[str, dict[str, str]]:
+    """Map a class-base's SYNTACTIC name to the IMPORTED symbol's real name.
+
+    ``_resolve_base_entity`` matches a base name against KG class entities by the last
+    dotted segment (this KG stores unqualified class names — see ADR-0006 Implementation
+    Status), so an aliased import hides the real target: ``from x import BaseThing as BT``
+    binds the base to ``BT``, which shares no segment with ``BaseThing``. This collects the
+    alias→real-name mapping so base refs can be normalized to the name resolution expects:
+
+      * ``from pkg.mod import BaseThing as BT`` → ``{"from": {"BT": "BaseThing"}}``
+        (no alias is a no-op: the syntactic name already equals the imported name).
+      * ``import pkg.mod as p`` → ``{"module": {"p": ""}}`` so a dotted base ``p.BaseThing``
+        drops the alias prefix to the imported leaf ``BaseThing``.
+
+    Source-order-aware with the same ``before_line`` cutoff as ``_abc_bindings``: an import
+    placed after the class does not bind for it. Relative imports (``level > 0``) still bind
+    their leaf name, which is all the (unqualified) matcher needs. Nothing is invented: an
+    alias whose target is absent from the KG resolves to no candidate (fail closed).
+    """
+    from_aliases: dict[str, str] = {}
+    module_aliases: set[str] = set()
+    for stmt in tree.body:
+        if before_line is not None and stmt.lineno >= before_line:
+            continue
+        if isinstance(stmt, ast.ImportFrom):
+            for alias in stmt.names:
+                if alias.name == "*":
+                    continue
+                if alias.asname and alias.asname != alias.name:
+                    from_aliases[alias.asname] = alias.name
+        elif isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                # ``import pkg.mod as p`` binds ``p`` to the module, so ``p.X`` refers to
+                # ``X`` in that module. Record the alias so the prefix can be dropped.
+                if alias.asname:
+                    module_aliases.add(alias.asname)
+    return {"from": from_aliases, "module": {a: "" for a in module_aliases}}
+
+
+def _normalize_base_ref(base_name: str, alias_map: dict[str, dict[str, str]]) -> str:
+    """Rewrite a syntactic base name to the IMPORTED name ``_resolve_base_entity`` expects.
+
+    Bare names map through the ``from`` aliases (``BT`` → ``BaseThing``); dotted names whose
+    leading segment is a module alias drop that prefix (``p.BaseThing`` → ``BaseThing``).
+    Unaliased names pass through unchanged so existing direct-base resolution is untouched.
+    """
+    from_aliases = alias_map.get("from") or {}
+    module_aliases = alias_map.get("module") or {}
+    if "." not in base_name:
+        return from_aliases.get(base_name, base_name)
+    prefix, _, rest = base_name.partition(".")
+    if prefix in module_aliases:
+        return rest
+    return base_name
 
 
 @dataclass(frozen=True)
@@ -466,7 +541,9 @@ def _abstract_base_from_entity(
     if parsed is None:
         return None
     tree, class_def, bpath, qualname, line = parsed
-    is_abstract, required = _base_is_abstract_and_members(class_def, _abc_bindings(tree))
+    is_abstract, required = _base_is_abstract_and_members(
+        class_def, _abc_bindings(tree, before_line=class_def.lineno)
+    )
     if not is_abstract or not required:
         return None
     return _AbstractBase(
@@ -515,12 +592,15 @@ def _transitive_concrete_members(
     if parsed is None:
         return set(), False
     tree, class_def, _bpath, _qualname, _line = parsed
-    bindings = _abc_bindings(tree)
+    bindings = _abc_bindings(tree, before_line=class_def.lineno)
+    alias_map = _import_alias_map(tree, before_line=class_def.lineno)
 
     supplied = _concrete_member_names(class_def, bindings)
     certain = True
     for ancestor_name in _base_names(class_def):
-        ancestor_entity = _resolve_base_entity(ancestor_name, head_snapshot, subclass_repo)
+        ancestor_entity = _resolve_base_entity(
+            _normalize_base_ref(ancestor_name, alias_map), head_snapshot, subclass_repo
+        )
         if ancestor_entity is None:
             certain = False
             continue
@@ -650,11 +730,6 @@ def abstract_contract_diff(
         except SyntaxError:
             stats.parse_failures += 1
             continue
-        # Binding-aware abc markers for the subclass's own file: a locally-defined
-        # ``abstractmethod`` decorator must not read as real abc semantics when
-        # classifying the subclass's members concrete vs abstract-redeclared.
-        head_bindings = _abc_bindings(head_tree)
-
         raw_line = props.get("line")
         head_line = int(raw_line) if raw_line is not None else None
         # head_line is the head-snapshot coordinate; only anchor the head lookup with
@@ -667,6 +742,14 @@ def abstract_contract_diff(
             # existing class; parse failure also lands here.
             stats.parse_failures += 1
             continue
+
+        # Binding-aware abc markers + import-alias map for the subclass's own file,
+        # source-order-aware against the subclass def's lineno: a locally-defined
+        # ``abstractmethod`` decorator (or a rebinding after the class) must not read as
+        # real abc semantics when classifying the subclass's members. The alias map
+        # normalizes aliased base refs (``from x import BaseThing as BT``) before resolution.
+        head_bindings = _abc_bindings(head_tree, before_line=head_class.lineno)
+        head_alias_map = _import_alias_map(head_tree, before_line=head_class.lineno)
 
         head_bases = _base_names(head_class)
         base_bases = _base_names(base_class)
@@ -689,7 +772,9 @@ def abstract_contract_diff(
         empty_body = _body_is_empty(head_class)
 
         for base_name in new_bases:
-            base_entity = _resolve_base_entity(base_name, head_snapshot, subclass_repo)
+            base_entity = _resolve_base_entity(
+                _normalize_base_ref(base_name, head_alias_map), head_snapshot, subclass_repo
+            )
             if base_entity is None:
                 continue
             abstract_base = _abstract_base_from_entity(base_entity, head_root)
@@ -709,7 +794,9 @@ def abstract_contract_diff(
             mro_supplied: set[str] = set()
             preceding_certain = True
             for other_name in preceding_bases:
-                other_entity = _resolve_base_entity(other_name, head_snapshot, subclass_repo)
+                other_entity = _resolve_base_entity(
+                    _normalize_base_ref(other_name, head_alias_map), head_snapshot, subclass_repo
+                )
                 if other_entity is None:
                     preceding_certain = False
                     continue

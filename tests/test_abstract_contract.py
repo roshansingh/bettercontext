@@ -177,6 +177,87 @@ _SHADOW_LOCAL_ABCMETA = (
     "        ...\n"
 )
 
+# --- Source-order-aware binding fixtures (later fix) ------------------------------
+
+# ``abc`` is rebound to a plain object AFTER BaseThing is defined. Python evaluates the
+# class bases at definition time, so BaseThing IS abstract; the later rebinding is
+# irrelevant to it. An order-blind collector would treat ``abc`` as shadowed and miss it.
+_SHADOW_ABC_AFTER_CLASS = (
+    "import abc\n"
+    "\n"
+    "\n"
+    "class BaseThing(abc.ABC):\n"
+    "    @property\n"
+    "    @abc.abstractmethod\n"
+    "    def counter_names(self):\n"
+    "        ...\n"
+    "\n"
+    "    @abc.abstractmethod\n"
+    "    def build_it(self, x):\n"
+    "        ...\n"
+    "\n"
+    "\n"
+    "abc = object()\n"
+)
+
+# ``abc`` is rebound to a plain object BEFORE BaseThing. At definition time ``abc.ABC`` is
+# an attribute access on the plain object, not the module — BaseThing is NOT abc-governed,
+# so its subclass is instantiable → no row. (Import kept first so the name exists.)
+_SHADOW_ABC_BEFORE_CLASS = (
+    "import abc\n"
+    "\n"
+    "\n"
+    "abc = object()\n"
+    "\n"
+    "\n"
+    "class BaseThing(abc.ABC):\n"
+    "    @property\n"
+    "    @abc.abstractmethod\n"
+    "    def counter_names(self):\n"
+    "        ...\n"
+    "\n"
+    "    @abc.abstractmethod\n"
+    "    def build_it(self, x):\n"
+    "        ...\n"
+)
+
+# The ``import abc`` appears AFTER BaseThing. At the class's definition point the name is
+# unbound, so ``abc`` does not bind to the module for this class → not abc-governed → no row.
+_IMPORT_ABC_AFTER_CLASS = (
+    "class BaseThing(abc.ABC):\n"
+    "    @property\n"
+    "    @abc.abstractmethod\n"
+    "    def counter_names(self):\n"
+    "        ...\n"
+    "\n"
+    "    @abc.abstractmethod\n"
+    "    def build_it(self, x):\n"
+    "        ...\n"
+    "\n"
+    "\n"
+    "import abc\n"
+)
+
+# --- Import-alias base-resolution fixtures (later fix) ----------------------------
+
+# Abstract base defined in a SEPARATE module (contracts.py), imported into core.py under
+# an alias. ``from .contracts import BaseThing as BT`` — the syntactic base is ``BT`` but
+# the KG qualname ends in ``BaseThing``; without alias normalization resolution misses it.
+_CONTRACTS_MODULE = (
+    "import abc\n"
+    "\n"
+    "\n"
+    "class BaseThing(abc.ABC):\n"
+    "    @property\n"
+    "    @abc.abstractmethod\n"
+    "    def counter_names(self):\n"
+    "        ...\n"
+    "\n"
+    "    @abc.abstractmethod\n"
+    "    def build_it(self, x):\n"
+    "        ...\n"
+)
+
 # --- Fix 2: transitive-ancestor MRO fixtures -------------------------------------
 
 # Concrete impl of BOTH abstract members, used as a further base of a mixin.
@@ -758,6 +839,186 @@ class TestAbcBindingAware(unittest.TestCase):
         """
         rows = self._run(*self._reparent(_SHADOW_LOCAL_ABCMETA))
         self.assertEqual(rows, [], f"local ABCMeta metaclass shadow → no row; got {rows}")
+
+
+class TestSourceOrderAwareBinding(unittest.TestCase):
+    """Source-order-aware abc binding: a rebinding/import AFTER the class does not shadow.
+
+    Python resolves a class's bases at class-definition time, so only module-level
+    imports/rebindings BEFORE the class participate in its abc-marker binding.
+    """
+
+    def _run(self, base_core: str, head_core: str) -> list[JsonObject]:
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            out_base, out_head, base_ck, head_ck = _build_pair(tmpdir, base_core, head_core)
+            result = _review_context(out_base, out_head, base_ck, head_ck)
+            return _abstract_rows(result)
+
+    def _reparent(self, base_module: str) -> tuple[str, str]:
+        base_core = base_module + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = base_module + _CONCRETE_BASE + (
+            "\n\nclass Widget(BaseThing):\n"
+            "    pass\n"
+        )
+        return base_core, head_core
+
+    def test_rebinding_after_class_does_not_shadow_row_emitted(self) -> None:
+        """``abc = object()`` AFTER BaseThing must NOT shadow → base abstract → row emitted.
+
+        Inversion: _SHADOW_ABC_BEFORE_CLASS (same rebinding placed BEFORE the class)
+        suppresses the row — see test_rebinding_before_class_shadows_no_row.
+        """
+        rows = self._run(*self._reparent(_SHADOW_ABC_AFTER_CLASS))
+        self.assertEqual(len(rows), 1, f"rebinding after class must not shadow → row; got {rows}")
+        claim = str(rows[0].get("postable_claim") or "")
+        self.assertIn("counter_names", claim, f"claim must name counter_names; got {claim!r}")
+        self.assertIn("build_it", claim, f"claim must name build_it; got {claim!r}")
+
+    def test_rebinding_before_class_shadows_no_row(self) -> None:
+        """``abc = object()`` BEFORE BaseThing shadows the import → not abc-governed → no row.
+
+        Inversion of test_rebinding_after_class_does_not_shadow_row_emitted: identical
+        fixture except the rebinding's position relative to the class.
+        """
+        rows = self._run(*self._reparent(_SHADOW_ABC_BEFORE_CLASS))
+        self.assertEqual(rows, [], f"rebinding before class shadows → no row; got {rows}")
+
+    def test_import_after_class_not_bound_no_row(self) -> None:
+        """``import abc`` placed AFTER BaseThing does not bind for it → not abc-governed → no row.
+
+        Inversion: moving the import BEFORE the class (the _ABSTRACT_BASE shape) emits a row.
+        """
+        rows = self._run(*self._reparent(_IMPORT_ABC_AFTER_CLASS))
+        self.assertEqual(rows, [], f"import after class → not bound → no row; got {rows}")
+
+
+class TestImportAliasedBaseResolution(unittest.TestCase):
+    """Import-aliased abstract bases resolve to the same row as a direct base reference."""
+
+    def _run_multi(
+        self,
+        contracts_module: str,
+        base_core: str,
+        head_core: str,
+    ) -> list[JsonObject]:
+        """Build base/head where the abstract base lives in a separate contracts.py module."""
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            base_pkg = tmpdir / "base" / "pkg"
+            head_pkg = tmpdir / "head" / "pkg"
+            base_pkg.mkdir(parents=True)
+            head_pkg.mkdir(parents=True)
+            for pkg in (base_pkg, head_pkg):
+                (pkg / "__init__.py").write_text("", encoding="utf-8")
+                (pkg / "contracts.py").write_text(contracts_module, encoding="utf-8")
+            (base_pkg / "core.py").write_text(base_core, encoding="utf-8")
+            (head_pkg / "core.py").write_text(head_core, encoding="utf-8")
+            out_base = tmpdir / "kg_base"
+            out_head = tmpdir / "kg_head"
+            build_kg(base_pkg, out_base, tenant_id=TENANT)
+            build_kg(head_pkg, out_head, tenant_id=TENANT)
+            result = _review_context(out_base, out_head, base_pkg, head_pkg)
+            return _abstract_rows(result)
+
+    def test_from_import_aliased_base_emits_row(self) -> None:
+        """``from pkg.contracts import BaseThing as BT`` + ``class Widget(BT)`` → row emitted.
+
+        Inversion: without alias normalization the syntactic base ``BT`` shares no qualname
+        suffix with ``BaseThing``, resolution returns no candidate, and the row is silently
+        missed — see test_unresolvable_alias_skips_no_crash for the fail-closed boundary.
+        """
+        base_core = (
+            "from pkg.contracts import BaseThing as BT\n"
+            "\n"
+            "\n"
+            "class Concrete:\n"
+            "    def evaluate(self):\n"
+            "        return 1\n"
+            "\n"
+            "\n"
+            "class Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = (
+            "from pkg.contracts import BaseThing as BT\n"
+            "\n"
+            "\n"
+            "class Widget(BT):\n"
+            "    pass\n"
+        )
+        rows = self._run_multi(_CONTRACTS_MODULE, base_core, head_core)
+        self.assertEqual(len(rows), 1, f"aliased from-import base → row; got {rows}")
+        claim = str(rows[0].get("postable_claim") or "")
+        self.assertIn("counter_names", claim, f"claim must name counter_names; got {claim!r}")
+        self.assertIn("build_it", claim, f"claim must name build_it; got {claim!r}")
+
+    def test_module_alias_dotted_base_emits_row(self) -> None:
+        """``import pkg.contracts as p`` + ``class Widget(p.BaseThing)`` → row emitted.
+
+        The dotted base ``p.BaseThing`` normalizes to ``pkg.contracts.BaseThing`` for
+        resolution. Inversion: without module-alias rewriting the prefix ``p`` is unknown
+        and the qualified-suffix match fails.
+        """
+        base_core = (
+            "import pkg.contracts as p\n"
+            "\n"
+            "\n"
+            "class Concrete:\n"
+            "    def evaluate(self):\n"
+            "        return 1\n"
+            "\n"
+            "\n"
+            "class Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = (
+            "import pkg.contracts as p\n"
+            "\n"
+            "\n"
+            "class Widget(p.BaseThing):\n"
+            "    pass\n"
+        )
+        rows = self._run_multi(_CONTRACTS_MODULE, base_core, head_core)
+        self.assertEqual(len(rows), 1, f"module-aliased dotted base → row; got {rows}")
+        claim = str(rows[0].get("postable_claim") or "")
+        self.assertIn("build_it", claim, f"claim must name build_it; got {claim!r}")
+
+    def test_unresolvable_alias_skips_no_crash(self) -> None:
+        """An aliased base whose target is NOT in the KG → fail-closed skip, no crash, no row.
+
+        ``from pkg.missing import Absent as BT`` + ``class Widget(BT)``: the normalized
+        target ``pkg.missing.Absent`` matches no class entity → skip. Proves normalization
+        keeps the fail-closed contract rather than inventing a match.
+        """
+        base_core = (
+            "from pkg.missing import Absent as BT\n"
+            "\n"
+            "\n"
+            "class Concrete:\n"
+            "    def evaluate(self):\n"
+            "        return 1\n"
+            "\n"
+            "\n"
+            "class Widget(Concrete):\n"
+            "    def evaluate(self):\n"
+            "        return 2\n"
+        )
+        head_core = (
+            "from pkg.missing import Absent as BT\n"
+            "\n"
+            "\n"
+            "class Widget(BT):\n"
+            "    pass\n"
+        )
+        rows = self._run_multi(_CONTRACTS_MODULE, base_core, head_core)
+        self.assertEqual(rows, [], f"unresolvable alias → fail-closed skip; got {rows}")
 
 
 class TestAncestorMroWalk(unittest.TestCase):

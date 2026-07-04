@@ -640,3 +640,67 @@ class TestCapReservationRealPipeline(unittest.TestCase):
                 returned_by.get(rt, 0), 1,
                 f"returned_by_risk_type[{rt!r}] must be >=1; got {returned_by}",
             )
+
+    def test_available_counts_reflect_precap_generated_not_capped(self):
+        """P2: available_count / available_by_risk_type reflect the PRE-CAP generated set;
+        returned_by_risk_type reflects the final packet; truncated = available - returned
+        (including cap-time drops). This is the exact regression the producer-side counts fix.
+        """
+        result, pre_types, _naive_types = self._run_capturing_precap()
+
+        # The producer over-generated beyond the cap — precondition for the fix to matter.
+        self.assertGreater(
+            len(pre_types), PLANNING_CONTEXT_SECTION_LIMIT,
+            f"fixture must generate more rows than the cap; pre={pre_types}",
+        )
+        expected_available_by_type: dict[str, int] = {}
+        for rt in pre_types:
+            if rt:
+                expected_available_by_type[rt] = expected_available_by_type.get(rt, 0) + 1
+
+        hs = result.get("review_hypothesis_status") or {}
+        avail = hs.get("available_by_risk_type") or {}
+        ret = hs.get("returned_by_risk_type") or {}
+        trunc = hs.get("truncated_by_risk_type") or {}
+
+        # available_count is the pre-cap generated total, NOT the post-cap survivors.
+        self.assertEqual(
+            hs.get("available_count"), len(pre_types),
+            f"available_count must equal pre-cap generated total {len(pre_types)}; got {hs.get('available_count')}",
+        )
+        self.assertGreater(
+            hs.get("available_count", 0), hs.get("returned_count", 0),
+            "available_count (pre-cap) must exceed returned_count when the cap dropped rows",
+        )
+        # available_by_risk_type matches the PRE-CAP by-type counts exactly.
+        self.assertEqual(
+            avail, expected_available_by_type,
+            "available_by_risk_type must reflect the PRE-CAP generated set",
+        )
+        # returned reflects the FINAL packet.
+        final_types = [
+            h.get("risk_type") for h in (result.get("review_hypotheses") or [])
+            if isinstance(h, dict) and h.get("risk_type")
+        ]
+        expected_returned: dict[str, int] = {}
+        for rt in final_types:
+            expected_returned[rt] = expected_returned.get(rt, 0) + 1
+        self.assertEqual(ret, expected_returned, "returned_by_risk_type must reflect the final packet")
+        # truncated = available - returned per type, and includes at least one CAP-time drop.
+        for rt, avail_count in avail.items():
+            expected_trunc = avail_count - ret.get(rt, 0)
+            self.assertEqual(
+                trunc.get(rt, 0), expected_trunc,
+                f"truncated_by_risk_type[{rt!r}] must be available - returned",
+            )
+        self.assertGreater(
+            sum(trunc.values()), 0,
+            "cap dropped rows, so truncated_by_risk_type must report the difference",
+        )
+
+    # INVERSION PROOF: if the producer counts are removed (available computed from the
+    # CAPPED original_hypotheses as before), available_count would equal returned_count and
+    # available_by_risk_type would omit the cap-dropped families — this test's
+    # assertGreater(available_count, returned_count) and the available_by_risk_type equality
+    # against the pre-cap set would both fail. Verified by temporarily passing
+    # generated_counts=None in _finalize_review_hypothesis_budget.

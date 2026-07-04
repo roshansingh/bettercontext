@@ -3091,6 +3091,12 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     # row per generated diff-derived risk type survives the slice (deterministic families
     # ranked above inferred_llm) — the cap-time twin of the budget-time survival rule, so
     # a generated diff family is never dropped before by-risk-type truncation counts run.
+    # Capture the by-risk-type counts of the FULL generated set BEFORE the cap. The
+    # cap below discards extra generated rows, so the post-cap list underreports what
+    # was generated. The budget layer's status computation prefers these producer-side
+    # counts for available_count/available_by_risk_type so truncated_by_risk_type
+    # includes cap-time drops (not just budget-time drops).
+    generated_hypothesis_counts = _generated_hypothesis_counts(review_hypotheses)
     review_hypotheses = _cap_review_hypotheses_reserving_diff_families(
         review_hypotheses, PLANNING_CONTEXT_SECTION_LIMIT
     )
@@ -3176,6 +3182,9 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         ),
         "review_hypotheses": review_hypotheses,
         "next_actions": next_actions,
+        # Producer-side pre-cap generated counts (private; consumed and removed by the
+        # review budget layer's hypothesis-status computation, never surfaced to callers).
+        "_generated_hypothesis_counts": generated_hypothesis_counts,
     }
     if _review_context_should_compact_unanchored(
         changed_ranges=changed_ranges,
@@ -3359,6 +3368,25 @@ _CONTRACT_DIFF_SPLICE_CAP = 3
 # Abstract-contract detector: deterministic_static family (reparent → abstract base
 # with unimplemented abstract members). Spliced alongside the other deterministic rows.
 _ABSTRACT_CONTRACT_SPLICE_CAP = 3
+
+
+def _generated_hypothesis_counts(review_hypotheses: list[JsonObject]) -> JsonObject:
+    """Producer-side counts of the FULL generated hypothesis set, before any cap.
+
+    Consumed by the review budget layer to compute available_count /
+    available_by_risk_type / available_risk_types against everything the producer
+    generated — the post-cap list underreports generated evidence. Private packet
+    field (``_generated_hypothesis_counts``), stripped before the packet is returned.
+    """
+    by_risk_type: dict[str, int] = {}
+    for row in review_hypotheses:
+        if isinstance(row, dict) and row.get("risk_type"):
+            rt = str(row["risk_type"])
+            by_risk_type[rt] = by_risk_type.get(rt, 0) + 1
+    return {
+        "available_count": len(review_hypotheses),
+        "by_risk_type": by_risk_type,
+    }
 
 
 def _cap_review_hypotheses_reserving_diff_families(
@@ -4003,6 +4031,14 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
             h for h in (result.get("review_hypotheses") or [])
             if isinstance(h, dict) and h.get("risk_type") == "low_coverage_stylesheet_gap"
         ],
+        # This zero-anchor path drops every non-stylesheet row, so pre-cap counts
+        # describe only the stylesheet rows actually retained here.
+        "_generated_hypothesis_counts": _generated_hypothesis_counts(
+            [
+                h for h in (result.get("review_hypotheses") or [])
+                if isinstance(h, dict) and h.get("risk_type") == "low_coverage_stylesheet_gap"
+            ]
+        ),
         "answerability": answerability,
         "coverage_warnings": result.get("coverage_warnings", []),
         "unsupported_scopes": result.get("unsupported_scopes", []),

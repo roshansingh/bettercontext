@@ -605,6 +605,14 @@ def enforce_review_context_budget(
         max_chars = REVIEW_CONTEXT_BROAD_MAX_CHARS if include_broad_context else REVIEW_CONTEXT_MAX_CHARS
     if not include_broad_context:
         result = _strip_broad_context(result)
+    # Producer-side pre-cap generated counts, if the producer attached them. The packet
+    # already capped review_hypotheses to PLANNING_CONTEXT_SECTION_LIMIT before budgeting,
+    # so original_hypotheses below is the CAPPED set. These counts describe the full
+    # generated set so available_count / available_by_risk_type reflect pre-cap totals and
+    # truncated_by_risk_type includes cap-time drops. Pop it so it never leaks to callers.
+    generated_counts = result.pop("_generated_hypothesis_counts", None)
+    if not isinstance(generated_counts, dict):
+        generated_counts = None
     measured = len(canonical_json(result))
     original_hypotheses = [
         row for row in _list_value(result.get("review_hypotheses")) if isinstance(row, dict)
@@ -618,7 +626,7 @@ def enforce_review_context_budget(
         # Sync mirror and emit status even when no compaction is needed so every packet
         # carries review_hypothesis_status regardless of packet size.
         _finalize_review_hypothesis_budget(
-            result, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+            result, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
         )
         return result
     if not include_broad_context:
@@ -632,7 +640,7 @@ def enforce_review_context_budget(
             original_hypotheses=original_hypotheses,
         )
         _finalize_review_hypothesis_budget(
-            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
         )
         if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
             compact["output_budget"]["exceeded_after_minimization"] = True
@@ -664,7 +672,7 @@ def enforce_review_context_budget(
                 truncated_sections=truncated_sections,
             )
             _finalize_review_hypothesis_budget(
-                backfilled, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+                backfilled, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
             )
             return backfilled
     # Even the tightest pass overshot (rare: dominated by non-row content); signal it like
@@ -674,7 +682,7 @@ def enforce_review_context_budget(
     compact = _protect_review_hypotheses_floor(compact, original_hypotheses, max_chars=max_chars)
     if len(canonical_json(compact)) <= max_chars:
         _finalize_review_hypothesis_budget(
-            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
         )
         return compact
     compact = _review_lead_only_budget_packet(
@@ -685,7 +693,7 @@ def enforce_review_context_budget(
         original_hypotheses=original_hypotheses,
     )
     _finalize_review_hypothesis_budget(
-        compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars
+        compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
     )
     if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
         compact["output_budget"]["exceeded_after_minimization"] = True
@@ -3687,7 +3695,12 @@ def _evict_review_rows_to_fit(result: JsonObject, *, max_chars: int) -> set[str]
     return evicted
 
 
-def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: list[JsonObject]) -> None:
+def _attach_review_hypothesis_status(
+    result: JsonObject,
+    original_hypotheses: list[JsonObject],
+    *,
+    generated_counts: JsonObject | None = None,
+) -> None:
     """Write review_hypothesis_status in-place on result.
 
     Emits the status dict so consumers can distinguish none-generated, budget-dropped,
@@ -3696,20 +3709,43 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
     other rows are evictable, _finalize_review_hypothesis_budget drops it — the hard cap
     always wins over metadata.
 
+    ``original_hypotheses`` is the CAPPED set the budget layer saw (top_review_hypotheses
+    were sliced to PLANNING_CONTEXT_SECTION_LIMIT before budgeting). When the producer
+    attaches pre-cap ``generated_counts`` (available_count + by_risk_type over the FULL
+    generated set), they are preferred for the available-side counts so cap-time drops are
+    reported as truncation rather than silent absence. Absent that, the capped set is used
+    (back-compat for callers/fixtures that do not carry the producer counts).
+
     Fields:
-      available_count — hypotheses generated pre-budget
+      available_count — hypotheses generated pre-budget AND pre-cap
       returned_count — top-level survivors
       answer_packet_returned_count — mirror survivors in review_answer_packet.top_review_hypotheses
       truncated_count — available - returned
       reason — "none_generated" | "budget" | "low_coverage" | null
-      available_risk_types — sorted list of risk_type strings from the pre-budget generated set
+      available_risk_types — sorted list of risk_type strings from the pre-cap generated set
         (not truncated by budget; bounded at 12 entries; empty when no hypotheses generated)
-      available_by_risk_type — counts over ALL generated hypotheses before budget truncation
+      available_by_risk_type — counts over ALL generated hypotheses before cap+budget truncation
       returned_by_risk_type — counts over hypotheses present in the final packet
       truncated_by_risk_type — available minus returned per type; zero entries omitted
     """
     _MAX_AVAILABLE_RISK_TYPES = 12
-    available = len(original_hypotheses)
+    capped_by_risk_type: dict[str, int] = {}
+    for h in original_hypotheses:
+        if isinstance(h, dict) and h.get("risk_type"):
+            rt = str(h["risk_type"])
+            capped_by_risk_type[rt] = capped_by_risk_type.get(rt, 0) + 1
+    if generated_counts is not None:
+        raw_avail = generated_counts.get("available_count")
+        available = int(raw_avail) if isinstance(raw_avail, int) else len(original_hypotheses)
+        raw_by_type = generated_counts.get("by_risk_type")
+        available_by_risk_type: dict[str, int] = (
+            {str(k): int(v) for k, v in raw_by_type.items() if isinstance(v, int)}
+            if isinstance(raw_by_type, dict)
+            else dict(capped_by_risk_type)
+        )
+    else:
+        available = len(original_hypotheses)
+        available_by_risk_type = dict(capped_by_risk_type)
     final_hyps = [h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)]
     returned = len(final_hyps)
     answer_packet = result.get("review_answer_packet")
@@ -3731,14 +3767,7 @@ def _attach_review_hypothesis_status(result: JsonObject, original_hypotheses: li
         reason = "budget"
     else:
         reason = None
-    available_risk_types = sorted(
-        {str(h.get("risk_type") or "") for h in original_hypotheses if isinstance(h, dict) and h.get("risk_type")}
-    )[:_MAX_AVAILABLE_RISK_TYPES]
-    available_by_risk_type: dict[str, int] = {}
-    for h in original_hypotheses:
-        if isinstance(h, dict) and h.get("risk_type"):
-            rt = str(h["risk_type"])
-            available_by_risk_type[rt] = available_by_risk_type.get(rt, 0) + 1
+    available_risk_types = sorted(available_by_risk_type)[:_MAX_AVAILABLE_RISK_TYPES]
     returned_by_risk_type: dict[str, int] = {}
     for h in final_hyps:
         if h.get("risk_type"):
@@ -4371,6 +4400,7 @@ def _finalize_review_hypothesis_budget(
     *,
     original_review_leads: JsonObject,
     max_chars: int,
+    generated_counts: JsonObject | None = None,
 ) -> None:
     """Sync the answer-packet mirror, attach review_hypothesis_status, and keep under the cap.
 
@@ -4417,14 +4447,14 @@ def _finalize_review_hypothesis_budget(
     # Sync mirror within budget: keep as many top-level hypotheses as fit in the mirror,
     # starting from the highest-ranked (first). If none fit, mirror is empty — recorded in status.
     _sync_review_hypothesis_mirror_within_budget(result, max_chars=max_chars)
-    _attach_review_hypothesis_status(result, original_hypotheses)
+    _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
     # The truncated_sections bookkeeping itself costs chars, so iterate until stable.
     for _ in range(5):
         evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
         if not evicted:
             break
         _sync_review_lead_status_from_packet(result)
-        _attach_review_hypothesis_status(result, original_hypotheses)
+        _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
         budget = result.get("output_budget")
         if isinstance(budget, dict):
             budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
@@ -4432,11 +4462,11 @@ def _finalize_review_hypothesis_budget(
     # approximately size-neutral, so re-run the eviction/status cycle if the cap moved.
     if _repair_cluster_coverage(result, original_review_leads, original_hypotheses, max_chars=max_chars):
         _sync_review_lead_status_from_packet(result)
-        _attach_review_hypothesis_status(result, original_hypotheses)
+        _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
         evicted = _evict_review_rows_to_fit(result, max_chars=max_chars)
         if evicted:
             _sync_review_lead_status_from_packet(result)
-            _attach_review_hypothesis_status(result, original_hypotheses)
+            _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
             budget = result.get("output_budget")
             if isinstance(budget, dict):
                 budget["truncated_sections"] = sorted(set(budget.get("truncated_sections") or []) | evicted)
@@ -4452,7 +4482,8 @@ def _finalize_review_hypothesis_budget(
     # bulk, so it may be funded by evicting low-priority rows (leads last); any lead rows
     # it evicts become part of the omitted counts it reports.
     _attach_truncation_summary_within_budget(
-        result, original_review_leads, original_hypotheses, max_chars=max_chars
+        result, original_review_leads, original_hypotheses, max_chars=max_chars,
+        generated_counts=generated_counts,
     )
     # The funding eviction above may have dropped further lead rows; reconcile again so
     # hypotheses never cite lead_ids that no longer exist in the packet.
@@ -4555,6 +4586,7 @@ def _attach_truncation_summary_within_budget(
     original_hypotheses: list[JsonObject],
     *,
     max_chars: int,
+    generated_counts: JsonObject | None = None,
 ) -> None:
     """Attach output_budget.truncation_summary without ever exceeding the cap.
 
@@ -4593,7 +4625,7 @@ def _attach_truncation_summary_within_budget(
             if not evicted:
                 return
             _sync_review_lead_status_from_packet(result)
-            _attach_review_hypothesis_status(result, original_hypotheses)
+            _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
             budget = result.get("output_budget")
             if not isinstance(budget, dict):
                 return
@@ -4620,7 +4652,7 @@ def _attach_truncation_summary_within_budget(
                 break
         if funding_evicted:
             _sync_review_lead_status_from_packet(result)
-            _attach_review_hypothesis_status(result, original_hypotheses)
+            _attach_review_hypothesis_status(result, original_hypotheses, generated_counts=generated_counts)
             budget = result.get("output_budget")
             if isinstance(budget, dict):
                 budget["truncated_sections"] = sorted(
