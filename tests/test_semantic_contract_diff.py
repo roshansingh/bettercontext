@@ -3844,7 +3844,11 @@ class TestViolatedInvariantSchema(unittest.TestCase):
                              f"valid-schema response must be 'active'; got {valid_status!r}")
 
     def test_oversized_new_field_dropped(self) -> None:
-        """violated_invariant > _DROP_VIOLATED_INVARIANT (1200) → item dropped entirely."""
+        """violated_invariant > _DROP_VIOLATED_INVARIANT (1200) → item dropped entirely.
+
+        When it is the ONLY item, the response parses but emits zero rows, so the status
+        must be honest ('failed:no_valid_claims'), never a silent 'active'.
+        """
         from source.kg.query.semantic_contract_diff import semantic_contract_diff
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3853,12 +3857,59 @@ class TestViolatedInvariantSchema(unittest.TestCase):
             entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
 
             client = _FakeClient(response=[_claim(violated_invariant="z" * 1500)])
-            rows, _status = semantic_contract_diff(
+            rows, status = semantic_contract_diff(
                 base_snapshot=snap, head_snapshot=snap,
                 base_root=base_dir, head_root=head_dir,
                 changed_symbols=entity_dicts, client=client,
             )
             self.assertEqual(rows, [], "oversized violated_invariant (>1200) must be dropped")
+            self.assertGreater(client.call_count, 0,
+                               "test must attempt an LLM call for the status to be honest")
+            self.assertEqual(status, "failed:no_valid_claims",
+                             f"oversized-only response emits zero rows; status must be honest, not 'active'; got {status!r}")
+
+    def test_all_items_dropped_by_thresholds_produces_no_valid_claims_status(self) -> None:
+        """Schema-VALID items all dropped by _DROP_* thresholds → zero rows, honest status.
+
+        Regression for the drop-threshold gap: items pass _validate_item (so the old
+        valid_item_count-based gate saw them as valid) but every one is then dropped by an
+        oversized-field check, emitting zero rows. Keying the status on EMITTED rows makes
+        this report 'failed:no_valid_claims' instead of a silent 'active'.
+        """
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+
+            # Two schema-valid items, each oversized on a DIFFERENT field → both dropped.
+            client = _FakeClient(response=[
+                _claim(claim="a" * 1500),                 # > _DROP_CLAIM
+                _claim(violated_invariant="z" * 1500),    # > _DROP_VIOLATED_INVARIANT
+            ])
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=client,
+            )
+            self.assertGreater(client.call_count, 0,
+                               "test must attempt an LLM call for the status to be honest")
+            self.assertEqual(rows, [], "all schema-valid items dropped by thresholds → zero rows")
+            self.assertEqual(status, "failed:no_valid_claims",
+                             f"all-items-dropped must be honest, not 'active'; got {status!r}")
+
+            # Inversion proof: the SAME pipeline with an in-range item emits a row and 'active',
+            # proving the status is driven by emitted rows, not a constant.
+            valid_client = _FakeClient(response=[_claim()])
+            valid_rows, valid_status = semantic_contract_diff(
+                base_snapshot=snap, head_snapshot=snap,
+                base_root=base_dir, head_root=head_dir,
+                changed_symbols=entity_dicts, client=valid_client,
+            )
+            self.assertEqual(len(valid_rows), 1, "in-range item must emit a row")
+            self.assertEqual(valid_status, "active",
+                             f"emitted-row response must be 'active'; got {valid_status!r}")
 
     def test_oversized_new_field_clamped(self) -> None:
         """violated_invariant of 500 chars → clamped to 300 in the row."""

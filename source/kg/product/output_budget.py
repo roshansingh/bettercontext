@@ -5105,18 +5105,33 @@ def _finalize_review_hypothesis_budget(
     # cannot shrink them. Trim the bounded status affordances until the packet fits.
     if max_chars is not None and _current_chars(result) > max_chars:
         _trim_review_quality_status_to_fit(result, max_chars=max_chars)
+        # attribution_labels is the LAST affordance dropped: it is funded first above and is
+        # the most valuable head-start affordance, so it survives every status trim. But it IS
+        # droppable — it fit at attach time, then review_quality_status growth can push the
+        # packet over the cap. If trimming the status affordances is not enough, drop the
+        # labels and re-measure BEFORE declaring the packet irreducible; otherwise the packet
+        # would be marked exceeded_after_minimization with a droppable affordance still present.
+        if _current_chars(result) > max_chars:
+            answer_packet = result.get("review_answer_packet")
+            if isinstance(answer_packet, dict) and "attribution_labels" in answer_packet:
+                answer_packet.pop("attribution_labels", None)
         # Invariant enforcement. A residual overshoot is legitimate ONLY when irreducible
         # protected content (e.g. the floor-of-1 review_hypotheses row) alone exceeds the
         # cap — that case is flagged via output_budget.exceeded_after_minimization, never
-        # silently hidden. But an overshoot caused by the trimmable status affordances is a
-        # BUG: after the trim ladder, review_quality_status must carry neither
-        # suggested_followups nor inspection_areas when the packet is still over the cap.
+        # silently hidden. But an overshoot caused by the trimmable status affordances or the
+        # droppable attribution_labels affordance is a BUG: after the trim ladder, neither
+        # may remain when the packet is still over the cap.
         if _current_chars(result) > max_chars:
             _status = result.get("review_quality_status")
             if isinstance(_status, dict):
                 assert "suggested_followups" not in _status and "inspection_areas" not in _status, (
                     "review packet over hard cap with trimmable status affordances still "
                     f"present: {sorted(k for k in ('suggested_followups', 'inspection_areas') if k in _status)}"
+                )
+            _ap = result.get("review_answer_packet")
+            if isinstance(_ap, dict):
+                assert "attribution_labels" not in _ap, (
+                    "review packet over hard cap with droppable attribution_labels still present"
                 )
             budget = result.get("output_budget")
             if isinstance(budget, dict):

@@ -449,7 +449,6 @@ def semantic_contract_diff(
     calls_failed = 0
     parse_miss_count = 0
     parsed_ok_count = 0  # responses that parsed to a usable list (even if zero valid items)
-    valid_item_count = 0  # items that passed _validate_item across all parsed responses
     auth_error_seen = False
     total_prompt_tokens: int | None = None
     total_completion_tokens: int | None = None
@@ -550,7 +549,6 @@ def semantic_contract_diff(
                 break
             if not _validate_item(item):
                 continue
-            valid_item_count += 1
             claim_key = str(item.get("claim", ""))
             if claim_key in seen_claims:
                 continue
@@ -722,16 +720,18 @@ def semantic_contract_diff(
         and parsed_ok_count == 0
         and parse_miss_count > 0
     )
-    # Schema-invalid honesty: a response can parse as a JSON list yet have EVERY item fail
-    # _validate_item (e.g. the old five-key shape after the schema grew). That yields zero
-    # rows but is NOT a clean run, so it must not report "active" (silent nothing). When
-    # calls were attempted, >= 1 response parsed, and no item validated overall, surface
-    # "failed:no_valid_claims". Gated on rows being empty so any usable row keeps the
-    # active/partial path.
+    # Schema-invalid honesty: a response can parse as a JSON list yet emit ZERO rows — either
+    # because every item failed _validate_item (e.g. the old five-key shape after the schema
+    # grew) OR because every schema-valid item was then dropped by the _DROP_* oversized-field
+    # thresholds (or fully deduped). All three yield zero rows but are NOT a clean run, so they
+    # must not report "active" (silent nothing). Key on EMITTED rows (post-dedupe,
+    # post-drop-threshold), not valid_item_count, so all-items-dropped is covered too: when
+    # calls were attempted, >= 1 response parsed, and no item survived into rows, surface
+    # "failed:no_valid_claims". `not rows` also keeps any usable row on the active/partial path.
     no_valid_claims = (
         calls_attempted > 0
         and parsed_ok_count > 0
-        and valid_item_count == 0
+        and not rows
     )
 
     if rows and calls_failed > 0:

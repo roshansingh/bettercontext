@@ -1458,6 +1458,93 @@ class TestTandemClippingCapInvariant(unittest.TestCase):
         self._assert_invariants(result, cap, entry_size, "enforce_budget_7544")
 
 
+class TestAttributionLabelsDroppedBeforeIrreducible(unittest.TestCase):
+    """P1: the final hard-cap fallback must drop review_answer_packet.attribution_labels
+    before declaring the packet irreducible (exceeded_after_minimization).
+
+    Repro: attribution_labels fit at attach time; review_quality_status growth/presence then
+    pushes the packet over the cap. After the trim ladder empties the status affordances the
+    packet is STILL over — but only because of the droppable attribution_labels. Before the
+    fix, the fallback trimmed status, saw the packet over cap, and set exceeded_after_minimization
+    with a droppable affordance still present. cap=1440 was verified to be a cap where the label
+    drop is load-bearing: without labels the packet fits, re-adding them breaches, and status
+    carries no trimmable affordances.
+    """
+
+    @staticmethod
+    def _make_packet() -> tuple[dict, list[dict]]:
+        surviving = {
+            "hypothesis_id": "hypothesis:contract_semantic_diff:aaaa000000000001",
+            "label": "H1",
+            "risk_type": "contract_semantic_diff",
+            "specificity": "high",
+            "confidence": "medium",
+            "why": "Risk.",
+            "postable_claim": "claim one",
+            "supporting_lead_ids": [],
+            "evidence_refs": [{"repo": "r", "path": "a.py", "line_start": 1, "line_end": 5}],
+            "source_checks": [],
+        }
+        review_quality_status = {
+            "coverage_status": "useful",
+            "recommended_action": "use_supercontext_packet",
+            "review_readiness": "packet_ready",
+            "specificity": "high",
+            "base_diff_status": "present",
+            # Pre-existing (S1) suggested_followups: bulk that the trim ladder can shed, so
+            # once trimmed the ONLY thing keeping the packet over cap is attribution_labels.
+            "suggested_followups": [{"followup": f"f{i}" + ("x" * 60)} for i in range(3)],
+        }
+        packet = {
+            "tool": "review_context",
+            "status": "ok",
+            "review_hypotheses": [surviving],
+            "review_answer_packet": {"top_review_hypotheses": [surviving], "status": "ok"},
+            "review_quality_status": review_quality_status,
+            "review_leads": {
+                "changed_symbols": [], "direct_callers": [], "direct_callees": [],
+                "transitive_callers": [], "source_coordinates": [],
+            },
+            "output_budget": {
+                "truncated": False, "measured_chars": 0, "max_chars": 0, "truncated_sections": [],
+            },
+        }
+        return packet, [surviving]
+
+    def test_labels_dropped_not_declared_irreducible(self):
+        from copy import deepcopy
+        cap = 1_440
+        packet, original_hyps = self._make_packet()
+        _finalize_review_hypothesis_budget(
+            packet, deepcopy(original_hyps), original_review_leads={}, max_chars=cap
+        )
+        size = len(canonical_json(packet))
+        ap = packet["review_answer_packet"]
+        budget = packet["output_budget"]
+        # Fix: packet fits, no irreducible flag, and the droppable affordance is gone.
+        self.assertLessEqual(size, cap, f"packet must fit the hard cap; size={size} cap={cap}")
+        self.assertNotIn(
+            "exceeded_after_minimization", budget,
+            "packet must NOT be declared irreducible when dropping attribution_labels restores the cap",
+        )
+        self.assertNotIn(
+            "attribution_labels", ap,
+            "droppable attribution_labels must be dropped in the final fallback",
+        )
+        # Inversion proof: re-attaching the dropped affordance (the REAL affordance, same
+        # instruction the producer attaches) breaches the cap, so the drop was load-bearing
+        # (not vacuous), and status carries no trimmable affordances.
+        from source.kg.product.output_budget import _ATTRIBUTION_LABELS_INSTRUCTION
+        ap["attribution_labels"] = {"labels": ["H1"], "instruction": _ATTRIBUTION_LABELS_INSTRUCTION}
+        self.assertGreater(
+            len(canonical_json(packet)), cap,
+            "re-attaching attribution_labels must breach the cap (proves the drop was load-bearing)",
+        )
+        status = packet["review_quality_status"]
+        self.assertNotIn("suggested_followups", status)
+        self.assertNotIn("inspection_areas", status)
+
+
 class TestAliasedTandemClipDoesNotDoubleEvict(unittest.TestCase):
     """Regression: aliased packet (top-level and review_leads sharing the same list object,
     as _sync_compact_review_leads produces) must lose exactly 1 row per eviction iteration,
