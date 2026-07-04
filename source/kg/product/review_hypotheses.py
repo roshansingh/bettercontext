@@ -45,28 +45,40 @@ _SPECIFIC_CLASS_FAMILIES: frozenset[str] = frozenset(
     }
 )
 
-# B2: Per-family specificity class. "high" = code_risk_signal-driven or A2 contract-diff;
-# "medium" = convention-triggered specific families; "low" = generic families.
-# test_locks_in_regression is "low" by default: it lacks a named runtime invariant in its
-# current form and must not outrank high-specificity families in top_review_hypotheses.
-# It becomes "medium" only if signal/delta-backed evidence attaches (not yet wired).
+# B2: Per-family specificity class. The class is a property of WHAT the family asserts,
+# applied uniformly to every family (not tuned to any one repo or eval):
+#   "high"   = asserts a concrete production-RUNTIME invariant anchored to CHANGED code
+#              (a named behavioural contract on the symbol/edge the PR touched).
+#   "medium" = a convention-grade or indirectly-anchored production concern (triggered by
+#              a naming/structural convention, or asserting a coverage/process concern
+#              about production code rather than a runtime invariant on it).
+#   "low"    = a generic suspicion with no named invariant (broad contract-drift, or a
+#              "we can't see this, inspect manually" coverage-limitation note).
+# TEST-SURFACE families — those whose asserted claim is about the TEST surface (a test
+# reference removed, a test locking in behaviour, a test/config edit masking runtime, a
+# missing test for a destructive op) — describe test-side or coverage concerns, never a
+# production-runtime invariant on the changed code, so they get at MOST "medium".
 _FAMILY_SPECIFICITY: dict[str, str] = {
-    # High: driven by code_risk_signal evidence or A2 contract-diff
+    # High: assert a concrete production-runtime invariant on changed code (signal-driven).
     "async_side_effect_lifecycle_drift": "high",
     "swallowed_exception_state_drift": "high",
     "call_result_identity_comparison_semantics": "high",
-    "destructive_mutation_test_gap": "high",
-    # Medium: convention-triggered specific families
+    # Medium: convention-grade / indirectly-anchored production concerns.
     "component_list_render_identity_drift": "medium",
     "hook_gate_render_mismatch": "medium",
-    "low_coverage_stylesheet_gap": "medium",
-    # Low: test_locks lacks a named runtime invariant; treated low until signal-backed
+    # Medium: test-surface family — asserts a missing-test (coverage) concern on a
+    # destructive production call, not a runtime invariant on the changed code itself.
+    "destructive_mutation_test_gap": "medium",
+    # Low: generic suspicion / coverage-limitation, no named runtime invariant.
+    "low_coverage_stylesheet_gap": "low",
+    # Low: test-surface family — asserts test assertions may lock in a regression.
     "test_locks_in_regression": "low",
-    # Low: generic families
+    # Low: generic contract-drift suspicions.
     "direct_call_contract_drift": "low",
     "framework_contract_drift": "low",
     "runtime_endpoint_or_event_contract_drift": "low",
     "application_surface_contract_drift": "low",
+    # Low: test-surface family — asserts a test/config edit may mask a runtime change.
     "test_or_config_masks_runtime_change": "low",
 }
 
@@ -911,6 +923,34 @@ def _short_name(sym: JsonObject) -> str:
     return str(sym.get("name") or "")
 
 
+def _matched_symbol_cause(sym: JsonObject) -> JsonObject | None:
+    """Build a cause coordinate from the symbol the detector matched.
+
+    Reads only the coordinate fields the symbol row already carries (from
+    _symbol_result: repo/path/line/end_line) and maps them to the cause envelope
+    (repo/path/line_start/line_end). Never fabricates: if the matched symbol has no
+    path, no cause is emitted. This is a dead-metadata fix — the family already
+    resolved this exact symbol to build its evidence_refs and postable_claim; the
+    coordinate it matched must not be dropped from the scored cause field.
+    """
+    cause: JsonObject = {}
+    repo = sym.get("repo")
+    if repo is not None:
+        cause["repo"] = repo
+    path = sym.get("path")
+    if path is not None:
+        cause["path"] = path
+    line = sym.get("line")
+    if line is not None:
+        cause["line_start"] = line
+    end_line = sym.get("end_line")
+    if end_line is not None:
+        cause["line_end"] = end_line
+    # A cause anchored to nothing is useless (and the changed-prod-file boost keys on
+    # cause path); require a path before emitting.
+    return cause if "path" in cause else None
+
+
 def _is_component_symbol(sym: JsonObject) -> bool:
     name = _short_name(sym)
     path = sym.get("path") or ""
@@ -1015,14 +1055,16 @@ def _component_list_render_identity_drift(
     negative_checks = [
         "If the component renders a static list with stable keys and no memoization dependency changed, identity drift is unlikely.",
     ]
-    # Build postable_claim from first component symbol
+    # Build postable_claim + cause from first component symbol (the one the detector matched).
     postable_claim: str | None = None
+    cause: JsonObject | None = None
     if component_syms:
         first_comp = _short_name(component_syms[0])
         if first_comp:
             postable_claim = (
                 f"{first_comp} has changed; verify list keys and child rendering identity are stable."
             )
+        cause = _matched_symbol_cause(component_syms[0])
     return _make_hypothesis(
         risk_type="component_list_render_identity_drift",
         confidence=confidence,
@@ -1032,6 +1074,7 @@ def _component_list_render_identity_drift(
         supporting_lead_ids=lead_ids[:10],
         negative_checks=negative_checks,
         postable_claim=postable_claim,
+        cause=cause,
     )
 
 
@@ -1131,14 +1174,16 @@ def _hook_gate_render_mismatch(
     negative_checks = [
         "If the hook's return shape is unchanged and only its internal implementation changed, render gate mismatch is unlikely.",
     ]
-    # postable_claim from first hook symbol
+    # postable_claim + cause from first hook symbol (the one the detector matched).
     postable_claim: str | None = None
+    cause: JsonObject | None = None
     if hook_syms:
         first_hook = _short_name(hook_syms[0])
         if first_hook:
             postable_claim = (
                 f"{first_hook} return contract may have shifted; components consuming it may render incorrectly."
             )
+        cause = _matched_symbol_cause(hook_syms[0])
     return _make_hypothesis(
         risk_type="hook_gate_render_mismatch",
         confidence=confidence,
@@ -1148,6 +1193,7 @@ def _hook_gate_render_mismatch(
         supporting_lead_ids=lead_ids[:10],
         negative_checks=negative_checks,
         postable_claim=postable_claim,
+        cause=cause,
     )
 
 

@@ -2362,8 +2362,9 @@ def _review_context_properties() -> JsonObject:
             "type": "string",
             "description": (
                 "Optional path to a base KG snapshot directory. When provided and loadable, runs a contract-diff "
-                "against the current snapshot and splices guard_call_removed_drift / responsibility_moved_drift / "
-                "test_reference_removed_drift hypotheses (specificity=high) into the review_hypotheses pipeline. "
+                "against the current snapshot and splices guard_call_removed_drift / responsibility_moved_drift "
+                "(specificity=high) and test_reference_removed_drift (specificity=medium; a test-surface concern) "
+                "hypotheses into the review_hypotheses pipeline. "
                 "Tenant mismatch or unloadable base snapshot is reported in review_quality_status.reason, never an error."
             ),
         },
@@ -3262,7 +3263,8 @@ def _build_review_quality_status(
     for h in review_hypotheses:
         if not isinstance(h, dict):
             continue
-        # Contract-diff families always injected as "high" specificity; other families use _FAMILY_SPECIFICITY
+        # Spliced rows carry their own specificity (see _CONTRACT_DIFF_SPECIFICITY); other
+        # families fall back to _FAMILY_SPECIFICITY.
         spec = h.get("specificity") or _FAMILY_SPECIFICITY.get(str(h.get("risk_type") or ""), "low")
         if spec in ("high", "medium"):
             specific_count += 1
@@ -3384,10 +3386,21 @@ def _build_suggested_followups(
     return followups[:3]
 
 
-# Contract-diff families treated as "high" specificity when spliced into review_hypotheses.
+# Contract-diff families spliced into review_hypotheses.
 _CONTRACT_DIFF_FAMILIES = frozenset(
     {"guard_call_removed_drift", "responsibility_moved_drift", "test_reference_removed_drift"}
 )
+# Per-family specificity for spliced contract-diff rows. A removed/moved CALLS edge on a
+# surviving PRODUCTION symbol asserts a concrete production-runtime invariant on changed
+# code → "high". test_reference_removed_drift asserts that a fact from a TEST-classified
+# path was removed — a test-surface (coverage) concern, never a production-runtime
+# invariant, so it gets at most "medium" (mirrors the test-surface rule in
+# review_hypotheses._FAMILY_SPECIFICITY). Missing entries default "medium" (never "high").
+_CONTRACT_DIFF_SPECIFICITY: dict[str, str] = {
+    "guard_call_removed_drift": "high",
+    "responsibility_moved_drift": "high",
+    "test_reference_removed_drift": "medium",
+}
 # Maximum contract-diff hypotheses to splice per family (avoid packet explosion).
 _CONTRACT_DIFF_SPLICE_CAP = 3
 
@@ -3648,19 +3661,21 @@ def _splice_contract_diff_hypotheses(
     changed_files: list[str],
     review_hypotheses: list[JsonObject],
 ) -> tuple[list[JsonObject], str | None]:
-    """Run contract_diff against base_snapshot_dir and splice high-specificity rows.
+    """Run contract_diff against base_snapshot_dir and splice contract-diff rows.
 
     Returns (merged_hypotheses, note_string).
     note_string is None on success; a coverage-honest message on tenant mismatch or
     load failure (never raises).
 
     Spliced rows carry:
-      specificity = "high"
+      specificity = per-family (_CONTRACT_DIFF_SPECIFICITY): "high" for production-edge
+        families (guard/moved), "medium" for the test-surface family
+        (test_reference_removed_drift)
       cause = first before_ref (path + line_start)
       consequence = first after_ref (path + line_start)
       source_spans = up to 4 evidence refs (before_refs + after_refs capped)
       evidence_refs = same as source_spans
-    High-specificity rows are inserted at the front of review_hypotheses so they rank
+    Spliced rows are inserted at the front of review_hypotheses so they rank
     before generic families; existing hypothesis order is preserved after them.
     """
     try:
@@ -3760,7 +3775,7 @@ def _splice_contract_diff_hypotheses(
             "hypothesis_id": hypothesis_id,
             "label": hypothesis_label(risk_type, hypothesis_id),
             "risk_type": risk_type,
-            "specificity": "high",
+            "specificity": _CONTRACT_DIFF_SPECIFICITY.get(risk_type, "medium"),
             "confidence": "medium",
             "derivation": "deterministic_static",
             "concrete_invariant": h.get("concrete_invariant", ""),

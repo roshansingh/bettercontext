@@ -840,6 +840,24 @@ class TestReviewContextContractDiffSplice(unittest.TestCase):
         rqs = result.get("review_quality_status") or {}
         self.assertEqual(rqs.get("specificity"), "high")
 
+    def test_test_reference_removed_drift_is_medium_not_high(self) -> None:
+        """Inversion (test-surface rule): the fixture removes a test's call to alpha, so a
+        test_reference_removed_drift row is spliced. Its claim is about the TEST surface (a
+        fact from a test-classified path was removed), never a production-runtime invariant,
+        so it must be "medium" — not "high" like the production-edge guard/moved families."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base, head = _build_two_commit_pair(Path(tmpdir))
+            result = self._review_context(head, {"base_snapshot": str(base)})
+
+        hyps = [h for h in result.get("review_hypotheses") or [] if isinstance(h, dict)]
+        test_rows = [h for h in hyps if h.get("risk_type") == "test_reference_removed_drift"]
+        self.assertGreaterEqual(len(test_rows), 1, "test_reference_removed_drift must be spliced in")
+        self.assertEqual(test_rows[0]["specificity"], "medium")
+        # And the production-edge families in the same splice stay "high" (contrast).
+        guard = [h for h in hyps if h.get("risk_type") == "guard_call_removed_drift"]
+        self.assertGreaterEqual(len(guard), 1)
+        self.assertEqual(guard[0]["specificity"], "high")
+
     def test_splice_enters_answer_packet_mirror(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base, head = _build_two_commit_pair(Path(tmpdir))

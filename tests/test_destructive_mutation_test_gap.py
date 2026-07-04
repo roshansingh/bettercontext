@@ -88,6 +88,9 @@ class TestDestructiveMutationTestGap(unittest.TestCase):
         self.assertIn("concrete_invariant", h)
         self.assertIn("hypothesis_id", h)
         self.assertTrue(h["hypothesis_id"].startswith("hypothesis:destructive_mutation_test_gap:"))
+        # Test-surface family (asserts a MISSING-TEST coverage concern, not a production-
+        # runtime invariant on changed code) → at most "medium", never "high".
+        self.assertEqual(h["specificity"], "medium")
 
     def test_negative_delete_with_test_file_absent(self):
         """Case 2: changed symbol calls .delete, test file in changed_files → no hypothesis."""
