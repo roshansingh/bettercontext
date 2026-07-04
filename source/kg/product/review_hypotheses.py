@@ -188,6 +188,41 @@ def _structural_noise_score(
     return score
 
 
+def _structural_score_inputs(
+    changed_files: list[str],
+    changed_symbols: list[JsonObject] | None,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Build the (changed_file_set, changed_qualnames) frozensets the scorer consumes.
+
+    Shared by apply_structural_noise_downranking and score_hypothesis_row so the peer-group
+    reorder and the seat-allocation policy score rows against the exact same inputs.
+    """
+    changed_file_set = frozenset(
+        _normalize_path(str(p)) for p in changed_files if isinstance(p, str) and p
+    )
+    changed_qualnames = frozenset(
+        str(s.get("qualname") or s.get("qualified_name") or "")
+        for s in (changed_symbols or [])
+        if isinstance(s, dict) and (s.get("qualname") or s.get("qualified_name"))
+    )
+    return changed_file_set, changed_qualnames
+
+
+def score_hypothesis_row(
+    row: JsonObject,
+    changed_files: list[str],
+    changed_symbols: list[JsonObject] | None = None,
+) -> float:
+    """Public structural score for one hypothesis row (higher = keep).
+
+    Wraps the same _structural_noise_score used by apply_structural_noise_downranking so
+    seat allocation (output_budget.plan_hypothesis_seats) and the peer-group reorder share
+    one scoring rule. See _structural_noise_score for the signal definitions.
+    """
+    changed_file_set, changed_qualnames = _structural_score_inputs(changed_files, changed_symbols)
+    return _structural_noise_score(row, changed_file_set, changed_qualnames)
+
+
 def apply_structural_noise_downranking(
     hypotheses: list[JsonObject],
     changed_files: list[str],
@@ -209,14 +244,7 @@ def apply_structural_noise_downranking(
     row (concrete failure mode, changed-prod-file cause) rises. Ties keep prior order.
     Does not cap or drop rows.
     """
-    changed_file_set = frozenset(
-        _normalize_path(str(p)) for p in changed_files if isinstance(p, str) and p
-    )
-    changed_qualnames = frozenset(
-        str(s.get("qualname") or s.get("qualified_name") or "")
-        for s in (changed_symbols or [])
-        if isinstance(s, dict) and (s.get("qualname") or s.get("qualified_name"))
-    )
+    changed_file_set, changed_qualnames = _structural_score_inputs(changed_files, changed_symbols)
 
     # Group original list indices by (derivation, risk_type). Rows are reordered only
     # among their group's own positions, so the sequence of group-slots is preserved.

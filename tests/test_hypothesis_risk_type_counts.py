@@ -679,12 +679,12 @@ class TestCapReservationRealPipeline(unittest.TestCase):
         captured: dict = {}
         original = mcp_tools_module._cap_review_hypotheses_reserving_diff_families
 
-        def _spy(rows, limit):
+        def _spy(rows, limit, **kwargs):
             captured["pre"] = [r.get("risk_type") for r in rows if isinstance(r, dict)]
             captured["naive"] = [
                 r.get("risk_type") for r in rows[:limit] if isinstance(r, dict)
             ]
-            return original(rows, limit)
+            return original(rows, limit, **kwargs)
 
         with tempfile.TemporaryDirectory() as td:
             tmpdir = Path(td)
@@ -819,3 +819,122 @@ class TestCapReservationRealPipeline(unittest.TestCase):
     # assertGreater(available_count, returned_count) and the available_by_risk_type equality
     # against the pre-cap set would both fail. Verified by temporarily passing
     # generated_counts=None in _finalize_review_hypothesis_budget.
+
+
+# ---------------------------------------------------------------------------
+# Part D: score-driven seat allocation (field-replay regressions)
+# ---------------------------------------------------------------------------
+#
+# The seat policy (plan_hypothesis_seats) allocates slots to families by their best row's
+# STRUCTURAL score, not by derivation tier. Derivation is a tiebreak only on equal scores.
+# These two regressions reproduce the geometry of two real field-replay failures the old
+# derivation-first policy handled wrongly:
+#   * Sentry: a test-helper (test+test cause/consequence) deterministic family outranked a
+#     production-file inferred family purely because deterministic > inferred.
+#   * Cal.com: a high-value non-diff production row lost its slot to noisy diff families
+#     (external/module-root call targets) because diff families had a reserved carve-out.
+# Names below are generic; the rules key on structural signals only.
+
+class TestScoreDrivenSeatAllocation(unittest.TestCase):
+    def test_sentry_geometry_low_score_deterministic_family_truncated(self):
+        """3 slots: high-score deterministic (concrete failure mode, +3), low-score
+        deterministic (test+test cause/consequence, -2), mid-score inferred_llm (changed
+        production-file cause, +2), plus a neutral next-best family (0). The low-score
+        deterministic family must be the one truncated — its derivation tier does NOT save
+        it under the score-driven policy."""
+        high_det = {
+            "risk_type": "abstract_contract_unimplemented",
+            "derivation": "deterministic_static",
+            "unimplemented_members": ["do_thing"],  # concrete failure mode → +3
+        }
+        low_det = {
+            "risk_type": "responsibility_moved_drift",
+            "derivation": "deterministic_static",
+            "cause": {"path": "tests/test_mod.py", "line_start": 1},
+            "consequence": {"path": "tests/test_other.py", "line_start": 2},  # both test → -2
+        }
+        mid_inferred = {
+            "risk_type": "contract_semantic_diff",
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/core.py", "line_start": 3},  # changed prod file → +2
+        }
+        next_best = {  # neutral non-diff family, score 0
+            "risk_type": "swallowed_exception_state_drift",
+            "derivation": None,
+        }
+        # low_det placed FIRST so a naive slice / derivation-first order would keep it.
+        ordered = [low_det, high_det, mid_inferred, next_best]
+        changed_files = ["src/core.py"]
+
+        # Inversion precondition: a naive [:3] slice keeps the low-score deterministic family
+        # and drops the neutral next-best row.
+        naive = {r["risk_type"] for r in ordered[:3]}
+        self.assertIn("responsibility_moved_drift", naive)
+        self.assertNotIn("swallowed_exception_state_drift", naive)
+
+        kept = _cap_review_hypotheses_reserving_diff_families(
+            ordered, 3, changed_files=changed_files
+        )
+        kept_types = {r["risk_type"] for r in kept}
+        self.assertEqual(len(kept), 3)
+        self.assertIn("abstract_contract_unimplemented", kept_types, "high-score det must seat")
+        self.assertIn("contract_semantic_diff", kept_types, "mid-score inferred must seat")
+        self.assertIn("swallowed_exception_state_drift", kept_types, "neutral next-best must seat")
+        self.assertNotIn(
+            "responsibility_moved_drift", kept_types,
+            f"low-score deterministic family must be truncated; kept={kept_types}",
+        )
+
+    def test_calcom_geometry_noisy_diff_family_truncated(self):
+        """3 slots: two noisy diff families (external-target guard, -3; module-root moved,
+        -2), a high-score non-diff production row (+2), and a semantic row with a changed
+        production-file cause (+2). The non-diff row AND the semantic row must BOTH seat;
+        the noisiest diff family (external target) is truncated."""
+        external_target = {  # removed call into a language builtin/external → -3
+            "risk_type": "guard_call_removed_drift",
+            "derivation": "deterministic_static",
+            "target_entity_kind": "ExternalSymbol",
+            "target_urn": "urn:external-symbol:x",
+        }
+        module_root = {  # moved call whose target is a bare module root → -2
+            "risk_type": "responsibility_moved_drift",
+            "derivation": "deterministic_static",
+            "target_entity_kind": "CodeModule",
+        }
+        non_diff_prod = {  # non-diff row, changed production-file cause → +2
+            "risk_type": "swallowed_exception_state_drift",
+            "derivation": None,
+            "cause": {"path": "src/core.py", "line_start": 4},
+        }
+        semantic = {  # inferred_llm diff row, changed production-file cause → +2
+            "risk_type": "contract_semantic_diff",
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/core.py", "line_start": 9},
+        }
+        # Noisy diff families FIRST so a derivation-first / carve-out policy keeps them.
+        ordered = [external_target, module_root, non_diff_prod, semantic]
+        changed_files = ["src/core.py"]
+
+        # Inversion precondition: a naive [:3] slice keeps both noisy diff families and drops
+        # the semantic row.
+        naive = {r["risk_type"] for r in ordered[:3]}
+        self.assertIn("guard_call_removed_drift", naive)
+        self.assertNotIn("contract_semantic_diff", naive)
+
+        kept = _cap_review_hypotheses_reserving_diff_families(
+            ordered, 3, changed_files=changed_files
+        )
+        kept_types = {r["risk_type"] for r in kept}
+        self.assertEqual(len(kept), 3)
+        self.assertIn(
+            "swallowed_exception_state_drift", kept_types,
+            f"high-score non-diff row must seat; kept={kept_types}",
+        )
+        self.assertIn(
+            "contract_semantic_diff", kept_types,
+            f"semantic row must seat; kept={kept_types}",
+        )
+        self.assertNotIn(
+            "guard_call_removed_drift", kept_types,
+            f"noisiest diff family (external target) must be truncated; kept={kept_types}",
+        )

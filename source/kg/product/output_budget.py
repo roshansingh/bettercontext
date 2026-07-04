@@ -6,6 +6,7 @@ from source.kg.core.models import JsonObject, canonical_json
 from source.kg.product.edge_role import rank_by_review_value
 from source.kg.product.evidence_score import rank_rows, score_key
 from source.kg.product.review_attribution import review_lead_counts
+from source.kg.product.review_hypotheses import score_hypothesis_row
 
 
 # Fleet runtime architecture questions need a compact head-start packet that
@@ -1016,65 +1017,65 @@ _DIFF_DERIVED_RISK_TYPES: frozenset[str] = frozenset(
 )
 
 
-def _first_index_by_diff_family(rows: list[JsonObject]) -> dict[str, int]:
-    """First list position of each generated diff-derived risk type.
+_DERIVATION_TIER_RANK: dict[str, int] = {"deterministic_static": 0, "inferred_llm": 1}
 
-    List position is the Task-A structural rank order (rows arrive already ordered by
-    apply_structural_noise_downranking then the reservation cap), so a LATER first index
-    means a lower-ranked family — the one that loses a scarce slot.
+
+def _derivation_tier(derivation: str) -> int:
+    """Trust-tier rank used ONLY as a score tiebreak: deterministic > inferred > other."""
+    return _DERIVATION_TIER_RANK.get(derivation, 2)
+
+
+def plan_hypothesis_seats(
+    rows: list[JsonObject],
+    *,
+    limit: int,
+    changed_files: list[str],
+    changed_symbols: list[JsonObject] | None = None,
+) -> list[str]:
+    """Shared score-driven seat-allocation policy for the cap and budget layers.
+
+    Every risk-type family (diff-derived AND non-diff) competes for the ``limit`` slots on
+    the same basis. Each family's representative is its best row by structural score (the
+    same score_hypothesis_row used by apply_structural_noise_downranking). Families are
+    seated in descending representative score. The derivation trust tier
+    (deterministic_static > inferred_llm > other) is a TIEBREAK ONLY on equal scores, then
+    the family's first list position for determinism. There is no separate non-diff seat
+    carve-out: a high-value non-diff family wins a seat by score like any other.
+
+    Returns the keep-ordered list of risk types that fit in ``limit`` slots; families beyond
+    it are dropped (their absence surfaces as truncated_by_risk_type, never silent absence).
     """
-    first: dict[str, int] = {}
+    if limit <= 0:
+        return []
+    first_index: dict[str, int] = {}
+    best_score: dict[str, float] = {}
+    derivation_by_type: dict[str, str] = {}
     for idx, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
         rt = row.get("risk_type")
-        if rt in _DIFF_DERIVED_RISK_TYPES and rt not in first:
-            first[str(rt)] = idx
-    return first
-
-
-def plan_hypothesis_seats(rows: list[JsonObject], *, limit: int) -> tuple[bool, list[str]]:
-    """Shared seat-allocation policy for the cap and budget layers.
-
-    Given the ranked generated hypothesis rows and a ``limit`` slot count, decide:
-      * whether one seat is reserved for the best-ranked non-diff-derived row (reserved
-        only when at least one non-diff row exists), and
-      * which diff-derived risk-type families get a seat, in keep-priority order.
-
-    Diff families compete for the remaining slots (limit minus the non-diff seat).
-    Within the diff families, deterministic_static rows rank above inferred_llm rows
-    (derivation trust tier); within a tier, the family with the lower structural rank
-    (earlier first index) wins. When diff families exceed the remaining slots, the
-    lowest-ranked families are the ones left out.
-
-    Returns ``(reserve_non_diff_seat, ordered_diff_types)`` where ``ordered_diff_types``
-    is the keep-ordered list of diff risk types that fit; families beyond it are dropped
-    (their absence surfaces as truncated_by_risk_type, never silent absence).
-    """
-    has_non_diff = any(
-        isinstance(row, dict) and row.get("risk_type") not in _DIFF_DERIVED_RISK_TYPES
-        for row in rows
-    )
-    reserve_non_diff_seat = has_non_diff and limit >= 1
-    diff_slots = max(0, limit - (1 if reserve_non_diff_seat else 0))
-    first_index = _first_index_by_diff_family(rows)
-    # Deterministic families before inferred_llm; within a tier, lower structural rank
-    # (earlier first index) wins. derivation is read from the family's first-seen row.
-    derivation_by_type: dict[str, str] = {}
-    for row in rows:
-        if not isinstance(row, dict):
+        if rt is None:
             continue
-        rt = row.get("risk_type")
-        if rt in _DIFF_DERIVED_RISK_TYPES and rt not in derivation_by_type:
-            derivation_by_type[str(rt)] = str(row.get("derivation") or "")
+        rt = str(rt)
+        score = score_hypothesis_row(row, changed_files, changed_symbols)
+        if rt not in first_index:
+            first_index[rt] = idx
+            best_score[rt] = score
+            derivation_by_type[rt] = str(row.get("derivation") or "")
+        elif score > best_score[rt]:
+            # Representative is the family's best-scoring row; the tiebreak derivation is
+            # read from that best row so a family whose top row is deterministic seats as one.
+            best_score[rt] = score
+            derivation_by_type[rt] = str(row.get("derivation") or "")
     ordered = sorted(
         first_index,
         key=lambda rt: (
-            0 if derivation_by_type.get(rt) == "deterministic_static" else 1,
+            -best_score[rt],
+            _derivation_tier(derivation_by_type[rt]),
             first_index[rt],
         ),
     )
-    return reserve_non_diff_seat, ordered[:diff_slots]
+    return ordered[:limit]
 
 
 def _lean_review_hypothesis(row: JsonObject) -> JsonObject:
@@ -1316,40 +1317,53 @@ def _hypothesis_first_compact_packet(
             hypotheses.pop()
             break
 
-    # Diff-derived pinning with a reserved non-diff seat and compact-before-evict.
-    # Shared policy (plan_hypothesis_seats, same as the cap layer): one seat is reserved
-    # for the best-ranked non-diff row when one exists, the remaining seats go to diff
-    # families (deterministic above inferred_llm, lower structural rank wins), and when a
+    # Diff-family pinning with compact-before-evict. The score-driven seat competition
+    # (plan_hypothesis_seats) is decided at the cap layer; by the time the budget layer runs,
+    # the packet already holds only the cap's seated winners. This layer's job is to keep the
+    # diff-derived winners alive under CHAR pressure: the order-based first-loop append above
+    # can drop a later-ordered diff family for budget, so we re-add any seated diff family
+    # missing from the packet. Non-diff winners already entered via the first loop and are not
+    # re-pinned here — force-pinning them would starve the cluster-anchor budget below. When a
     # diff family's last row will not fit we FIRST trim optional/verbose fields on the
-    # already-kept rows (compact-before-evict) so the family is dropped only when even the
-    # fully compacted packet cannot hold it — so char pressure never silently erases a
-    # generated diff family. A dropped family surfaces in truncated_by_risk_type via
-    # _finalize_review_hypothesis_budget, never as silent absence.
-    _reserve_non_diff_seat, _seat_diff_types = plan_hypothesis_seats(
-        original_hypotheses, limit=len(original_hypotheses) or 1
+    # already-kept rows (compact-before-evict), then evict the last non-protected non-diff row,
+    # and drop the family only when even the fully compacted packet cannot hold it — so char
+    # pressure never silently erases a diff winner. A dropped family surfaces in
+    # truncated_by_risk_type via _finalize_review_hypothesis_budget, never as silent absence.
+    seat_changed_files = _list_value(review_leads.get("changed_files"))
+    seat_changed_symbols = [
+        row for row in _list_value(review_leads.get("changed_symbols")) if isinstance(row, dict)
+    ]
+    seated_types = plan_hypothesis_seats(
+        original_hypotheses,
+        limit=len(original_hypotheses) or 1,
+        changed_files=seat_changed_files,
+        changed_symbols=seat_changed_symbols,
     )
-    # Protect the best-ranked non-diff row already in the packet so compaction/eviction
-    # for diff families never starves the reserved non-diff seat.
+    # Protect the best-scoring non-diff row already in the packet (the cap's non-diff seat
+    # winner) so diff pinning never evicts it.
     protected_non_diff_id: set[int] = set()
-    if _reserve_non_diff_seat:
-        for h in hypotheses:
-            if isinstance(h, dict) and h.get("risk_type") not in _DIFF_DERIVED_RISK_TYPES:
-                protected_non_diff_id.add(id(h))
-                break
+    best_non_diff_score = float("-inf")
+    for h in hypotheses:
+        if not isinstance(h, dict) or h.get("risk_type") in _DIFF_DERIVED_RISK_TYPES:
+            continue
+        hs = score_hypothesis_row(h, seat_changed_files, seat_changed_symbols)
+        if hs > best_non_diff_score:
+            best_non_diff_score = hs
+            protected_non_diff_id = {id(h)}
     kept_risk_types = {h.get("risk_type") for h in hypotheses if isinstance(h, dict)}
     for orig_hyp in original_hypotheses:
         if not isinstance(orig_hyp, dict):
             continue
         rt = orig_hyp.get("risk_type")
-        if rt not in _seat_diff_types or rt in kept_risk_types:
+        if rt not in _DIFF_DERIVED_RISK_TYPES or rt not in seated_types or rt in kept_risk_types:
             continue
         lean_row = _lean_review_hypothesis(orig_hyp)
         hypotheses.append(lean_row)
         if _current_chars(packet) <= hypothesis_budget:
             kept_risk_types.add(rt)
             continue
-        # Over budget: compact the already-kept rows (protecting the reserved non-diff
-        # seat and the row just added) before considering a drop.
+        # Over budget: compact the already-kept rows (protecting the non-diff seat winner and
+        # the row just added) before considering a drop.
         if _compact_hypothesis_rows_to_fit(
             packet,
             hypotheses,
@@ -1358,8 +1372,8 @@ def _hypothesis_first_compact_packet(
         ):
             kept_risk_types.add(rt)
             continue
-        # Still over budget after full compaction: evict the last non-diff-derived row
-        # that is not the reserved seat, then retry compaction.
+        # Still over budget after full compaction: evict the last non-diff-derived row that is
+        # not the protected non-diff seat, then retry compaction.
         swap_idx = next(
             (i for i in range(len(hypotheses) - 2, -1, -1)
              if hypotheses[i].get("risk_type") not in _DIFF_DERIVED_RISK_TYPES

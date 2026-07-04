@@ -3108,7 +3108,10 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         review_hypotheses, changed_files, changed_symbols_in_scope
     )
     review_hypotheses = _cap_review_hypotheses_reserving_diff_families(
-        review_hypotheses, PLANNING_CONTEXT_SECTION_LIMIT
+        review_hypotheses,
+        PLANNING_CONTEXT_SECTION_LIMIT,
+        changed_files=changed_files,
+        changed_symbols=changed_symbols_in_scope,
     )
     review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     if base_snapshot_dir:
@@ -3402,58 +3405,54 @@ def _generated_hypothesis_counts(review_hypotheses: list[JsonObject]) -> JsonObj
 def _cap_review_hypotheses_reserving_diff_families(
     review_hypotheses: list[JsonObject],
     limit: int,
+    *,
+    changed_files: list[str] | None = None,
+    changed_symbols: list[JsonObject] | None = None,
 ) -> list[JsonObject]:
-    """Cap the top-level hypothesis list to ``limit`` while guaranteeing at least one
-    row per GENERATED diff-derived risk type survives the slice.
+    """Cap the top-level hypothesis list to ``limit`` while guaranteeing that the highest
+    structural-value families each keep a representative row.
 
-    A naive ``review_hypotheses[:limit]`` can evict an entire generated diff family
-    before budget pinning or the by-risk-type truncation counts ever run — the
-    pre-budget "generated" set fed to _attach_review_hypothesis_status is exactly this
-    already-capped list, so a family dropped here becomes invisible (no returned row,
-    no truncated_by_risk_type entry). This is the cap-time twin of the budget-time
-    survival rule in output_budget._hypothesis_first_compact_packet: both keep one row
-    per generated ``_DIFF_DERIVED_RISK_TYPES`` member, and both rank deterministic
-    families above inferred_llm rows (derivation tier deterministic_static >
-    inferred_llm) when slots are scarce.
+    A naive ``review_hypotheses[:limit]`` can evict an entire generated family before
+    budget pinning or the by-risk-type truncation counts ever run — the pre-budget
+    "generated" set fed to _attach_review_hypothesis_status is exactly this already-capped
+    list, so a family dropped here becomes invisible (no returned row, no
+    truncated_by_risk_type entry). This is the cap-time twin of the budget-time survival
+    rule in output_budget._hypothesis_first_compact_packet: both seat families by the same
+    score-driven policy (output_budget.plan_hypothesis_seats).
 
     Seat policy (shared with the budget layer via output_budget.plan_hypothesis_seats):
-    when at least one non-diff-derived row exists, one of ``limit`` slots is reserved for
-    the best-ranked non-diff row so diff families can never take ALL slots; the remaining
-    slots go to diff families, deterministic_static above inferred_llm, and within a tier
-    the lower structural rank (earlier list position) wins. When distinct generated
-    diff-derived types exceed the remaining slots, the lowest-ranked families are left out;
-    their absence surfaces as nonzero truncated_by_risk_type entries downstream, never as
-    silent absence.
+    every family — diff-derived AND non-diff — competes for the ``limit`` slots on its best
+    row's structural score. Families are seated in descending representative score; the
+    derivation trust tier (deterministic_static > inferred_llm > other) is a tiebreak only
+    on equal scores, then first list position. There is no separate non-diff seat: a
+    high-value non-diff family wins a seat by score. When distinct generated families exceed
+    ``limit``, the lowest-scoring families are left out; their absence surfaces as nonzero
+    truncated_by_risk_type entries downstream, never as silent absence.
 
-    The kept rows preserve the input relative order. One representative row (first
-    occurrence) is kept per selected diff family; leftover slots after the reserved
-    non-diff seat and the diff seats are filled by the highest-ranked remaining rows.
+    One representative row (first occurrence in the input's rank order) is kept per seated
+    family; any leftover slots are filled by the highest-ranked remaining rows.
     """
     if limit <= 0:
         return []
-    reserve_non_diff_seat, diff_types = plan_hypothesis_seats(review_hypotheses, limit=limit)
-    diff_type_set = set(diff_types)
+    seated_types = set(
+        plan_hypothesis_seats(
+            review_hypotheses,
+            limit=limit,
+            changed_files=changed_files or [],
+            changed_symbols=changed_symbols,
+        )
+    )
 
     kept_ids: set[int] = set()
-    # One representative (first occurrence) per selected diff family.
-    seen_diff: set[str] = set()
+    # One representative (first occurrence) per seated family.
+    seen: set[str] = set()
     for row in review_hypotheses:
         if not isinstance(row, dict):
             continue
         rt = row.get("risk_type")
-        if rt in diff_type_set and rt not in seen_diff:
-            seen_diff.add(str(rt))
+        if rt in seated_types and rt not in seen:
+            seen.add(str(rt))
             kept_ids.add(id(row))
-    # Reserved non-diff seat: best-ranked (first) non-diff row.
-    if reserve_non_diff_seat:
-        for row in review_hypotheses:
-            if (
-                isinstance(row, dict)
-                and row.get("risk_type") not in _DIFF_DERIVED_RISK_TYPES
-                and id(row) not in kept_ids
-            ):
-                kept_ids.add(id(row))
-                break
     # Fill leftover slots with the highest-ranked remaining rows.
     for row in review_hypotheses:
         if len(kept_ids) >= limit:

@@ -1,15 +1,18 @@
-"""B2: the cap/reservation and the budget survival sweep both reserve one seat for the
-best-ranked non-diff-derived hypothesis so diff-derived families can never take ALL slots.
+"""Score-driven seat allocation: a HIGH-VALUE non-diff-derived hypothesis wins a seat on
+the same structural-score basis as diff families, so diff-derived families can never crowd
+a high-signal non-diff row out purely by their derivation tier.
 
 Real-pipeline test through call_tool("review_context"): the fixture over-produces 5+
 diff-derived families across multiple risk types. The base (non-splice) hypothesis
-generator is stubbed to return ONE real-shaped non-diff-derived row (a legitimate seam:
-the stub controls only the producer's base input, never the cap/budget logic under test),
-so the packet has 5+ diff families PLUS 1 high-ranked non-diff row — exactly the geometry
-B2 must handle. The non-diff row must survive the cap AND the budget.
+generator is stubbed to return ONE real-shaped non-diff-derived row whose cause is a
+CHANGED PRODUCTION file (a positive structural score) — a legitimate seam: the stub
+controls only the producer's base input, never the cap/budget logic under test — so the
+packet has 5+ diff families PLUS 1 high-score non-diff row. The non-diff row must survive
+the cap AND the budget by outscoring the noisier diff families.
 
-Inversion proof: without the reserved seat, the diff families claim all 5 cap slots and
-the non-diff row is dropped before the budget layer ever sees it.
+Inversion proof: a naive [:limit] slice drops the trailing non-diff row; the score-driven
+seat policy keeps it because its structural score beats the zero-score diff families it
+sits behind.
 """
 from __future__ import annotations
 
@@ -62,10 +65,10 @@ class TestNonDiffSeatRealPipeline(unittest.TestCase):
         captured: dict = {}
         cap_original = mcp_tools_module._cap_review_hypotheses_reserving_diff_families
 
-        def _cap_spy(rows, limit):
+        def _cap_spy(rows, limit, **kwargs):
             captured["pre"] = [r.get("risk_type") for r in rows if isinstance(r, dict)]
             captured["naive"] = [r.get("risk_type") for r in rows[:limit] if isinstance(r, dict)]
-            return cap_original(rows, limit)
+            return cap_original(rows, limit, **kwargs)
 
         producer_original = mcp_tools_module.review_hypotheses_for_context
 
@@ -143,9 +146,12 @@ class TestNonDiffSeatRealPipeline(unittest.TestCase):
             f"diff families must still occupy most slots; returned={sorted(returned)}",
         )
 
-    # INVERSION PROOF: cap-layer unit inversion — with the seat, a non-diff row placed
-    # AFTER five distinct diff families is retained; a naive [:limit] slice drops it.
+    # INVERSION PROOF: cap-layer unit inversion — a HIGH-SCORE non-diff row placed AFTER
+    # five zero-score diff families is seated by score; a naive [:limit] slice drops it.
     def test_cap_inversion_naive_slice_drops_non_diff(self):
+        # Diff families score 0 (no structural signal); the non-diff row's cause is a
+        # CHANGED production file → +_BOOST_CAUSE_IN_CHANGED_PROD_FILE, so it outscores
+        # every diff family and wins a seat on the shared score basis.
         diff_rows = [
             {"risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
             {"risk_type": "responsibility_moved_drift", "derivation": "deterministic_static"},
@@ -153,22 +159,29 @@ class TestNonDiffSeatRealPipeline(unittest.TestCase):
             {"risk_type": "abstract_contract_unimplemented", "derivation": "deterministic_static"},
             {"risk_type": "contract_semantic_diff", "derivation": "inferred_llm"},
         ]
-        non_diff = {"risk_type": _NON_DIFF_RISK_TYPE, "derivation": None}
+        non_diff = {
+            "risk_type": _NON_DIFF_RISK_TYPE,
+            "derivation": None,
+            "cause": {"path": "src/core.py", "line_start": 1},
+        }
         ordered = [*diff_rows, non_diff]
+        changed_files = ["src/core.py"]
 
         naive = {r["risk_type"] for r in ordered[:PLANNING_CONTEXT_SECTION_LIMIT]}
         self.assertNotIn(
             _NON_DIFF_RISK_TYPE, naive,
             "inversion precondition: naive slice must drop the non-diff row",
         )
-        kept = _cap_review_hypotheses_reserving_diff_families(ordered, PLANNING_CONTEXT_SECTION_LIMIT)
+        kept = _cap_review_hypotheses_reserving_diff_families(
+            ordered, PLANNING_CONTEXT_SECTION_LIMIT, changed_files=changed_files
+        )
         kept_types = {r["risk_type"] for r in kept}
         self.assertIn(
             _NON_DIFF_RISK_TYPE, kept_types,
-            f"reserved seat must retain the non-diff row; kept={kept_types}",
+            f"high-score non-diff row must win a seat by score; kept={kept_types}",
         )
         self.assertEqual(len(kept), PLANNING_CONTEXT_SECTION_LIMIT)
-        # Exactly one non-diff seat: the other four slots are diff families.
+        # One slot goes to the score-winning non-diff family; the rest to diff families.
         diff_kept = {rt for rt in kept_types if rt in _DIFF_DERIVED_RISK_TYPES}
         self.assertEqual(len(diff_kept), PLANNING_CONTEXT_SECTION_LIMIT - 1)
 
