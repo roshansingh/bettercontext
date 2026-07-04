@@ -449,6 +449,22 @@ class TestPacketHonestySurvivesBudgetCompaction(unittest.TestCase):
             f"packet with affordances must fit the 15K cap; size={size}",
         )
 
+    def test_no_stale_lead_ids_in_final_packet(self) -> None:
+        """No surviving hypothesis may cite a lead_id absent from the final review_leads.
+        Broad invariant over the real pipeline; the load-bearing eviction-forcing regression
+        lives in test_pre_pr_review_fixes.TestStaleLeadIdsAfterLateFundingEviction."""
+        from source.kg.product.output_budget import _collect_surviving_lead_ids
+
+        result = self._run()
+        surviving = _collect_surviving_lead_ids(result)
+        ap = result.get("review_answer_packet") or {}
+        for hyps in (result.get("review_hypotheses") or [], ap.get("top_review_hypotheses") or []):
+            for hyp in hyps:
+                lead_ids = hyp.get("supporting_lead_ids") if isinstance(hyp, dict) else None
+                if isinstance(lead_ids, list):
+                    stale = [lid for lid in lead_ids if lid not in surviving]
+                    self.assertEqual(stale, [], f"stale lead ids in {hyp.get('label')!r}: {stale}")
+
 
 # ---------------------------------------------------------------------------
 # Ordering regression: attribution_labels funded before inspection_areas

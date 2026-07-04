@@ -5086,6 +5086,11 @@ def _finalize_review_hypothesis_budget(
         result, original_hypotheses, full_pre_cap_hypotheses=full_pre_cap_hypotheses,
         max_chars=max_chars, fund_over_cap=True,
     )
+    # The two fund_over_cap passes above (_attach_attribution_labels and the quality-status
+    # sync) can evict further lead rows to fund their affordances. Reconcile once more so no
+    # surviving hypothesis cites a lead_id absent from the final review_leads. Reconciliation
+    # only removes stale ids (shrink-or-equal), so it can never breach the cap.
+    _reconcile_hypothesis_lead_ids(result)
     # Re-mirror top-level changed_symbols from review_leads.changed_symbols.
     # _repair_cluster_coverage and the gated re-interleave both de-alias the two lists.
     # Tandem clipping in _evict_review_rows_to_fit keeps review_leads.changed_symbols in

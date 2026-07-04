@@ -1545,6 +1545,94 @@ class TestAttributionLabelsDroppedBeforeIrreducible(unittest.TestCase):
         self.assertNotIn("inspection_areas", status)
 
 
+class TestStaleLeadIdsAfterLateFundingEviction(unittest.TestCase):
+    """P2: the fund_over_cap passes (_attach_attribution_labels, quality-status sync) run
+    AFTER the last mid-finalize _reconcile_hypothesis_lead_ids and can evict lead rows to
+    fund their affordances. Without the final reconcile pass, a surviving hypothesis keeps
+    citing the evicted lead_id — a stale reference into a row absent from the packet.
+    """
+
+    @staticmethod
+    def _make_packet(cap_pressure_rows: int = 6) -> tuple[dict, list[dict]]:
+        lead_rows = [
+            {
+                "lead_id": f"lead:changed_symbol:x{i}",
+                "path": f"pkg/mod{i}.py",
+                "symbol": f"func{i}",
+                "detail": "d" * 220,
+            }
+            for i in range(cap_pressure_rows)
+        ]
+        hyp = {
+            "hypothesis_id": "hypothesis:contract_semantic_diff:bbbb000000000001",
+            "label": "H1",
+            "risk_type": "contract_semantic_diff",
+            "specificity": "high",
+            "confidence": "medium",
+            "why": "Risk.",
+            "postable_claim": "claim one",
+            # Cites the LAST lead rows — the ones eviction pops first.
+            "supporting_lead_ids": [f"lead:changed_symbol:x{cap_pressure_rows - 1}",
+                                    "lead:changed_symbol:x0"],
+            "evidence_refs": [{"repo": "r", "path": "a.py", "line_start": 1, "line_end": 5}],
+            "source_checks": [],
+        }
+        packet = {
+            "tool": "review_context",
+            "status": "ok",
+            "review_hypotheses": [hyp],
+            "review_answer_packet": {"top_review_hypotheses": [hyp], "status": "ok"},
+            "review_quality_status": {
+                "coverage_status": "useful",
+                "recommended_action": "use_supercontext_packet",
+                "review_readiness": "packet_ready",
+                "specificity": "high",
+                "base_diff_status": "present",
+            },
+            "review_leads": {
+                "changed_symbols": lead_rows,
+                "direct_callers": [], "direct_callees": [],
+                "transitive_callers": [], "source_coordinates": [],
+            },
+            "output_budget": {
+                "truncated": False, "measured_chars": 0, "max_chars": 0, "truncated_sections": [],
+            },
+        }
+        return packet, [hyp]
+
+    def test_final_hypotheses_cite_only_surviving_leads(self):
+        from copy import deepcopy
+        from source.kg.product.output_budget import _collect_surviving_lead_ids
+
+        cap = 1_900  # tuned: labels/status funding must evict lead rows to fit
+        packet, original_hyps = self._make_packet()
+        _finalize_review_hypothesis_budget(
+            packet, deepcopy(original_hyps), original_review_leads={}, max_chars=cap
+        )
+        surviving = _collect_surviving_lead_ids(packet)
+        # Precondition: the funding passes actually evicted at least one cited lead row —
+        # otherwise this test is vacuous (assert loudly so cap re-tuning is forced).
+        self.assertLess(
+            len(surviving), 6,
+            f"cap={cap} no longer forces lead eviction; re-tune the fixture (surviving={surviving})",
+        )
+        stale_targets = {"lead:changed_symbol:x5", "lead:changed_symbol:x0"} - surviving
+        self.assertTrue(
+            stale_targets,
+            f"fixture must evict at least one CITED lead; surviving={sorted(surviving)}",
+        )
+        for hyps in (packet.get("review_hypotheses") or [],
+                     (packet.get("review_answer_packet") or {}).get("top_review_hypotheses") or []):
+            for hyp in hyps:
+                lead_ids = hyp.get("supporting_lead_ids") or []
+                stale = [lid for lid in lead_ids if lid not in surviving]
+                self.assertEqual(
+                    stale, [],
+                    f"hypothesis {hyp.get('label')!r} cites evicted lead ids {stale}; "
+                    "final reconcile after late funding passes must strip them",
+                )
+
+
 class TestAliasedTandemClipDoesNotDoubleEvict(unittest.TestCase):
     """Regression: aliased packet (top-level and review_leads sharing the same list object,
     as _sync_compact_review_leads produces) must lose exactly 1 row per eviction iteration,
