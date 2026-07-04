@@ -185,6 +185,61 @@ class TestNonDiffSeatRealPipeline(unittest.TestCase):
         diff_kept = {rt for rt in kept_types if rt in _DIFF_DERIVED_RISK_TYPES}
         self.assertEqual(len(diff_kept), PLANNING_CONTEXT_SECTION_LIMIT - 1)
 
+    def test_cap_keeps_scoring_representative_not_family_first_row(self):
+        # P2: A family's earlier row scores low (cause in an UNchanged prod file → 0) and a
+        # later row scores high (cause in a CHANGED prod file → +2). The seat plan ranks the
+        # family by its best (later) row; the cap must return that high-score representative,
+        # not the family's first occurrence.
+        rt = _NON_DIFF_RISK_TYPE
+        low_first = {
+            "hypothesis_id": "hyp:low",
+            "risk_type": rt,
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/other.py", "line_start": 1},
+        }
+        high_later = {
+            "hypothesis_id": "hyp:high",
+            "risk_type": rt,
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/core.py", "line_start": 5},
+        }
+        ordered = [low_first, high_later]
+        changed_files = ["src/core.py"]
+
+        # Inversion precondition: keeping the family's FIRST row would return the low-score row.
+        self.assertEqual(ordered[0]["hypothesis_id"], "hyp:low")
+
+        kept = _cap_review_hypotheses_reserving_diff_families(
+            ordered, 1, changed_files=changed_files
+        )
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(
+            kept[0]["hypothesis_id"], "hyp:high",
+            "cap must keep the score-winning representative, not the family's first row",
+        )
+
+    def test_cap_representative_comes_first_when_family_rows_spare_slots(self):
+        # When both rows of the seated family fit (spare slots), the representative comes
+        # first and the other follows in existing order.
+        rt = _NON_DIFF_RISK_TYPE
+        low_first = {
+            "hypothesis_id": "hyp:low",
+            "risk_type": rt,
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/other.py", "line_start": 1},
+        }
+        high_later = {
+            "hypothesis_id": "hyp:high",
+            "risk_type": rt,
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/core.py", "line_start": 5},
+        }
+        ordered = [low_first, high_later]
+        kept = _cap_review_hypotheses_reserving_diff_families(
+            ordered, 5, changed_files=["src/core.py"]
+        )
+        self.assertEqual([r["hypothesis_id"] for r in kept], ["hyp:high", "hyp:low"])
+
 
 if __name__ == "__main__":
     unittest.main()

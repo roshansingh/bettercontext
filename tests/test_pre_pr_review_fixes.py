@@ -28,7 +28,9 @@ from source.kg.product.output_budget import (
     _evict_review_rows_to_fit,
     _finalize_review_hypothesis_budget,
     _protect_review_hypotheses_floor,
+    _restore_hypotheses_up_to_target,
     _sync_review_quality_status_from_packet,
+    compute_hypothesis_seat_plan,
     enforce_review_context_budget,
 )
 from source.kg.product.review_attribution import review_lead_counts
@@ -997,6 +999,83 @@ class TestN2HypothesisHeadroomUnderPressure(unittest.TestCase):
 
         top_hyps = result.get("review_hypotheses") or []
         self.assertGreaterEqual(len(top_hyps), 1, "floor-of-1 must always hold")
+
+
+class TestRestoreUsesRankedOrderNoDuplicates(unittest.TestCase):
+    """P1: _restore_hypotheses_up_to_target consumes the shared seat order and dedups by id.
+
+    Post score-ordering, the seated rows are no longer an original-order prefix, so the old
+    prefix-based restore (original_hypotheses[len(current):target]) could duplicate an
+    already-seated row or restore a lower-scored row ahead of a higher-scored one.
+    """
+
+    @staticmethod
+    def _rows():
+        # low scores -2 (both paths test), mid scores 0 (unchanged prod file), high scores
+        # +2 (cause in a CHANGED prod file). Distinct risk_types so the seat plan ranks the
+        # families high > mid > low.
+        low = {
+            "hypothesis_id": "hyp:low",
+            "risk_type": "rt_low",
+            "derivation": "inferred_llm",
+            "cause": {"path": "tests/test_a.py", "line_start": 1},
+            "consequence": {"path": "tests/test_b.py", "line_start": 1},
+        }
+        high = {
+            "hypothesis_id": "hyp:high",
+            "risk_type": "rt_high",
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/core.py", "line_start": 1},
+        }
+        mid = {
+            "hypothesis_id": "hyp:mid",
+            "risk_type": "rt_mid",
+            "derivation": "inferred_llm",
+            "cause": {"path": "src/other.py", "line_start": 1},
+        }
+        # Original producer order is [low, high, mid] — NOT score order.
+        return [low, high, mid], high, mid, low
+
+    def test_restore_to_target_uses_ranked_order_no_duplicate(self):
+        original, high, mid, low = self._rows()
+        seat_plan = compute_hypothesis_seat_plan(
+            original, changed_files=["src/core.py"], changed_symbols=None
+        )
+        # Precondition: seat plan ranks high before mid before low (score order).
+        self.assertEqual(seat_plan["ordered_types"], ["rt_high", "rt_mid", "rt_low"])
+        # Simulate the compactor having seated only the highest-scored family (high). Because
+        # high is original_hypotheses[1], the OLD prefix restore would append
+        # original_hypotheses[len([high]):2] == original_hypotheses[1:2] == [high] again.
+        result = {"review_hypotheses": [dict(high)]}
+        # Inversion proof: prefix-based restore would duplicate high (it sits at index 1).
+        prefix_next = [h["hypothesis_id"] for h in original[1:2]]
+        self.assertEqual(prefix_next, ["hyp:high"], "inversion: prefix restore re-adds high")
+
+        _restore_hypotheses_up_to_target(
+            result, original, max_chars=100_000, target=2, seat_plan=seat_plan
+        )
+        got = [h["hypothesis_id"] for h in result["review_hypotheses"]]
+        self.assertEqual(got, ["hyp:high", "hyp:mid"], f"expected [high, mid], got {got}")
+        self.assertEqual(len(got), len(set(got)), "no duplicate hypothesis_ids")
+        self.assertNotIn("hyp:low", got, "lowest-scored row must not be restored before mid")
+
+    def test_restore_dedups_when_current_row_not_first_in_original(self):
+        # Current already holds mid (a non-first, non-highest row). Restore to target 3 must
+        # add high and low without re-adding mid.
+        original, high, mid, low = self._rows()
+        seat_plan = compute_hypothesis_seat_plan(
+            original, changed_files=["src/core.py"], changed_symbols=None
+        )
+        result = {"review_hypotheses": [dict(mid)]}
+        _restore_hypotheses_up_to_target(
+            result, original, max_chars=100_000, target=3, seat_plan=seat_plan
+        )
+        got = [h["hypothesis_id"] for h in result["review_hypotheses"]]
+        self.assertEqual(len(got), len(set(got)), f"no duplicates; got {got}")
+        self.assertEqual(got.count("hyp:mid"), 1, "mid not re-added")
+        self.assertEqual(set(got), {"hyp:mid", "hyp:high", "hyp:low"})
+        # Restored rows follow ranked order after the already-present mid.
+        self.assertEqual(got[1:], ["hyp:high", "hyp:low"])
 
 
 class TestN4AvailableRiskTypes(unittest.TestCase):

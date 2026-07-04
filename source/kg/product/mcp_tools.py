@@ -3443,8 +3443,10 @@ def _cap_review_hypotheses_reserving_diff_families(
     ``limit``, the lowest-scoring families are left out; their absence surfaces as nonzero
     truncated_by_risk_type entries downstream, never as silent absence.
 
-    One representative row (first occurrence in the input's rank order) is kept per seated
-    family; any leftover slots are filled by the highest-ranked remaining rows.
+    The representative row the seat plan scored the family by (its best-scoring row, NOT
+    the family's first occurrence — which can be a lower-scored peer in an earlier
+    derivation tier) is kept per seated family; any leftover slots are filled by the
+    highest-ranked remaining rows.
     """
     if limit <= 0:
         return []
@@ -3456,17 +3458,27 @@ def _cap_review_hypotheses_reserving_diff_families(
             changed_files=changed_files or [],
             changed_symbols=changed_symbols,
         )
-    seated_types = set(list(seat_plan.get("ordered_types") or [])[:limit])
+    ordered_types = list(seat_plan.get("ordered_types") or [])
+    seated_types = set(ordered_types[:limit])
+    representative_index = seat_plan.get("representative_index") or {}
 
     kept_ids: set[int] = set()
-    # One representative (first occurrence) per seated family.
+    # Keep the seat plan's representative row (the family's best-scoring row) per seated
+    # family; fall back to first occurrence only if the representative index is missing.
     seen: set[str] = set()
+    for rt in ordered_types[:limit]:
+        rep_idx = representative_index.get(rt)
+        if isinstance(rep_idx, int) and 0 <= rep_idx < len(review_hypotheses):
+            row = review_hypotheses[rep_idx]
+            if isinstance(row, dict) and str(row.get("risk_type")) == rt:
+                kept_ids.add(id(row))
+                seen.add(rt)
     for row in review_hypotheses:
         if not isinstance(row, dict):
             continue
-        rt = row.get("risk_type")
+        rt = str(row.get("risk_type"))
         if rt in seated_types and rt not in seen:
-            seen.add(str(rt))
+            seen.add(rt)
             kept_ids.add(id(row))
     # Fill leftover slots with the highest-ranked remaining rows.
     for row in review_hypotheses:
@@ -3475,7 +3487,28 @@ def _cap_review_hypotheses_reserving_diff_families(
         if isinstance(row, dict) and id(row) not in kept_ids:
             kept_ids.add(id(row))
 
-    return [row for row in review_hypotheses if isinstance(row, dict) and id(row) in kept_ids]
+    kept = [row for row in review_hypotheses if isinstance(row, dict) and id(row) in kept_ids]
+    # Within a seated family, the representative comes first; other kept rows of that family
+    # follow in existing order. Only reorder inside a family (keeping each family's earliest
+    # slot) — cross-family sequence is preserved for the downstream budget layer.
+    rep_ids = {
+        id(review_hypotheses[idx])
+        for rt, idx in representative_index.items()
+        if isinstance(idx, int) and 0 <= idx < len(review_hypotheses) and rt in seated_types
+    }
+    by_family: dict[str, list[JsonObject]] = {}
+    for row in kept:
+        by_family.setdefault(str(row.get("risk_type")), []).append(row)
+    ordered_rows: list[JsonObject] = list(kept)
+    for rt, rows in by_family.items():
+        if len(rows) < 2:
+            continue
+        rows.sort(key=lambda row: id(row) not in rep_ids)
+        # Write the family's rows back into the slots that family already occupied.
+        family_slots = [s for s, row in enumerate(kept) if str(row.get("risk_type")) == rt]
+        for slot, row in zip(family_slots, rows):
+            ordered_rows[slot] = row
+    return ordered_rows
 
 
 def _resolve_changed_head_entities(

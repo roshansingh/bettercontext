@@ -633,7 +633,7 @@ def enforce_review_context_budget(
         # Sync mirror and emit status even when no compaction is needed so every packet
         # carries review_hypothesis_status regardless of packet size.
         _finalize_review_hypothesis_budget(
-            result, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
+            result, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan
         )
         return result
     if not include_broad_context:
@@ -648,7 +648,7 @@ def enforce_review_context_budget(
             seat_plan=seat_plan,
         )
         _finalize_review_hypothesis_budget(
-            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
+            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan
         )
         if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
             compact["output_budget"]["exceeded_after_minimization"] = True
@@ -680,7 +680,7 @@ def enforce_review_context_budget(
                 truncated_sections=truncated_sections,
             )
             _finalize_review_hypothesis_budget(
-                backfilled, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
+                backfilled, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan
             )
             return backfilled
     # Even the tightest pass overshot (rare: dominated by non-row content); signal it like
@@ -690,7 +690,7 @@ def enforce_review_context_budget(
     compact = _protect_review_hypotheses_floor(compact, original_hypotheses, max_chars=max_chars)
     if len(canonical_json(compact)) <= max_chars:
         _finalize_review_hypothesis_budget(
-            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
+            compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan
         )
         return compact
     compact = _review_lead_only_budget_packet(
@@ -701,7 +701,7 @@ def enforce_review_context_budget(
         original_hypotheses=original_hypotheses,
     )
     _finalize_review_hypothesis_budget(
-        compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
+        compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan
     )
     if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
         compact["output_budget"]["exceeded_after_minimization"] = True
@@ -1049,13 +1049,21 @@ def compute_hypothesis_seat_plan(
     seating AND eviction both consume this one ordering, so they can never diverge.
 
     Returns a plan object ``{"ordered_types": [...], "scores": {rt: score}, "tiers":
-    {rt: tier_rank}}``. ``ordered_types`` is keep-order (best first); reverse it for the
-    eviction order (lowest-scored family drops first). The cap seats ``ordered_types[:limit]``
-    (see plan_hypothesis_seats); the budget layer threads this same plan so both agree.
+    {rt: tier_rank}, "representative_index": {rt: idx}, "representative_id": {rt: hid}}``.
+    ``ordered_types`` is keep-order (best first); reverse it for the eviction order
+    (lowest-scored family drops first). ``representative_index``/``representative_id`` identify
+    the exact best-scoring row per family so the cap keeps that row (not the family's first
+    occurrence). The cap seats ``ordered_types[:limit]`` (see plan_hypothesis_seats); the
+    budget layer threads this same plan so both agree.
     """
     first_index: dict[str, int] = {}
     best_score: dict[str, float] = {}
     derivation_by_type: dict[str, str] = {}
+    # Per-family representative: the best-scoring row's list index and stable hypothesis_id.
+    # The cap keeps this exact row (not the family's first occurrence, which can be a lower-
+    # scored peer in an earlier derivation tier), and the budget layer restores by this id.
+    representative_index: dict[str, int] = {}
+    representative_id: dict[str, str] = {}
     for idx, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
@@ -1068,11 +1076,16 @@ def compute_hypothesis_seat_plan(
             first_index[rt] = idx
             best_score[rt] = score
             derivation_by_type[rt] = str(row.get("derivation") or "")
+            representative_index[rt] = idx
+            representative_id[rt] = str(row.get("hypothesis_id") or "")
         elif score > best_score[rt]:
             # Representative is the family's best-scoring row; the tiebreak derivation is
             # read from that best row so a family whose top row is deterministic seats as one.
+            # On equal scores the earlier row (strict >) stays the representative for determinism.
             best_score[rt] = score
             derivation_by_type[rt] = str(row.get("derivation") or "")
+            representative_index[rt] = idx
+            representative_id[rt] = str(row.get("hypothesis_id") or "")
     ordered = sorted(
         first_index,
         key=lambda rt: (
@@ -1085,6 +1098,8 @@ def compute_hypothesis_seat_plan(
         "ordered_types": ordered,
         "scores": {rt: best_score[rt] for rt in ordered},
         "tiers": {rt: _derivation_tier(derivation_by_type[rt]) for rt in ordered},
+        "representative_index": {rt: representative_index[rt] for rt in ordered},
+        "representative_id": {rt: representative_id[rt] for rt in ordered},
     }
 
 
@@ -4468,12 +4483,45 @@ def _repair_cluster_coverage(
 _REVIEW_HYPOTHESIS_HEADROOM_TARGET = 3
 
 
+def _rank_hypotheses_by_seat_plan(
+    hypotheses: list[JsonObject],
+    seat_plan: JsonObject | None,
+) -> list[JsonObject]:
+    """Order hypotheses by the shared seat plan's keep-order (best-scored family first).
+
+    Mirrors the ranking _hypothesis_first_compact_packet seats by, so restore consumes the
+    SAME order the compactor did. Families not in the plan (or when no plan is threaded)
+    keep their original relative order after all seated families. Stable within a family.
+    """
+    keep_order = [rt for rt in _list_value((seat_plan or {}).get("ordered_types")) if isinstance(rt, str)]
+    if not keep_order:
+        return list(hypotheses)
+    keep_rank = {rt: idx for idx, rt in enumerate(keep_order)}
+    fallback_rank = len(keep_order)
+    return sorted(
+        hypotheses,
+        key=lambda h: keep_rank.get(str(h.get("risk_type")), fallback_rank),
+    )
+
+
+def _hypothesis_identity(row: JsonObject) -> object:
+    """Stable identity for dedup: hypothesis_id (always producer-set), then label, then id()."""
+    hid = row.get("hypothesis_id")
+    if isinstance(hid, str) and hid:
+        return ("hid", hid)
+    label = row.get("label")
+    if isinstance(label, str) and label:
+        return ("label", label)
+    return ("obj", id(row))
+
+
 def _restore_hypotheses_up_to_target(
     result: JsonObject,
     original_hypotheses: list[JsonObject],
     *,
     max_chars: int,
     target: int,
+    seat_plan: JsonObject | None = None,
 ) -> set[str]:
     """N2: Evict broad-context rows to fund up to ``target`` compacted hypotheses.
 
@@ -4481,15 +4529,33 @@ def _restore_hypotheses_up_to_target(
     broad context. This step only evicts from broad application/runtime/framework sections
     (and their answer-packet mirrors) — never from lead/coordinate/anchor sections.
     Returns the set of section labels that had rows evicted.
+
+    Restores in the SAME ranked order the compactor seated by (via ``seat_plan``), skipping
+    hypotheses already present (deduped by hypothesis_id, then label, then object identity).
+    This prevents duplicating an already-seated row and prevents restoring a lower-scored row
+    ahead of a higher-scored one when the current rows are not an original-order prefix.
     """
     if not original_hypotheses:
         return set()
     current_hyps = [h for h in _list_value(result.get("review_hypotheses")) if isinstance(h, dict)]
     if len(current_hyps) >= min(target, len(original_hypotheses)):
         return set()
+    present = {_hypothesis_identity(h) for h in current_hyps}
+    ranked = _rank_hypotheses_by_seat_plan(
+        [h for h in original_hypotheses if isinstance(h, dict)], seat_plan
+    )
+    remaining_slots = target - len(current_hyps)
+    to_restore: list[JsonObject] = []
+    for hyp in ranked:
+        if remaining_slots <= 0:
+            break
+        if _hypothesis_identity(hyp) in present:
+            continue
+        to_restore.append(hyp)
+        remaining_slots -= 1
     evicted: set[str] = set()
     # Try to restore hypotheses one by one (compacted), evicting broad context as needed.
-    for hyp in original_hypotheses[len(current_hyps) : target]:
+    for hyp in to_restore:
         compact_hyp = _compact_review_hypothesis(hyp)
         hyp_cost = len(canonical_json(compact_hyp))
         # Evict broad-context rows until there is room for this hypothesis.
@@ -4626,6 +4692,7 @@ def _finalize_review_hypothesis_budget(
     original_review_leads: JsonObject,
     max_chars: int,
     generated_counts: JsonObject | None = None,
+    seat_plan: JsonObject | None = None,
 ) -> None:
     """Sync the answer-packet mirror, attach review_hypothesis_status, and keep under the cap.
 
@@ -4663,6 +4730,7 @@ def _finalize_review_hypothesis_budget(
         original_hypotheses,
         max_chars=max_chars,
         target=_REVIEW_HYPOTHESIS_HEADROOM_TARGET,
+        seat_plan=seat_plan,
     )
     if broad_evicted:
         _sync_review_lead_status_from_packet(result)
