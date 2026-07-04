@@ -32,6 +32,7 @@ from source.kg.product.review_attribution import (
 )
 from source.kg.product.review_hypotheses import (
     _FAMILY_SPECIFICITY,
+    apply_structural_noise_downranking,
     review_hypotheses_for_context,
 )
 from source.kg.product.runtime_architecture import ENDPOINT_PATH_SHAPE_MATCH_BASIS, runtime_architecture_packet
@@ -3097,6 +3098,14 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     # counts for available_count/available_by_risk_type so truncated_by_risk_type
     # includes cap-time drops (not just budget-time drops).
     generated_hypothesis_counts = _generated_hypothesis_counts(review_hypotheses)
+    # Structural noise downranking: stably reorder within each derivation trust tier so
+    # low-value deterministic rows (builtin/module-root call moves, test-only cause and
+    # consequence) sink below high-value peers (concrete failure modes, changed-prod-file
+    # causes) before the reservation cap claims scarce slots. Does not cross tier
+    # boundaries and does not change cap/budget semantics (a sibling task owns floors).
+    review_hypotheses = apply_structural_noise_downranking(
+        review_hypotheses, changed_files, changed_symbols_in_scope
+    )
     review_hypotheses = _cap_review_hypotheses_reserving_diff_families(
         review_hypotheses, PLANNING_CONTEXT_SECTION_LIMIT
     )
@@ -3678,6 +3687,16 @@ def _splice_contract_diff_hypotheses(
             negative_checks = [
                 "Verify the removed test reference was superseded by a broader or renamed test that still covers the same invariant; if coverage is maintained, this risk does not apply.",
             ]
+        # Preserve the structural identity of the call target (removed callee for a
+        # guard row, moved-to symbol for a responsibility-moved row) so the structural
+        # scorer can key on the KG entity kind — e.g. penalize call rows targeting a
+        # language builtin/external package or a bare module/package root. Reads the
+        # symbol_ref emitted by contract_diff (kind/urn); never string-matches names.
+        target_ref: JsonObject | None = None
+        if risk_type == "guard_call_removed_drift":
+            target_ref = h.get("removed_callee") if isinstance(h.get("removed_callee"), dict) else None
+        elif risk_type == "responsibility_moved_drift":
+            target_ref = h.get("moved_to") if isinstance(h.get("moved_to"), dict) else None
         spliced_row: JsonObject = {
             "hypothesis_id": hypothesis_id,
             "label": hypothesis_label(risk_type, hypothesis_id),
@@ -3693,6 +3712,11 @@ def _splice_contract_diff_hypotheses(
             "evidence_refs": source_spans,
             "source_spans": source_spans,
         }
+        if target_ref is not None:
+            if target_ref.get("kind"):
+                spliced_row["target_entity_kind"] = str(target_ref["kind"])
+            if target_ref.get("urn"):
+                spliced_row["target_urn"] = str(target_ref["urn"])
         if cause is not None:
             spliced_row["cause"] = cause
         if consequence is not None:

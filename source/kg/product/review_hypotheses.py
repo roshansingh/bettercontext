@@ -96,6 +96,153 @@ def _sort_and_cap_hypotheses(hypotheses: list[JsonObject]) -> list[JsonObject]:
     return (highs + mediums + lows)[:5]
 
 
+# ---------------------------------------------------------------------------
+# Structural noise downranking (pre-cap reorder within peer groups)
+# ---------------------------------------------------------------------------
+#
+# The splice layer inserts diff-derived rows at the front partitioned strictly by
+# derivation trust tier (deterministic_static, then inferred_llm, then generic rows
+# with no derivation stamp). That tier boundary is intentional and must not be
+# crossed by scoring — a low-value deterministic row still outranks a high-value
+# inferred one. The scorer therefore reorders only WITHIN each derivation peer group,
+# stably (score desc, prior order as tiebreak), so on a large PR a builtin/test-only/
+# module-root call row cannot win a scarce slot ahead of a concrete-failure-mode row.
+#
+# All signals are structural (KG entity kind / path segments / claim shape) — no
+# name lists, no keywords. Constants are additive; the base score is 0.
+
+# Call-target entity kinds that make a removed/moved-call row low-value:
+#   external symbol (e.g. a language builtin) or an external package.
+_LOW_VALUE_CALL_TARGET_KINDS: frozenset[str] = frozenset({"ExternalSymbol", "ExternalPackage"})
+# Entity kinds that represent a bare package/module root rather than a real symbol.
+_MODULE_ROOT_TARGET_KINDS: frozenset[str] = frozenset({"CodeModule", "ExternalPackage"})
+# Risk types whose rows describe a removed or moved CALLS edge (target-bearing).
+_CALL_MOVE_RISK_TYPES: frozenset[str] = frozenset(
+    {"guard_call_removed_drift", "responsibility_moved_drift"}
+)
+
+_PENALTY_EXTERNAL_CALL_TARGET = -3.0
+_PENALTY_BOTH_PATHS_TEST = -2.0
+_PENALTY_MODULE_ROOT_TARGET = -2.0
+_BOOST_CONCRETE_FAILURE_MODE = 3.0
+_BOOST_CAUSE_IN_CHANGED_PROD_FILE = 2.0
+
+
+def _path_of(ref: JsonObject | None) -> str:
+    if not isinstance(ref, dict):
+        return ""
+    return _normalize_path(str(ref.get("path") or ""))
+
+
+def _structural_noise_score(
+    row: JsonObject,
+    changed_file_set: frozenset[str],
+    changed_qualnames: frozenset[str],
+) -> float:
+    """Deterministic structural score for one hypothesis row (higher = keep).
+
+    Structural signals only — entity kind, path segments, claim shape. Base 0.
+
+    Penalize:
+      - a removed/moved-call row whose call target resolves to a language builtin or
+        external-package entity, with no changed-symbol overlap (target/subject qualname
+        not among the PR's changed symbols) — a call into third-party/builtin code that
+        the PR did not itself touch.
+      - a row whose cause AND consequence are both test-classified paths.
+      - a moved-call row whose target is a bare module/package root entity.
+    Boost:
+      - a row carrying a concrete failure mode in its claim structure
+        (an ``unimplemented_members`` list — e.g. abstract-contract rows).
+      - a row whose cause path is a production (non-test) file present in the PR's
+        changed files.
+    """
+    score = 0.0
+    risk_type = str(row.get("risk_type") or "")
+    cause_path = _path_of(row.get("cause"))
+    consequence_path = _path_of(row.get("consequence"))
+    target_kind = str(row.get("target_entity_kind") or "")
+
+    # Penalty 1: call row targeting a builtin/external entity with no changed-symbol overlap.
+    if risk_type in _CALL_MOVE_RISK_TYPES and target_kind in _LOW_VALUE_CALL_TARGET_KINDS:
+        target_urn = str(row.get("target_urn") or "")
+        overlaps = bool(target_urn) and any(q and q in target_urn for q in changed_qualnames)
+        if not overlaps:
+            score += _PENALTY_EXTERNAL_CALL_TARGET
+
+    # Penalty 2: both cause and consequence are test paths.
+    if cause_path and consequence_path and _is_test_file(cause_path) and _is_test_file(consequence_path):
+        score += _PENALTY_BOTH_PATHS_TEST
+
+    # Penalty 3: moved-call row whose target is a bare module/package root.
+    if risk_type in _CALL_MOVE_RISK_TYPES and target_kind in _MODULE_ROOT_TARGET_KINDS:
+        score += _PENALTY_MODULE_ROOT_TARGET
+
+    # Boost 1: concrete failure mode carried in the claim structure.
+    if row.get("unimplemented_members"):
+        score += _BOOST_CONCRETE_FAILURE_MODE
+
+    # Boost 2: cause path is a production file that the PR changed.
+    if cause_path and not _is_test_file(cause_path) and cause_path in changed_file_set:
+        score += _BOOST_CAUSE_IN_CHANGED_PROD_FILE
+
+    return score
+
+
+def apply_structural_noise_downranking(
+    hypotheses: list[JsonObject],
+    changed_files: list[str],
+    changed_symbols: list[JsonObject] | None = None,
+) -> list[JsonObject]:
+    """Stable-reorder rows by structural score WITHIN each (derivation, risk_type) peer group.
+
+    Peer group is (derivation trust tier, risk_type family). The scorer reorders only
+    among rows of the SAME tier AND SAME family, writing them back into the exact
+    positions that family's rows already occupied. This preserves two existing
+    invariants the downstream cap depends on:
+      - the derivation trust-tier partition (deterministic_static, then inferred_llm,
+        then generic) — a row never crosses a tier boundary; and
+      - the family interleaving the splice round-robin built — so which diff-derived
+        families sit in the pre-cap prefix is unchanged, and the cap's per-family
+        survival guarantee (_cap_review_hypotheses_reserving_diff_families) still holds.
+    Within a family, a noisy row (builtin/external or module-root call target, test-only
+    cause+consequence) sinks below a higher-signal peer of the same family; a boosted
+    row (concrete failure mode, changed-prod-file cause) rises. Ties keep prior order.
+    Does not cap or drop rows.
+    """
+    changed_file_set = frozenset(
+        _normalize_path(str(p)) for p in changed_files if isinstance(p, str) and p
+    )
+    changed_qualnames = frozenset(
+        str(s.get("qualname") or s.get("qualified_name") or "")
+        for s in (changed_symbols or [])
+        if isinstance(s, dict) and (s.get("qualname") or s.get("qualified_name"))
+    )
+
+    # Group original list indices by (derivation, risk_type). Rows are reordered only
+    # among their group's own positions, so the sequence of group-slots is preserved.
+    groups: dict[tuple[str, str], list[int]] = {}
+    for idx, row in enumerate(hypotheses):
+        if not isinstance(row, dict):
+            continue
+        key = (str(row.get("derivation") or ""), str(row.get("risk_type") or ""))
+        groups.setdefault(key, []).append(idx)
+
+    reordered = list(hypotheses)
+    for positions in groups.values():
+        if len(positions) < 2:
+            continue
+        ranked = sorted(
+            positions,
+            key=lambda i: (
+                -_structural_noise_score(hypotheses[i], changed_file_set, changed_qualnames),
+                i,  # stable tiebreak: prior order
+            ),
+        )
+        for slot, src in zip(positions, ranked):
+            reordered[slot] = hypotheses[src]
+    return reordered
+
+
 def review_hypotheses_for_context(
     *,
     changed_files: list[str],
