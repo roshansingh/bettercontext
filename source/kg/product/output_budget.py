@@ -614,6 +614,12 @@ def enforce_review_context_budget(
     generated_counts = result.pop("_generated_hypothesis_counts", None)
     if not isinstance(generated_counts, dict):
         generated_counts = None
+    # Shared score-driven seat plan threaded from the cap layer. The budget layer reverses
+    # its keep-order for eviction so a lower-scored family (diff-derived or not) drops before
+    # a higher-scored one — the SAME ordering the cap seated by. Pop so it never leaks.
+    seat_plan = result.pop("_hypothesis_seat_plan", None)
+    if not isinstance(seat_plan, dict):
+        seat_plan = None
     measured = len(canonical_json(result))
     original_hypotheses = [
         row for row in _list_value(result.get("review_hypotheses")) if isinstance(row, dict)
@@ -639,6 +645,7 @@ def enforce_review_context_budget(
             max_chars=max_chars,
             measured_chars=measured,
             original_hypotheses=original_hypotheses,
+            seat_plan=seat_plan,
         )
         _finalize_review_hypothesis_budget(
             compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts
@@ -1025,28 +1032,27 @@ def _derivation_tier(derivation: str) -> int:
     return _DERIVATION_TIER_RANK.get(derivation, 2)
 
 
-def plan_hypothesis_seats(
+def compute_hypothesis_seat_plan(
     rows: list[JsonObject],
     *,
-    limit: int,
     changed_files: list[str],
     changed_symbols: list[JsonObject] | None = None,
-) -> list[str]:
-    """Shared score-driven seat-allocation policy for the cap and budget layers.
+) -> JsonObject:
+    """Compute the single shared score-driven seat plan for the cap AND budget layers.
 
-    Every risk-type family (diff-derived AND non-diff) competes for the ``limit`` slots on
-    the same basis. Each family's representative is its best row by structural score (the
-    same score_hypothesis_row used by apply_structural_noise_downranking). Families are
-    seated in descending representative score. The derivation trust tier
-    (deterministic_static > inferred_llm > other) is a TIEBREAK ONLY on equal scores, then
-    the family's first list position for determinism. There is no separate non-diff seat
-    carve-out: a high-value non-diff family wins a seat by score like any other.
+    Every risk-type family (diff-derived AND non-diff) competes on the same basis. Each
+    family's representative is its best row by structural score (the same
+    score_hypothesis_row used by apply_structural_noise_downranking). Families are ordered by
+    descending representative score; the derivation trust tier (deterministic_static >
+    inferred_llm > other) is a TIEBREAK ONLY on equal scores, then the family's first list
+    position for determinism. There is no separate diff-derived carve-out on either axis:
+    seating AND eviction both consume this one ordering, so they can never diverge.
 
-    Returns the keep-ordered list of risk types that fit in ``limit`` slots; families beyond
-    it are dropped (their absence surfaces as truncated_by_risk_type, never silent absence).
+    Returns a plan object ``{"ordered_types": [...], "scores": {rt: score}, "tiers":
+    {rt: tier_rank}}``. ``ordered_types`` is keep-order (best first); reverse it for the
+    eviction order (lowest-scored family drops first). The cap seats ``ordered_types[:limit]``
+    (see plan_hypothesis_seats); the budget layer threads this same plan so both agree.
     """
-    if limit <= 0:
-        return []
     first_index: dict[str, int] = {}
     best_score: dict[str, float] = {}
     derivation_by_type: dict[str, str] = {}
@@ -1075,7 +1081,56 @@ def plan_hypothesis_seats(
             first_index[rt],
         ),
     )
-    return ordered[:limit]
+    return {
+        "ordered_types": ordered,
+        "scores": {rt: best_score[rt] for rt in ordered},
+        "tiers": {rt: _derivation_tier(derivation_by_type[rt]) for rt in ordered},
+    }
+
+
+def plan_hypothesis_seats(
+    rows: list[JsonObject],
+    *,
+    limit: int,
+    changed_files: list[str],
+    changed_symbols: list[JsonObject] | None = None,
+) -> list[str]:
+    """Score-driven seated risk types for ``limit`` slots (thin wrapper on the shared plan).
+
+    Families beyond ``limit`` are dropped (their absence surfaces as truncated_by_risk_type,
+    never silent absence). See compute_hypothesis_seat_plan for the ordering policy.
+    """
+    if limit <= 0:
+        return []
+    plan = compute_hypothesis_seat_plan(
+        rows, changed_files=changed_files, changed_symbols=changed_symbols
+    )
+    return list(plan["ordered_types"])[:limit]
+
+
+def _lowest_scored_hypothesis_index(
+    hypotheses: list[JsonObject],
+    keep_rank: dict[str, int],
+    *,
+    protected: set[int],
+) -> int | None:
+    """Index of the row to evict first: the lowest-scored family (highest keep_rank), then the
+    LAST list position within that family. Reverses the shared seat plan's keep-order so
+    eviction and seating share one ordering. Protected rows (the floor) are never returned.
+    """
+    worst_idx: int | None = None
+    worst_key: tuple[int, int] | None = None
+    fallback_rank = len(keep_rank)
+    for idx, row in enumerate(hypotheses):
+        if id(row) in protected:
+            continue
+        rank = keep_rank.get(str(row.get("risk_type")), fallback_rank)
+        # Higher keep_rank = lower score = evict earlier; within a family, later position first.
+        key = (rank, idx)
+        if worst_key is None or key > worst_key:
+            worst_key = key
+            worst_idx = idx
+    return worst_idx
 
 
 def _lean_review_hypothesis(row: JsonObject) -> JsonObject:
@@ -1211,6 +1266,7 @@ def _hypothesis_first_compact_packet(
     max_chars: int,
     measured_chars: int,
     original_hypotheses: list[JsonObject],
+    seat_plan: JsonObject | None = None,
 ) -> JsonObject:
     """Compose the B4 hypothesis-first compact packet in priority order.
 
@@ -1225,6 +1281,13 @@ def _hypothesis_first_compact_packet(
     Broad application/runtime/framework sections are never included. The caller runs
     _finalize_review_hypothesis_budget afterwards for mirror sync, cluster repair,
     hypothesis status, and the P2 truncation summary.
+
+    ``seat_plan`` is the shared score-driven plan the cap layer seated by. When char
+    pressure forces dropping seated hypothesis rows, families are evicted in ASCENDING
+    representative-score order (lowest-scored family first) — reversing the plan's keep-order
+    — with derivation tier and list position as tiebreaks only. Diff-derived vs non-diff is
+    NOT a separate eviction axis. Compact-before-evict still runs first: optional/verbose
+    fields are trimmed on kept rows before any family's last row is dropped.
     """
     review_leads = result.get("review_leads") if isinstance(result.get("review_leads"), dict) else {}
     lead_status = result.get("review_lead_status") if isinstance(result.get("review_lead_status"), dict) else {}
@@ -1307,89 +1370,62 @@ def _hypothesis_first_compact_packet(
     hypothesis_budget = max(1, fill_budget - anchor_cost - _COMPACT_EDGE_RESERVE)
     anchor_budget = max(1, fill_budget - _COMPACT_EDGE_RESERVE)
 
-    # Tier 2: hypotheses. The first is the floor (always kept); the rest are budget-checked
-    # against the hypothesis tier budget so anchors and edges are never starved.
-    hypotheses: list[JsonObject] = []
-    packet["review_hypotheses"] = hypotheses
-    for index, hyp in enumerate(original_hypotheses):
-        hypotheses.append(_lean_review_hypothesis(hyp))
-        if index > 0 and _current_chars(packet) > hypothesis_budget:
-            hypotheses.pop()
-            break
-
-    # Diff-family pinning with compact-before-evict. The score-driven seat competition
-    # (plan_hypothesis_seats) is decided at the cap layer; by the time the budget layer runs,
-    # the packet already holds only the cap's seated winners. This layer's job is to keep the
-    # diff-derived winners alive under CHAR pressure: the order-based first-loop append above
-    # can drop a later-ordered diff family for budget, so we re-add any seated diff family
-    # missing from the packet. Non-diff winners already entered via the first loop and are not
-    # re-pinned here — force-pinning them would starve the cluster-anchor budget below. When a
-    # diff family's last row will not fit we FIRST trim optional/verbose fields on the
-    # already-kept rows (compact-before-evict), then evict the last non-protected non-diff row,
-    # and drop the family only when even the fully compacted packet cannot hold it — so char
-    # pressure never silently erases a diff winner. A dropped family surfaces in
-    # truncated_by_risk_type via _finalize_review_hypothesis_budget, never as silent absence.
+    # Tier 2: hypotheses, seated by the SHARED score-driven plan and evicted by its reverse.
+    # The cap threads its plan (score-ordered, diff-derived and non-diff competing on one
+    # basis); recompute only when it is absent (standalone callers/fixtures). The budget layer
+    # must NOT recompute from review_leads.changed_symbols — those are sliced to
+    # PLANNING_CONTEXT_SECTION_LIMIT, so recomputed scores could diverge from the cap's.
     seat_changed_files = _list_value(review_leads.get("changed_files"))
     seat_changed_symbols = [
         row for row in _list_value(review_leads.get("changed_symbols")) if isinstance(row, dict)
     ]
-    seated_types = plan_hypothesis_seats(
-        original_hypotheses,
-        limit=len(original_hypotheses) or 1,
-        changed_files=seat_changed_files,
-        changed_symbols=seat_changed_symbols,
+    if seat_plan is None:
+        seat_plan = compute_hypothesis_seat_plan(
+            original_hypotheses,
+            changed_files=seat_changed_files,
+            changed_symbols=seat_changed_symbols,
+        )
+    keep_order = [rt for rt in _list_value(seat_plan.get("ordered_types")) if isinstance(rt, str)]
+    keep_rank = {rt: idx for idx, rt in enumerate(keep_order)}
+    # Fill in seat-plan keep-order (best-scored family first), preserving each family's list
+    # order within the group. Families not in the plan (defensive: unseen risk types) sort
+    # after all seated families, keeping their original relative order.
+    fallback_rank = len(keep_order)
+    seated_hyps = sorted(
+        (h for h in original_hypotheses if isinstance(h, dict)),
+        key=lambda h: keep_rank.get(str(h.get("risk_type")), fallback_rank),
     )
-    # Protect the best-scoring non-diff row already in the packet (the cap's non-diff seat
-    # winner) so diff pinning never evicts it.
-    protected_non_diff_id: set[int] = set()
-    best_non_diff_score = float("-inf")
-    for h in hypotheses:
-        if not isinstance(h, dict) or h.get("risk_type") in _DIFF_DERIVED_RISK_TYPES:
-            continue
-        hs = score_hypothesis_row(h, seat_changed_files, seat_changed_symbols)
-        if hs > best_non_diff_score:
-            best_non_diff_score = hs
-            protected_non_diff_id = {id(h)}
-    kept_risk_types = {h.get("risk_type") for h in hypotheses if isinstance(h, dict)}
-    for orig_hyp in original_hypotheses:
-        if not isinstance(orig_hyp, dict):
-            continue
-        rt = orig_hyp.get("risk_type")
-        if rt not in _DIFF_DERIVED_RISK_TYPES or rt not in seated_types or rt in kept_risk_types:
-            continue
-        lean_row = _lean_review_hypothesis(orig_hyp)
+    hypotheses: list[JsonObject] = []
+    packet["review_hypotheses"] = hypotheses
+    for index, hyp in enumerate(seated_hyps):
+        lean_row = _lean_review_hypothesis(hyp)
         hypotheses.append(lean_row)
-        if _current_chars(packet) <= hypothesis_budget:
-            kept_risk_types.add(rt)
+        # index 0 is the floor: the highest-scored family's row is always kept.
+        if index == 0 or _current_chars(packet) <= hypothesis_budget:
             continue
-        # Over budget: compact the already-kept rows (protecting the non-diff seat winner and
-        # the row just added) before considering a drop.
+        # Over budget: compact-before-evict — trim optional/verbose fields on every kept row
+        # (protecting the floor row) before dropping any family's last row.
         if _compact_hypothesis_rows_to_fit(
             packet,
             hypotheses,
             budget=hypothesis_budget,
-            protected_ids=protected_non_diff_id | {id(lean_row)},
+            protected_ids={id(hypotheses[0])},
         ):
-            kept_risk_types.add(rt)
             continue
-        # Still over budget after full compaction: evict the last non-diff-derived row that is
-        # not the protected non-diff seat, then retry compaction.
-        swap_idx = next(
-            (i for i in range(len(hypotheses) - 2, -1, -1)
-             if hypotheses[i].get("risk_type") not in _DIFF_DERIVED_RISK_TYPES
-             and id(hypotheses[i]) not in protected_non_diff_id),
-            None,
-        )
-        if swap_idx is not None:
-            hypotheses.pop(swap_idx)
-            if _current_chars(packet) <= hypothesis_budget or _compact_hypothesis_rows_to_fit(
-                packet, hypotheses, budget=hypothesis_budget, protected_ids={id(lean_row)}
-            ):
-                kept_risk_types.add(rt)
-                continue
-        # Only now, when even the fully compacted packet cannot hold the family's last
-        # row, drop it — truncated_by_risk_type will record the omission.
-        hypotheses.pop()
+        # Still over budget after full compaction. Evict the LOWEST-scored family's last row
+        # first (ascending representative-score order = reverse of the seat plan), never a
+        # separate diff-derived axis. Never evict the floor row. A dropped family surfaces in
+        # truncated_by_risk_type via _finalize_review_hypothesis_budget, never silent absence.
+        while _current_chars(packet) > hypothesis_budget and len(hypotheses) > 1:
+            evict_idx = _lowest_scored_hypothesis_index(hypotheses, keep_rank, protected={id(hypotheses[0])})
+            if evict_idx is None:
+                break
+            hypotheses.pop(evict_idx)
+            if _current_chars(packet) <= hypothesis_budget:
+                break
+            _compact_hypothesis_rows_to_fit(
+                packet, hypotheses, budget=hypothesis_budget, protected_ids={id(hypotheses[0])}
+            )
 
     # Tier 3: append the pre-computed anchors (budget guard for pathological fixtures
     # where even the anchor set alone exceeds the cap).

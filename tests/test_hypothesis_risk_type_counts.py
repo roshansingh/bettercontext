@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 import source.kg.product.mcp_tools as mcp_tools_module
+import source.kg.product.output_budget as output_budget_module
 from source.kg.build.pipeline import build_kg
 from source.kg.core.models import canonical_json
 from source.kg.product.mcp_tools import (
@@ -27,6 +28,7 @@ from source.kg.product.mcp_tools import (
 )
 from source.kg.product.output_budget import (
     REVIEW_CONTEXT_MAX_CHARS,
+    compute_hypothesis_seat_plan,
     enforce_review_context_budget,
     _DIFF_DERIVED_RISK_TYPES,
 )
@@ -212,11 +214,13 @@ class TestHypothesisRiskTypeCounts(unittest.TestCase):
 
     def test_over_budget_truncated_type_appears_in_truncated_by_risk_type(self):
         """When truncation drops a risk_type entirely, it appears in truncated_by_risk_type."""
-        # Build a packet that is over budget (compact profile at 15K) so some hypotheses
-        # are evicted. Use many large hypotheses so truncation is forced.
+        # Build a packet that is over budget (compact profile at 15K). Use enough large
+        # hypotheses that truncation is forced even after compact-before-evict shrinks each
+        # row to its lean floor. All rows score 0, so eviction falls to list position: the
+        # trailing rare_type family (last) is dropped, exercising the entire-type-dropped case.
         hyps = []
-        for i in range(8):
-            rt = "type_a" if i < 6 else "rare_type"
+        for i in range(24):
+            rt = "type_a" if i < 22 else "rare_type"
             h = _make_hyp(rt, i)
             h["why"] += " filler " * 200  # inflate each hypothesis
             hyps.append(h)
@@ -261,18 +265,28 @@ class TestHypothesisRiskTypeCounts(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestSemanticRowBudgetSurvival(unittest.TestCase):
-    """contract_semantic_diff rows survive budget truncation even at low list position."""
+    """A higher-scored contract_semantic_diff row survives budget truncation over lower-scored
+    competitors — by SCORE, not by any diff-only carve-out. Its cause is a changed production
+    file (+2 structural score); the competing rows have no such signal (score 0), so under the
+    shared score-driven seat plan the semantic row seats and the lowest-scored competitors are
+    the ones truncated."""
 
     def _make_over_budget_packet_with_semantic(self) -> dict:
         """Build a compact-profile packet where:
-        - 5 large deterministic hypotheses fill positions 0-4 (each ~2KB)
-        - 1 contract_semantic_diff hypothesis is at position 5 (low position)
-        - Budget forces truncation to fewer than 6 hypotheses
+        - 20 large low-score deterministic hypotheses (no structural signal → score 0), each a
+          distinct family, together far exceeding the hypothesis budget even fully compacted
+        - 1 higher-scored contract_semantic_diff hypothesis at the LAST position (cause in a
+          changed production file → +2)
+        - Budget forces truncation; the +2 semantic row must survive while lowest-scored
+          (0-score, deterministic-tier) det families are the ones dropped.
         """
-        # Each det hypothesis is padded to ~2KB so 5 together exceed the hypothesis_budget.
+        # Changed prod file present in _base_packet's changed_files → cause-in-changed-file boost.
+        changed_prod = "src/module_0.py"
+        # Each det hypothesis is padded so together they exceed the hypothesis_budget; none
+        # carries a structural boost, so all score 0 (below the +2 semantic row).
         det_hyps = []
-        for i in range(5):
-            h = _make_hyp("direct_call_contract_drift", i, derivation="deterministic_static")
+        for i in range(20):
+            h = _make_hyp(f"direct_call_contract_drift_{i}", i, derivation="deterministic_static")
             h["why"] += (" Extended rationale with detailed analysis of the change. " * 30)
             h["source_checks"] = [
                 {"reason": f"check_{j}", "anchor": f"src/a{i}.py", "repo": "repo-test", "path": f"src/a{i}.py"}
@@ -285,7 +299,9 @@ class TestSemanticRowBudgetSurvival(unittest.TestCase):
             det_hyps.append(h)
         sem_hyp = _make_hyp("contract_semantic_diff", 99, derivation="inferred_llm")
         sem_hyp["why"] += " Semantic contract diff analysis. " * 10
-        # Place semantic last — this is the low-priority position
+        # +2 boost: cause path is a changed production file. This is why it wins by SCORE.
+        sem_hyp["cause"] = {"repo": "repo-test", "path": changed_prod, "line_start": 1, "line_end": 4}
+        # Place semantic last — a naive prefix fill or a low derivation tiebreak would drop it.
         hypotheses = det_hyps + [sem_hyp]
 
         # Create a packet that starts over the 15K compact limit.
@@ -299,7 +315,7 @@ class TestSemanticRowBudgetSurvival(unittest.TestCase):
         return packet, hypotheses, sem_hyp
 
     def test_semantic_row_survives_budget_truncation(self):
-        """contract_semantic_diff row at position 5 must survive when budget forces cuts."""
+        """Higher-scored contract_semantic_diff row at the last position survives budget cuts."""
         packet, _, sem_hyp = self._make_over_budget_packet_with_semantic()
         result = enforce_review_context_budget(packet)
 
@@ -359,22 +375,35 @@ class TestSemanticRowBudgetSurvival(unittest.TestCase):
             "expected truncation to drop at least one hypothesis",
         )
 
-    # INVERSION PROOF: if _DIFF_DERIVED_RISK_TYPES is emptied or the pinning block in
-    # _hypothesis_first_compact_packet is removed, the semantic row at position 5 will
-    # be truncated by the budget fill loop (only prefix survives). The test
-    # test_semantic_row_survives_budget_truncation would then fail because
-    # returned_risk_types would not contain "contract_semantic_diff".
+    # INVERSION PROOF: if the budget layer's eviction reverts to diff-first pinning (evicting
+    # non-diff / lower-tier rows to keep diff families regardless of score), the +2 semantic
+    # row would still survive but for the WRONG reason. The load-bearing inversion is the
+    # field-replay regression below (test_field_replay_zero_score_diff_family_evicted): restore
+    # diff-first pinning and it fails. Here, if score ceased to drive survival and the semantic
+    # row lost its +2 boost (cause not in a changed file), it would be evicted first on the
+    # derivation tiebreak — verified by removing sem_hyp["cause"]: the test then fails.
 
     def test_diff_derived_constant_includes_semantic_type(self):
         """Constant sanity: contract_semantic_diff is in _DIFF_DERIVED_RISK_TYPES."""
         self.assertIn("contract_semantic_diff", _DIFF_DERIVED_RISK_TYPES)
 
-    def test_multiple_diff_derived_types_all_survive(self):
-        """All diff-derived types present in original_hypotheses survive budget."""
+    def test_higher_scored_diff_types_survive_over_lower_scored_competitors(self):
+        """Diff-derived families that outscore their competitors survive budget — by SCORE.
+
+        Three diff-derived families carry a +2 boost (cause in a changed production file);
+        four low-score generic families (score 0) are the ones truncated under pressure.
+        """
+        changed_prod = "src/module_0.py"  # present in _base_packet changed_files
         diff_types = ["contract_semantic_diff", "guard_call_removed_drift", "abstract_contract_unimplemented"]
-        # 4 non-diff hypotheses (large) + 3 diff-derived at the end
+        # 4 low-score generic hypotheses (large, score 0) + 3 higher-scored diff-derived rows.
         non_diff = [_make_hyp("generic_drift", i) for i in range(4)]
-        diff_hyps = [_make_hyp(rt, 100 + i, derivation="deterministic_static") for i, rt in enumerate(diff_types)]
+        for h in non_diff:
+            h["why"] += (" filler rationale " * 60)  # inflate so pressure forces truncation
+        diff_hyps = []
+        for i, rt in enumerate(diff_types):
+            h = _make_hyp(rt, 100 + i, derivation="deterministic_static")
+            h["cause"] = {"repo": "repo-test", "path": changed_prod, "line_start": 1, "line_end": 4}  # +2
+            diff_hyps.append(h)
         hypotheses = non_diff + diff_hyps
 
         packet = _base_packet(hypotheses, extra_bulk=40)
@@ -385,7 +414,7 @@ class TestSemanticRowBudgetSurvival(unittest.TestCase):
         returned_risk_types = {h.get("risk_type") for h in returned_hyps if isinstance(h, dict)}
 
         for rt in diff_types:
-            self.assertIn(rt, returned_risk_types, f"diff-derived type {rt!r} was evicted")
+            self.assertIn(rt, returned_risk_types, f"higher-scored diff family {rt!r} was evicted")
         # Budget still respected.
         self.assertLessEqual(len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS)
 
@@ -503,6 +532,140 @@ class TestCompactBeforeEvictFamilyFloor(unittest.TestCase):
     # pin path drops at least one family — test_all_four_diff_families_survive would fail
     # because returned_types would omit a diff family. Verified by temporarily making
     # _compact_hypothesis_rows_to_fit a no-op.
+
+
+# ---------------------------------------------------------------------------
+# Part B2: budget-time score-ordered eviction (field-replay regression)
+# ---------------------------------------------------------------------------
+
+_FIELD_REPLAY_CHANGED_FILES = ["src/module_0.py", "src/module_1.py"]
+_FIELD_REPLAY_CHANGED_PROD = "src/module_0.py"
+
+
+def _score_shaped_hyp(risk_type: str, derivation: str | None, *, cause=None, consequence=None) -> dict:
+    """A hypothesis row whose structural score is controlled by its cause/consequence paths.
+
+    postable_claim is inflated to a size that survives compaction (it is a load-bearing
+    field), so each row has a large irreducible floor — the budget can hold only two.
+    """
+    idx = abs(hash(risk_type)) % 100000
+    h = _make_hyp(risk_type, idx, derivation=derivation)
+    if derivation is None:
+        h.pop("derivation", None)
+    if cause is not None:
+        h["cause"] = cause
+    if consequence is not None:
+        h["consequence"] = consequence
+    h["postable_claim"] = "claim word " * 350
+    return h
+
+
+class TestBudgetScoreOrderedEviction(unittest.TestCase):
+    """Field-replay regression: under char pressure the budget layer evicts the LOWEST-scored
+    family first — diff-derived or not — reversing the shared seat plan the cap seated by.
+
+    Geometry (engine f1c93a0 field packet): families scoring
+      {+2 inferred_llm (contract_semantic_diff, DIFF), +2 non-diff, +2 non-diff,
+       0 deterministic-diff, -2 deterministic-diff}
+    with a char budget that fits only 2 rows after compaction. Correct result: the +2 inferred
+    row and the FIRST +2 non-diff row survive; the 0-score and -2 diff families are evicted and
+    visible in truncated_by_risk_type. The prior split policy (budget-time diff-first pinning)
+    kept the 0-score diff family and dropped a +2 non-diff row — the exact bug this fixes.
+    """
+
+    _PROD_CAUSE_1 = {"repo": "repo-test", "path": _FIELD_REPLAY_CHANGED_PROD, "line_start": 1, "line_end": 2}
+    _PROD_CAUSE_2 = {"repo": "repo-test", "path": _FIELD_REPLAY_CHANGED_PROD, "line_start": 3, "line_end": 4}
+    _PROD_CAUSE_3 = {"repo": "repo-test", "path": _FIELD_REPLAY_CHANGED_PROD, "line_start": 5, "line_end": 6}
+    _TEST_CAUSE = {"repo": "repo-test", "path": "tests/t.py", "line_start": 1, "line_end": 2}
+    _TEST_CONS = {"repo": "repo-test", "path": "tests/u.py", "line_start": 1, "line_end": 2}
+
+    def _field_replay_packet(self):
+        sem = _score_shaped_hyp("contract_semantic_diff", "inferred_llm", cause=self._PROD_CAUSE_1)  # +2 DIFF
+        async_row = _score_shaped_hyp("async_side_effect_lifecycle_drift", None, cause=self._PROD_CAUSE_2)  # +2 non-diff
+        destr = _score_shaped_hyp("destructive_mutation_test_gap", None, cause=self._PROD_CAUSE_3)  # +2 non-diff
+        moved = _score_shaped_hyp("responsibility_moved_drift", "deterministic_static")  # 0 DIFF
+        guard = _score_shaped_hyp(
+            "guard_call_removed_drift", "deterministic_static", cause=self._TEST_CAUSE, consequence=self._TEST_CONS
+        )  # -2 DIFF
+        rows = [sem, async_row, destr, moved, guard]
+        # Thread the shared plan exactly as the producer does — scored over the full changed set.
+        plan = compute_hypothesis_seat_plan(
+            rows, changed_files=_FIELD_REPLAY_CHANGED_FILES, changed_symbols=[]
+        )
+        packet = _base_packet(rows, extra_bulk=40)
+        packet["_hypothesis_seat_plan"] = plan
+        self.assertGreater(len(canonical_json(packet)), REVIEW_CONTEXT_MAX_CHARS, "fixture must start over budget")
+        return packet, rows
+
+    def test_score_ordered_eviction_keeps_top_two_by_score(self):
+        packet, _rows = self._field_replay_packet()
+        result = enforce_review_context_budget(packet)
+        returned = [h.get("risk_type") for h in (result.get("review_hypotheses") or [])]
+
+        # Only two rows fit; they must be the two highest-scored families.
+        self.assertEqual(len(returned), 2, f"budget must hold exactly 2 rows; got {returned}")
+        self.assertIn("contract_semantic_diff", returned, "the +2 inferred_llm diff row must survive")
+        self.assertIn(
+            "async_side_effect_lifecycle_drift", returned,
+            f"the first +2 non-diff row must survive over a 0-score diff family; got {returned}",
+        )
+        # The 0-score diff family is EVICTED — it does not outlive a +2 non-diff row anymore.
+        self.assertNotIn(
+            "responsibility_moved_drift", returned,
+            f"0-score diff family must be evicted, not pinned; got {returned}",
+        )
+
+    def test_evicted_families_visible_in_truncated_by_risk_type(self):
+        packet, _rows = self._field_replay_packet()
+        result = enforce_review_context_budget(packet)
+        trunc = result.get("review_hypothesis_status", {}).get("truncated_by_risk_type", {})
+        # Evicted families are recorded — never silent absence.
+        self.assertEqual(trunc.get("responsibility_moved_drift"), 1, f"0-score diff family must be recorded; {trunc}")
+        self.assertEqual(trunc.get("guard_call_removed_drift"), 1, f"-2 diff family must be recorded; {trunc}")
+
+    def test_budget_respected(self):
+        packet, _rows = self._field_replay_packet()
+        result = enforce_review_context_budget(packet)
+        size = len(canonical_json(result))
+        self.assertLessEqual(size, REVIEW_CONTEXT_MAX_CHARS, f"packet {size} exceeds cap")
+
+    def test_inversion_diff_first_eviction_would_keep_the_zero_score_diff_family(self):
+        """INVERSION PROOF: restore diff-first pinning (evict non-diff before diff) and the
+        0-score diff family survives while a +2 non-diff row is dropped — the old bug. We
+        emulate that by patching the eviction selector to prefer evicting non-diff rows, and
+        assert the WRONG result appears, proving the score-ordered selector is load-bearing.
+        """
+        from source.kg.product.output_budget import _DIFF_DERIVED_RISK_TYPES
+
+        def _diff_first_evict(hypotheses, keep_rank, *, protected):
+            # Old policy: drop the last non-diff row (never a diff family) — ignore score.
+            for i in range(len(hypotheses) - 1, -1, -1):
+                if id(hypotheses[i]) in protected:
+                    continue
+                if hypotheses[i].get("risk_type") not in _DIFF_DERIVED_RISK_TYPES:
+                    return i
+            # Fall back to the last non-protected row if only diff rows remain.
+            for i in range(len(hypotheses) - 1, -1, -1):
+                if id(hypotheses[i]) not in protected:
+                    return i
+            return None
+
+        packet, _rows = self._field_replay_packet()
+        with mock.patch.object(
+            output_budget_module, "_lowest_scored_hypothesis_index", _diff_first_evict
+        ):
+            result = enforce_review_context_budget(packet)
+        returned = {h.get("risk_type") for h in (result.get("review_hypotheses") or [])}
+        # Under the restored diff-first policy the 0-score diff family survives and a +2 non-diff
+        # family is the one dropped — demonstrating the regression the real selector prevents.
+        self.assertIn(
+            "responsibility_moved_drift", returned,
+            f"inversion: diff-first pinning keeps the 0-score diff family; got {returned}",
+        )
+        self.assertNotIn(
+            "async_side_effect_lifecycle_drift", returned,
+            f"inversion: diff-first pinning drops a +2 non-diff row; got {returned}",
+        )
 
 
 # ---------------------------------------------------------------------------

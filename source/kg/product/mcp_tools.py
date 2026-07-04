@@ -18,7 +18,7 @@ from source.kg.product.output_budget import (
     PLANNING_CONTEXT_ANCHORED_MAX_CHARS,
     REVIEW_CONTEXT_BROAD_MAX_CHARS,
     _DIFF_DERIVED_RISK_TYPES,
-    plan_hypothesis_seats,
+    compute_hypothesis_seat_plan,
     enforce_planning_context_budget,
     enforce_review_context_budget,
     enforce_reverse_impact_budget,
@@ -3107,11 +3107,21 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     review_hypotheses = apply_structural_noise_downranking(
         review_hypotheses, changed_files, changed_symbols_in_scope
     )
+    # Compute the score-driven seat plan ONCE over the full pre-cap set (with the full,
+    # un-sliced changed_files/changed_symbols so scoring is authoritative), then thread the
+    # SAME plan to the cap and, via the packet, to the budget layer. Both consume one
+    # ordering so cap seating and budget eviction can never diverge again.
+    hypothesis_seat_plan = compute_hypothesis_seat_plan(
+        review_hypotheses,
+        changed_files=changed_files,
+        changed_symbols=changed_symbols_in_scope,
+    )
     review_hypotheses = _cap_review_hypotheses_reserving_diff_families(
         review_hypotheses,
         PLANNING_CONTEXT_SECTION_LIMIT,
         changed_files=changed_files,
         changed_symbols=changed_symbols_in_scope,
+        seat_plan=hypothesis_seat_plan,
     )
     review_answer_packet["top_review_hypotheses"] = review_hypotheses[:PLANNING_CONTEXT_SECTION_LIMIT]
     if base_snapshot_dir:
@@ -3198,6 +3208,9 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         # Producer-side pre-cap generated counts (private; consumed and removed by the
         # review budget layer's hypothesis-status computation, never surfaced to callers).
         "_generated_hypothesis_counts": generated_hypothesis_counts,
+        # Shared score-driven seat plan (private; consumed and removed by the review budget
+        # layer so budget-time eviction reverses the SAME ordering the cap seated by).
+        "_hypothesis_seat_plan": hypothesis_seat_plan,
     }
     if _review_context_should_compact_unanchored(
         changed_ranges=changed_ranges,
@@ -3408,6 +3421,7 @@ def _cap_review_hypotheses_reserving_diff_families(
     *,
     changed_files: list[str] | None = None,
     changed_symbols: list[JsonObject] | None = None,
+    seat_plan: JsonObject | None = None,
 ) -> list[JsonObject]:
     """Cap the top-level hypothesis list to ``limit`` while guaranteeing that the highest
     structural-value families each keep a representative row.
@@ -3434,14 +3448,15 @@ def _cap_review_hypotheses_reserving_diff_families(
     """
     if limit <= 0:
         return []
-    seated_types = set(
-        plan_hypothesis_seats(
+    # Consume the caller-threaded shared plan when provided so the cap and the budget layer
+    # seat/evict off ONE ordering; recompute only when called standalone (tests/fixtures).
+    if seat_plan is None:
+        seat_plan = compute_hypothesis_seat_plan(
             review_hypotheses,
-            limit=limit,
             changed_files=changed_files or [],
             changed_symbols=changed_symbols,
         )
-    )
+    seated_types = set(list(seat_plan.get("ordered_types") or [])[:limit])
 
     kept_ids: set[int] = set()
     # One representative (first occurrence) per seated family.
