@@ -207,6 +207,31 @@ class Wave4ReviewEntryResolutionTests(unittest.TestCase):
             self.assertEqual(len([path for path in cache_root.iterdir() if path.is_dir()]), 2)
             exclude_text = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
             self.assertIn(".supercontext/", exclude_text)
+            head_snapshot = Path(first["entry_resolution"]["snapshots"]["head_snapshot"])
+            head_entities = [
+                json.loads(line)
+                for line in (head_snapshot / "entities.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            leaked_entity_paths = sorted(
+                path
+                for row in head_entities
+                for path in [row.get("properties", {}).get("path")]
+                if isinstance(path, str) and path.startswith(".supercontext/")
+            )
+            head_evidence = [
+                json.loads(line)
+                for line in (head_snapshot / "evidence.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            leaked_evidence_paths = sorted(
+                path
+                for row in head_evidence
+                for path in [(row.get("bytes_ref") or {}).get("path")]
+                if isinstance(path, str) and path.startswith(".supercontext/")
+            )
+            self.assertEqual([], leaked_entity_paths)
+            self.assertEqual([], leaked_evidence_paths)
 
     def test_review_context_non_git_dir_returns_structured_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -374,6 +399,8 @@ class Wave4ReviewEntryResolutionTests(unittest.TestCase):
             self.assertEqual(dirty["status"], "error")
             self.assertIn("dirty_worktree", dirty["entry_resolution"]["derivation_failures"])
             self.assertFalse((repo / ".supercontext" / "kg").exists())
+            exclude_text = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+            self.assertNotIn(".supercontext/", exclude_text)
 
             _commit_all(repo, "commit dirty change")
             clean = call_tool(kg, "review_context", {"repo_path": str(repo), "base_ref": "HEAD~1"})
@@ -632,6 +659,27 @@ class Wave4ReviewEntryResolutionTests(unittest.TestCase):
         self.assertTrue(ranges)
         self.assertEqual({row["path"] for row in ranges}, {"pkg/has space.py"})
 
+    def test_changed_range_parser_preserves_trailing_space_path_marker(self) -> None:
+        from source.kg.product.review_entry_resolution import _derive_changed_ranges
+
+        path = "pkg/trailing-space.py "
+        diff_text = (
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\t\n"
+            f"+++ b/{path}\t\n"
+            "@@ -1 +1,2 @@\n"
+            "-old\n"
+            "+new\n"
+            "+again\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            with patch("source.kg.product.review_entry_resolution._git_stdout", return_value=diff_text):
+                ranges = _derive_changed_ranges(repo, "HEAD~1", [path])
+
+        self.assertEqual(ranges, [{"path": path, "start_line": 1, "end_line": 2}])
+
     def test_malformed_hunk_range_is_skipped_not_raised(self) -> None:
         from source.kg.product.review_entry_resolution import _parse_hunk_added_range
 
@@ -725,6 +773,37 @@ class Wave4ReviewEntryResolutionTests(unittest.TestCase):
             self.assertLessEqual(len(remaining), 4)
             self.assertIn("sha-0", remaining)
             self.assertIn("sha-5", remaining)
+
+    def test_safe_remove_cache_dir_unlinks_symlink_without_following_target(self) -> None:
+        from source.kg.product.review_entry_resolution import _safe_remove_cache_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_root = root / ".supercontext" / "kg"
+            cache_root.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            outside_marker = outside / "sentinel.txt"
+            outside_marker.write_text("keep", encoding="utf-8")
+            link = cache_root / "linked-cache-entry"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+
+            _safe_remove_cache_dir(link, root=cache_root)
+
+            self.assertFalse(link.exists())
+            self.assertFalse(link.is_symlink())
+            self.assertTrue(outside_marker.exists())
+
+            ordinary = cache_root / "ordinary-cache-entry"
+            ordinary.mkdir()
+            (ordinary / "manifest.json").write_text("{}", encoding="utf-8")
+
+            _safe_remove_cache_dir(ordinary, root=cache_root)
+
+            self.assertFalse(ordinary.exists())
 
     def test_cache_lock_reclaims_dead_pid_lock(self) -> None:
         from source.kg.product.review_entry_resolution import _cache_lock

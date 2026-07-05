@@ -139,21 +139,6 @@ def resolve_review_context_entry(kg: KgSnapshot, arguments: JsonObject) -> Resol
             terminal_payload=_terminal_resolution_payload(entry_resolution),
         )
     try:
-        _ensure_supercontext_excluded(repo_path)
-    except RuntimeError as exc:
-        entry_resolution = _entry_resolution(
-            mode="derived",
-            status="failed",
-            base_ref=base_ref_arg,
-            derivation_failures=[_failure_reason(exc)],
-        )
-        return ResolvedReviewContextEntry(
-            kg=kg,
-            arguments=dict(arguments),
-            entry_resolution=entry_resolution,
-            terminal_payload=_terminal_resolution_payload(entry_resolution),
-        )
-    try:
         dirty_worktree = _is_dirty_worktree(repo_path)
     except RuntimeError as exc:
         entry_resolution = _entry_resolution(
@@ -217,6 +202,7 @@ def resolve_review_context_entry(kg: KgSnapshot, arguments: JsonObject) -> Resol
                 _warnings_out=derivation_warnings,
             )
             if derived_files:
+                _ensure_supercontext_excluded(repo_path)
                 base_checkout, base_worktree_reused, base_worktree_recreated = _ensure_base_worktree(repo_path, base_sha)
                 base_snapshot, base_snapshot_reused = _ensure_snapshot(base_checkout, base_sha, cache_root=repo_path)
                 head_snapshot, head_snapshot_reused = _ensure_snapshot(repo_path, head_sha, cache_root=repo_path)
@@ -559,7 +545,7 @@ def _derive_changed_ranges(
             awaiting_new_header = True
             continue
         if not in_hunk and awaiting_new_header and line.startswith("+++ "):
-            marker = line[4:].strip()
+            marker = line[4:].split("\t", 1)[0]
             current_path = None if marker == "/dev/null" else _strip_diff_prefix(marker)
             awaiting_new_header = False
             continue
@@ -751,14 +737,20 @@ def _prune_snapshot_cache(cache_root: Path, *, keep: set[Path]) -> None:
 def _safe_remove_cache_dir(path: Path, *, root: Path) -> None:
     resolved_root = root.resolve()
     try:
+        resolved_parent = path.parent.resolve()
+    except OSError as exc:
+        raise RuntimeError("cache_path_resolution_failed") from exc
+    if not resolved_parent.is_relative_to(resolved_root):
+        raise RuntimeError("cache_path_escape")
+    if path.is_symlink():
+        path.unlink()
+        return
+    try:
         resolved_path = path.resolve()
     except OSError as exc:
         raise RuntimeError("cache_path_resolution_failed") from exc
     if not resolved_path.is_relative_to(resolved_root):
         raise RuntimeError("cache_path_escape")
-    if path.is_symlink():
-        path.unlink()
-        return
     shutil.rmtree(path)
 
 
