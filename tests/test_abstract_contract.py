@@ -26,6 +26,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from source.kg.build.pipeline import build_kg
 from source.kg.core.models import JsonObject
@@ -341,6 +342,37 @@ def _abstract_rows(result: JsonObject) -> list[JsonObject]:
 
 class TestAbstractContractPositive(unittest.TestCase):
     """Reparent onto abstract base with unimplemented members → row in FINAL packet."""
+
+    def test_invalid_abstract_rows_do_not_crash_splice(self) -> None:
+        from source.kg.product.mcp_tools import _splice_abstract_contract_hypotheses
+
+        base_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(Concrete):\n"
+            "    pass\n"
+        )
+        head_core = _ABSTRACT_BASE + _CONCRETE_BASE + (
+            "\n\nclass Widget(BaseThing):\n"
+            "    pass\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            out_base, out_head, base_ck, head_ck = _build_pair(tmpdir, base_core, head_core)
+            head_kg = KgSnapshot(out_head)
+            with patch(
+                "source.kg.query.abstract_contract.abstract_contract_diff",
+                return_value=([{"risk_type": _RISK}], {"rows_generated": 1}),
+            ):
+                merged, status = _splice_abstract_contract_hypotheses(
+                    base_snapshot_dir=str(out_base),
+                    head_kg=head_kg,
+                    base_checkout=str(base_ck),
+                    head_checkout=str(head_ck),
+                    changed_symbols=[{"qualname": "Widget", "path": "core.py"}],
+                    review_hypotheses=[],
+                )
+
+        self.assertEqual(merged, [])
+        self.assertEqual(status, "active")
 
     def test_row_in_final_packet_with_member_names(self) -> None:
         base_core = _ABSTRACT_BASE + _CONCRETE_BASE + (

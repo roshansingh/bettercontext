@@ -79,6 +79,8 @@ def _make_hyp(risk_type: str, idx: int, lead_ids: list[str] | None = None, deriv
     }
     if derivation is not None:
         h["derivation"] = derivation
+    if risk_type == "contract_semantic_diff":
+        h["verification"] = "verified"
     return h
 
 
@@ -679,6 +681,8 @@ def _cap_hyp(risk_type: str, idx: int, derivation: str | None) -> dict:
     }
     if derivation is not None:
         h["derivation"] = derivation
+    if risk_type == "contract_semantic_diff":
+        h["verification"] = "verified"
     return h
 
 
@@ -771,18 +775,22 @@ TENANT = "default"
 
 def _build_combined_pair(tmpdir: Path) -> tuple[Path, Path, Path, Path]:
     """base + head where core.py has BOTH contract-diff churn (guard/moved/test-ref)
-    AND a class reparented onto an abstract base with unimplemented members.
+    AND deterministic high-signal families that would be easy to crowd out.
 
     Base and head live in SEPARATE checkout dirs (the abstract/semantic detectors diff
     the two checkouts on disk, so an in-place overwrite would produce an empty diff).
-    Yields up to 4 generated diff-derived families (3 contract + 1 abstract) that all
-    exceed the top-level cap once generic caller hypotheses are added.
+    Yields 5 generated diff-derived families (3 contract + abstract + async-result).
+    The duplicate async-result rows intentionally make a naive top-5 slice drop a later
+    family, while the reservation cap can still return one row per family.
     """
     abstract_base = (
         "import abc\n\n\n"
         "class BaseThing(abc.ABC):\n"
         "    @abc.abstractmethod\n"
         "    def build_it(self, x):\n"
+        "        ...\n\n\n"
+        "    @abc.abstractmethod\n"
+        "    def render_it(self, x):\n"
         "        ...\n\n\n"
         "class Concrete:\n"
         "    def evaluate(self):\n"
@@ -797,6 +805,10 @@ def _build_combined_pair(tmpdir: Path) -> tuple[Path, Path, Path, Path]:
         "def gamma():\n    pass\n\n"
         "def delta():\n    pass\n\n"
         "def eps():\n    gamma()\n\n"
+        "def make_value():\n    return 'value'\n\n"
+        "def use_value():\n    value = make_value()\n    return value.upper()\n\n"
+        "def make_other():\n    return 'other'\n\n"
+        "def use_other():\n    value = make_other()\n    return value.upper()\n\n"
         "class Widget(Concrete):\n"
         "    def evaluate(self):\n"
         "        return 2\n"
@@ -807,6 +819,10 @@ def _build_combined_pair(tmpdir: Path) -> tuple[Path, Path, Path, Path]:
         "def gamma():\n    pass\n\n"
         "def delta():\n    gamma()\n\n"
         "def eps():\n    pass\n\n"
+        "async def make_value():\n    return 'value'\n\n"
+        "def use_value():\n    value = make_value()\n    return value.upper()\n\n"
+        "async def make_other():\n    return 'other'\n\n"
+        "def use_other():\n    value = make_other()\n    return value.upper()\n\n"
         "class Widget(BaseThing):\n"
         "    pass\n"
     )
@@ -849,6 +865,9 @@ class TestCapReservationRealPipeline(unittest.TestCase):
             ]
             return original(rows, limit, **kwargs)
 
+        def _no_semantic_splice(**kwargs):
+            return kwargs["review_hypotheses"], "active"
+
         with tempfile.TemporaryDirectory() as td:
             tmpdir = Path(td)
             out_base, out_head, base_ck, head_ck = _build_combined_pair(tmpdir)
@@ -857,6 +876,10 @@ class TestCapReservationRealPipeline(unittest.TestCase):
                 mcp_tools_module,
                 "_cap_review_hypotheses_reserving_diff_families",
                 _spy,
+            ), mock.patch.object(
+                mcp_tools_module,
+                "_splice_semantic_diff_hypotheses",
+                _no_semantic_splice,
             ):
                 result = call_tool(
                     head_kg,
@@ -1019,6 +1042,7 @@ class TestScoreDrivenSeatAllocation(unittest.TestCase):
         mid_inferred = {
             "risk_type": "contract_semantic_diff",
             "derivation": "inferred_llm",
+            "verification": "verified",
             "cause": {"path": "src/core.py", "line_start": 3},  # changed prod file → +2
         }
         next_best = {  # neutral non-diff family, score 0
@@ -1072,6 +1096,7 @@ class TestScoreDrivenSeatAllocation(unittest.TestCase):
         semantic = {  # inferred_llm diff row, changed production-file cause → +2
             "risk_type": "contract_semantic_diff",
             "derivation": "inferred_llm",
+            "verification": "verified",
             "cause": {"path": "src/core.py", "line_start": 9},
         }
         # Noisy diff families FIRST so a derivation-first / carve-out policy keeps them.

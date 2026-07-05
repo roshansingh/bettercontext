@@ -114,9 +114,13 @@ class McpToolsTest(unittest.TestCase):
         self.assertEqual(schemas["reverse_impact"]["properties"]["depth"]["default"], 3)
         self.assertEqual(schemas["reverse_impact"]["properties"]["include_all"]["default"], False)
         self.assertEqual(schemas["planning_context"]["properties"]["symbol"]["type"], ["string", "null"])
+        self.assertEqual(schemas["review_context"]["properties"]["repo_path"]["type"], "string")
+        self.assertEqual(schemas["review_context"]["properties"]["base_ref"]["type"], "string")
         self.assertEqual(schemas["review_context"]["properties"]["changed_files"]["type"], "array")
         self.assertEqual(schemas["review_context"]["properties"]["requested_surfaces"]["type"], "array")
         self.assertEqual(schemas["review_context"]["properties"]["include_unlinked_leads"]["default"], False)
+        self.assertEqual(schemas["review_context"]["properties"]["execute_followups"]["default"], True)
+        self.assertEqual(schemas["review_context"].get("required"), [])
         self.assertNotIn("depth", schemas["review_context"]["properties"])
         self.assertIn("operational_surfaces.evidence_partition", descriptions["get_service_brief"])
         self.assertIn("operational_surfaces.deploy_link_facts", descriptions["get_service_brief"])
@@ -132,11 +136,12 @@ class McpToolsTest(unittest.TestCase):
         self.assertIn("investigation_brief_only", descriptions["planning_context"])
         self.assertIn("related_facts.symbol_impact.reverse_impact", descriptions["planning_context"])
         self.assertIn("ownership_context", descriptions["planning_context"])
-        self.assertIn("review_answer_packet", descriptions["review_context"])
-        self.assertIn("review_answer_packet.changed_file_symbol_inventory", descriptions["review_context"])
-        self.assertIn("requested_surfaces", descriptions["review_context"])
-        self.assertIn("framework_impact", descriptions["review_context"])
-        self.assertIn("application_impact", descriptions["review_context"])
+        self.assertIn("Call this FIRST", descriptions["review_context"])
+        self.assertIn("repo_path plus base_ref", descriptions["review_context"])
+        self.assertIn("entry_resolution", descriptions["review_context"])
+        self.assertIn("review_quality_status", descriptions["review_context"])
+        self.assertIn("source-inspection context, not proof", descriptions["review_context"])
+        self.assertIn("no_supercontext_hypothesis_used", descriptions["review_context"])
         self.assertIn("disambiguation.retry_arguments", descriptions["find_callers"])
         self.assertIn("unqualified symbol name", schemas["reverse_impact"]["properties"]["symbol"]["description"])
         self.assertIn("__init__", descriptions["reverse_impact"])
@@ -8046,7 +8051,11 @@ class TestR1FundingBoilerplateVictim(unittest.TestCase):
         # Only meaningful if original exceeds cap
         if original_size <= REVIEW_CONTEXT_MAX_CHARS:
             self.skipTest("fixture does not exceed cap — increase boilerplate mass")
-        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result = enforce_review_context_budget(
+            packet,
+            max_chars=REVIEW_CONTEXT_MAX_CHARS,
+            execute_followups=False,
+        )
         result_size = len(canonical_json(result))
         self.assertLessEqual(result_size, REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
 
@@ -8063,7 +8072,11 @@ class TestR1FundingBoilerplateVictim(unittest.TestCase):
         from source.kg.core.models import canonical_json
         if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
             self.skipTest("fixture does not exceed cap")
-        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result = enforce_review_context_budget(
+            packet,
+            max_chars=REVIEW_CONTEXT_MAX_CHARS,
+            execute_followups=False,
+        )
         result_size = len(canonical_json(result))
         self.assertLessEqual(result_size, REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
         # At least some anchors must survive
@@ -8100,7 +8113,11 @@ class TestR1FundingBoilerplateVictim(unittest.TestCase):
         from source.kg.core.models import canonical_json
         if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
             self.skipTest("fixture does not exceed cap")
-        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result = enforce_review_context_budget(
+            packet,
+            max_chars=REVIEW_CONTEXT_MAX_CHARS,
+            execute_followups=False,
+        )
         self.assertLessEqual(len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
         rows = result.get("surface_status") or []
         unknown_rows = [r for r in rows if isinstance(r, dict) and r.get("status") == "unsupported_or_unlinked"]
@@ -8125,7 +8142,11 @@ class TestR1FundingBoilerplateVictim(unittest.TestCase):
         from source.kg.core.models import canonical_json
         if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
             self.skipTest("fixture does not exceed cap")
-        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result = enforce_review_context_budget(
+            packet,
+            max_chars=REVIEW_CONTEXT_MAX_CHARS,
+            execute_followups=False,
+        )
         self.assertLessEqual(len(canonical_json(result)), REVIEW_CONTEXT_MAX_CHARS, "cap must be held")
         rows = [
             r
@@ -8522,7 +8543,11 @@ class TestCompactProfileTruncatedSections(unittest.TestCase):
         packet = self._make_compact_packet(n_diff_anchors=25, n_source_coords=0, n_rl_source_coords=0)
         if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
             self.skipTest("fixture does not exceed compact cap")
-        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result = enforce_review_context_budget(
+            packet,
+            max_chars=REVIEW_CONTEXT_MAX_CHARS,
+            execute_followups=False,
+        )
         budget = result.get("output_budget") or {}
         truncated = budget.get("truncated_sections") or []
         returned_diff_anchors = result.get("diff_anchors") or []
@@ -8539,7 +8564,11 @@ class TestCompactProfileTruncatedSections(unittest.TestCase):
         packet = self._make_compact_packet(n_diff_anchors=0, n_source_coords=5, n_rl_source_coords=5)
         if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
             self.skipTest("fixture does not exceed compact cap")
-        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result = enforce_review_context_budget(
+            packet,
+            max_chars=REVIEW_CONTEXT_MAX_CHARS,
+            execute_followups=False,
+        )
         budget = result.get("output_budget") or {}
         truncated = budget.get("truncated_sections") or []
         returned_sc = result.get("source_coordinates") or []
@@ -8743,7 +8772,11 @@ class TestCompactSkeletonCommonContract(unittest.TestCase):
         packet = self._build_over_budget_packet()
         if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
             self.skipTest("fixture does not exceed compact cap")
-        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result = enforce_review_context_budget(
+            packet,
+            max_chars=REVIEW_CONTEXT_MAX_CHARS,
+            execute_followups=False,
+        )
         self.assertIn("packet_contract", result, "compact skeleton must include packet_contract")
         self.assertIsInstance(result["packet_contract"], dict)
 
@@ -8753,7 +8786,11 @@ class TestCompactSkeletonCommonContract(unittest.TestCase):
         packet = self._build_over_budget_packet()
         if len(canonical_json(packet)) <= REVIEW_CONTEXT_MAX_CHARS:
             self.skipTest("fixture does not exceed compact cap")
-        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result = enforce_review_context_budget(
+            packet,
+            max_chars=REVIEW_CONTEXT_MAX_CHARS,
+            execute_followups=False,
+        )
         self.assertIn("answerability", result, "compact skeleton must include answerability")
         self.assertEqual(result["answerability"].get("status"), "answerable")
 
@@ -8761,7 +8798,11 @@ class TestCompactSkeletonCommonContract(unittest.TestCase):
         """Compact output must stay ≤ 15,000 chars even with packet_contract present."""
         from source.kg.core.models import canonical_json
         packet = self._build_over_budget_packet()
-        result = enforce_review_context_budget(packet, max_chars=REVIEW_CONTEXT_MAX_CHARS)
+        result = enforce_review_context_budget(
+            packet,
+            max_chars=REVIEW_CONTEXT_MAX_CHARS,
+            execute_followups=False,
+        )
         size = len(canonical_json(result))
         self.assertLessEqual(size, REVIEW_CONTEXT_MAX_CHARS, f"compact size {size} exceeds 15000")
 

@@ -1004,6 +1004,9 @@ class KgSnapshot:
             return self._resolve_symbol(callee_query, limit=limit, allow_fuzzy=False)
         return self._resolution_result(callee_query, "exact_name", entities, limit)
 
+    def symbol_import_consumer_leads(self, resolution: JsonObject, *, limit: int) -> JsonObject:
+        return self._symbol_import_consumer_leads(resolution, limit=limit)
+
     def _symbol_import_consumer_leads(self, resolution: JsonObject, *, limit: int) -> JsonObject:
         if resolution.get("status") != "resolved":
             return {

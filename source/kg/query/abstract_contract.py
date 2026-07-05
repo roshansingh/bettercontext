@@ -921,5 +921,8 @@ def _build_row(
         "unimplemented_members": list(unimplemented),
         "abstract_base": abstract_base.qualname,
         "subclass": subclass_qualname,
+        "subject_urn": str(subclass_entity.get("urn") or ""),
+        "subject_qualname": subclass_qualname,
+        "subject_path": str(cause.get("path") or ""),
     }
     return row

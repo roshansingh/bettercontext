@@ -25,6 +25,11 @@ PLANNING_CONTEXT_ANCHORED_MAX_CHARS = 60_000
 REVIEW_CONTEXT_MAX_CHARS = 15_000
 # Broad profile (include_broad_context=True): preserves legacy 40K behavior.
 REVIEW_CONTEXT_BROAD_MAX_CHARS = 40_000
+# Default compact review_context can attach internally executed follow-up packets
+# after the 15K parent packet is finalized. Keep the combined response below 20K.
+REVIEW_CONTEXT_FOLLOWUP_COMBINED_MAX_CHARS = 20_000
+REVIEW_CONTEXT_FOLLOWUP_PACKET_LIMIT = 2
+REVIEW_CONTEXT_FOLLOWUP_ROWS_PER_PACKET = 3
 REVERSE_IMPACT_MAX_CHARS = 40_000
 # get_service_brief.operational_surfaces is unbounded today and balloons on real
 # multi-repo snapshots; bound it with the same head-start discipline. Slightly above the
@@ -582,6 +587,7 @@ def enforce_review_context_budget(
     *,
     max_chars: int | None = None,
     include_broad_context: bool = False,
+    execute_followups: bool = True,
 ) -> JsonObject:
     """Compact oversized review_context detail rows to a bounded head start.
 
@@ -613,6 +619,11 @@ def enforce_review_context_budget(
         max_chars = REVIEW_CONTEXT_BROAD_MAX_CHARS if include_broad_context else REVIEW_CONTEXT_MAX_CHARS
     if not include_broad_context:
         result = _strip_broad_context(result)
+    if (
+        result.get("status") in {"error", "no_changes_detected", "binary_only_changes"}
+        and not _list_value(result.get("review_hypotheses"))
+    ):
+        return result
     # Producer-side pre-cap generated counts, if the producer attached them. The packet
     # already capped review_hypotheses to PLANNING_CONTEXT_SECTION_LIMIT before budgeting,
     # so original_hypotheses below is the CAPPED set. These counts describe the full
@@ -651,6 +662,14 @@ def enforce_review_context_budget(
         _finalize_review_hypothesis_budget(
             result, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
         )
+        _attach_review_context_followup_packets(
+            result,
+            original_hypotheses,
+            full_pre_cap_hypotheses=full_pre_cap_hypotheses,
+            parent_max_chars=max_chars,
+            execute_followups=execute_followups,
+        )
+        _fit_review_context_after_followups(result, max_chars=max_chars)
         return result
     if not include_broad_context:
         # Compact profile over budget: compose hypothesis-first from a scalar skeleton
@@ -668,6 +687,14 @@ def enforce_review_context_budget(
         )
         if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
             compact["output_budget"]["exceeded_after_minimization"] = True
+        _attach_review_context_followup_packets(
+            compact,
+            original_hypotheses,
+            full_pre_cap_hypotheses=full_pre_cap_hypotheses,
+            parent_max_chars=max_chars,
+            execute_followups=execute_followups,
+        )
+        _fit_review_context_after_followups(compact, max_chars=max_chars)
         return compact
     # P1: Cluster-aware ordering BEFORE the row-limit passes — _compact_review_detail
     # samples rows[:limit] and backfill restores in list order, so the interleaved order
@@ -698,6 +725,14 @@ def enforce_review_context_budget(
             _finalize_review_hypothesis_budget(
                 backfilled, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
             )
+            _attach_review_context_followup_packets(
+                backfilled,
+                original_hypotheses,
+                full_pre_cap_hypotheses=full_pre_cap_hypotheses,
+                parent_max_chars=max_chars,
+                execute_followups=execute_followups,
+            )
+            _fit_review_context_after_followups(backfilled, max_chars=max_chars)
             return backfilled
     # Even the tightest pass overshot (rare: dominated by non-row content); signal it like
     # the planning path by shrinking the largest low-signal row lists before degrading to a
@@ -708,6 +743,14 @@ def enforce_review_context_budget(
         _finalize_review_hypothesis_budget(
             compact, original_hypotheses, original_review_leads=original_review_leads, max_chars=max_chars, generated_counts=generated_counts, seat_plan=seat_plan, full_pre_cap_hypotheses=full_pre_cap_hypotheses
         )
+        _attach_review_context_followup_packets(
+            compact,
+            original_hypotheses,
+            full_pre_cap_hypotheses=full_pre_cap_hypotheses,
+            parent_max_chars=max_chars,
+            execute_followups=execute_followups,
+        )
+        _fit_review_context_after_followups(compact, max_chars=max_chars)
         return compact
     compact = _review_lead_only_budget_packet(
         compact,
@@ -721,7 +764,48 @@ def enforce_review_context_budget(
     )
     if isinstance(compact.get("output_budget"), dict) and len(canonical_json(compact)) > max_chars:
         compact["output_budget"]["exceeded_after_minimization"] = True
+    _attach_review_context_followup_packets(
+        compact,
+        original_hypotheses,
+        full_pre_cap_hypotheses=full_pre_cap_hypotheses,
+        parent_max_chars=max_chars,
+        execute_followups=execute_followups,
+    )
+    _fit_review_context_after_followups(compact, max_chars=max_chars)
     return compact
+
+
+def _fit_review_context_after_followups(result: JsonObject, *, max_chars: int) -> None:
+    if _current_chars(result) <= max_chars:
+        return
+    status = result.get("review_quality_status")
+    if isinstance(status, dict):
+        status.pop("suggested_followups", None)
+    if _current_chars(result) <= max_chars:
+        return
+    if isinstance(status, dict):
+        followup_status_omitted = "followup_execution" in status or "followups_executed" in status
+        status.pop("followup_execution", None)
+        status.pop("followups_executed", None)
+        if followup_status_omitted:
+            budget = result.setdefault("output_budget", {})
+            if isinstance(budget, dict):
+                budget["followup_status_omitted"] = True
+    if _current_chars(result) <= max_chars:
+        return
+    _trim_review_quality_status_to_fit(result, max_chars=max_chars)
+    if _current_chars(result) > max_chars:
+        answer_packet = result.get("review_answer_packet")
+        if isinstance(answer_packet, dict):
+            if "attribution_labels" in answer_packet:
+                answer_packet.pop("attribution_labels", None)
+                budget = result.setdefault("output_budget", {})
+                if isinstance(budget, dict):
+                    budget["attribution_labels_omitted"] = True
+    if _current_chars(result) > max_chars:
+        budget = result.get("output_budget")
+        if isinstance(budget, dict):
+            budget["exceeded_after_minimization"] = True
 
 
 def _compact_review_detail(result: JsonObject, *, limit: int) -> tuple[JsonObject, set[str]]:
@@ -988,6 +1072,9 @@ def _review_lead_only_budget_packet(
     }
     if isinstance(prior_budget, dict) and "engine_version" in prior_budget:
         lead_only["output_budget"] = {"engine_version": prior_budget["engine_version"]}
+    if isinstance(compact.get("entry_resolution"), dict) and compact.get("entry_resolution"):
+        lead_only["entry_resolution"] = compact["entry_resolution"]
+        lead_only["review_answer_packet"]["entry_resolution"] = compact["entry_resolution"]
     # Use original_hypotheses as fallback when the compact pass evicted all hypotheses
     # (can happen when the last detail pass reduced them to an empty list).
     hyp_source = compact.get("review_hypotheses") or (original_hypotheses or [])
@@ -1033,6 +1120,7 @@ _DIFF_DERIVED_RISK_TYPES: frozenset[str] = frozenset(
     {
         "contract_semantic_diff",
         "abstract_contract_unimplemented",
+        "unawaited_async_result_capture",
         "guard_call_removed_drift",
         "responsibility_moved_drift",
         "test_reference_removed_drift",
@@ -1046,6 +1134,13 @@ _DERIVATION_TIER_RANK: dict[str, int] = {"deterministic_static": 0, "inferred_ll
 def _derivation_tier(derivation: str) -> int:
     """Trust-tier rank used ONLY as a score tiebreak: deterministic > inferred > other."""
     return _DERIVATION_TIER_RANK.get(derivation, 2)
+
+
+def _is_unverified_semantic_diff(row: JsonObject) -> bool:
+    return (
+        str(row.get("risk_type") or "") == "contract_semantic_diff"
+        and row.get("verification") != "verified"
+    )
 
 
 def compute_hypothesis_seat_plan(
@@ -1082,6 +1177,8 @@ def compute_hypothesis_seat_plan(
     representative_id: dict[str, str] = {}
     for idx, row in enumerate(rows):
         if not isinstance(row, dict):
+            continue
+        if _is_unverified_semantic_diff(row):
             continue
         rt = row.get("risk_type")
         if rt is None:
@@ -1398,6 +1495,9 @@ def _hypothesis_first_compact_packet(
         "next_actions": result.get("next_actions", []),
         "output_budget": dict(prior_budget),
     }
+    if isinstance(result.get("entry_resolution"), dict) and result.get("entry_resolution"):
+        packet["entry_resolution"] = result["entry_resolution"]
+        packet["review_answer_packet"]["entry_resolution"] = result["entry_resolution"]
     # Seed the budget metadata BEFORE the fill tiers so _current_chars measures the
     # final packet shape; truncated_sections is refreshed in place after the fills.
     _attach_detail_budget_metadata(
@@ -3575,7 +3675,10 @@ def _compact_coordinate(row: JsonObject) -> JsonObject:
 def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
     compact: JsonObject = {}
     for key in ("hypothesis_id", "label", "risk_type", "confidence", "why", "concrete_invariant",
-                "specificity", "postable_claim", "cause", "consequence", "derivation"):
+                "specificity", "postable_claim", "cause", "consequence", "derivation", "verification",
+                "use_context", "subject_urn", "subject_qualname", "subject_path",
+                "consumer_breadth_skipped", "consumer_breadth_skip_reason",
+                "consumer_breadth_enumeration_cap"):
         if key in row:
             compact[key] = row[key]
     evidence_refs = row.get("evidence_refs")
@@ -3593,6 +3696,37 @@ def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
     supporting_lead_ids = row.get("supporting_lead_ids")
     if isinstance(supporting_lead_ids, list):
         compact["supporting_lead_ids"] = supporting_lead_ids[:5]
+    consumer_breadth = row.get("consumer_breadth")
+    if isinstance(consumer_breadth, dict):
+        compact["consumer_breadth"] = _compact_consumer_breadth(consumer_breadth)
+    return compact
+
+
+def _compact_consumer_breadth(value: JsonObject) -> JsonObject:
+    compact: JsonObject = {}
+    for key in (
+        "total_consumers",
+        "consumer_unit",
+        "in_diff_count",
+        "out_of_diff_count",
+        "enumeration_status",
+        "enumerated_limit",
+        "raw_fact_limit",
+        "unknown_coordinate_count",
+    ):
+        if key in value:
+            compact[key] = value[key]
+    top = value.get("top_out_of_diff")
+    if isinstance(top, list):
+        compact["top_out_of_diff"] = [
+            {
+                coord_key: coord[coord_key]
+                for coord_key in ("path", "line", "qualname")
+                if isinstance(coord, dict) and coord_key in coord
+            }
+            for coord in top[:1]
+            if isinstance(coord, dict)
+        ]
     return compact
 
 
@@ -4710,6 +4844,7 @@ def _sync_review_quality_status_from_packet(
         "semantic_diff_status",
         "semantic_diff_stats",
         "abstract_contract_status",
+        "async_result_capture_status",
     ):
         if _s1_key in status:
             synced[_s1_key] = status[_s1_key]
@@ -4890,6 +5025,286 @@ def _attach_truncated_hypothesis_followups(
         synced["suggested_followups"] = existing_followups + new_followups
 
 
+def _followup_row_key(row: JsonObject) -> tuple[str, str] | None:
+    hid = row.get("hypothesis_id")
+    if isinstance(hid, str) and hid:
+        return ("hypothesis_id", hid)
+    label = row.get("label")
+    if isinstance(label, str) and label:
+        return ("label", label)
+    return None
+
+
+def _followup_scope_key(row: JsonObject) -> tuple[str, str, str, str]:
+    area = _inspection_area_from_hypothesis(row)
+    return (
+        str(row.get("risk_type") or ""),
+        str(area.get("repo") or ""),
+        str(area.get("path") or ""),
+        str(area.get("symbol") or ""),
+    )
+
+
+def _candidate_followup_rows(
+    result: JsonObject,
+    original_hypotheses: list[JsonObject],
+    *,
+    full_pre_cap_hypotheses: list[JsonObject] | None,
+) -> list[JsonObject]:
+    available = (
+        [h for h in full_pre_cap_hypotheses if isinstance(h, dict)]
+        if full_pre_cap_hypotheses is not None
+        else [h for h in original_hypotheses if isinstance(h, dict)]
+    )
+    returned_keys = {
+        key
+        for key in (
+            _followup_row_key(h)
+            for h in _list_value(result.get("review_hypotheses"))
+            if isinstance(h, dict)
+        )
+        if key is not None
+    }
+    candidates: list[JsonObject] = []
+    seen: set[tuple[str, str]] = set()
+    for row in available:
+        if str(row.get("specificity") or "low") not in ("high", "medium"):
+            continue
+        key = _followup_row_key(row)
+        if key is None or key in returned_keys or key in seen:
+            continue
+        seen.add(key)
+        candidates.append(row)
+    return candidates
+
+
+def _build_review_context_followup_packet(
+    rows: list[JsonObject],
+    *,
+    followup_index: int,
+    total_candidates: int,
+) -> JsonObject | None:
+    compact_rows = [
+        _compact_review_hypothesis(row)
+        for row in rows[:REVIEW_CONTEXT_FOLLOWUP_ROWS_PER_PACKET]
+        if isinstance(row, dict)
+    ]
+    compact_rows = [row for row in compact_rows if row]
+    if not compact_rows:
+        return None
+    max_spec = "low"
+    for row in compact_rows:
+        spec = str(row.get("specificity") or "low")
+        if _QUALITY_SPECIFICITY_RANK.get(spec, 0) > _QUALITY_SPECIFICITY_RANK.get(max_spec, 0):
+            max_spec = spec
+    scope = _inspection_area_from_hypothesis(rows[0]) if rows else {}
+    labels = [
+        str(row.get("label"))
+        for row in compact_rows
+        if isinstance(row.get("label"), str) and row.get("label")
+    ]
+    answer_packet: JsonObject = {
+        "packet_mode": "internal_followup",
+        "top_review_hypotheses": [_slim_mirror_hypothesis(row) for row in compact_rows],
+    }
+    if labels:
+        answer_packet["attribution_labels"] = {
+            "labels": labels,
+            "instruction": _ATTRIBUTION_LABELS_INSTRUCTION,
+        }
+    return {
+        "tool": "review_context",
+        "packet_mode": "internal_followup",
+        "followup_index": followup_index,
+        "followup_depth": 1,
+        "scope": scope,
+        "reason": "Internal follow-up for truncated high/medium-specificity review hypotheses.",
+        "rows": compact_rows,
+        "review_answer_packet": answer_packet,
+        "review_quality_status": {
+            "specific_hypothesis_count": len(compact_rows),
+            "generic_hypothesis_count": 0,
+            "specificity": max_spec,
+            "review_readiness": "packet_ready" if compact_rows else "plain_review_better",
+            "followup_candidate_count": total_candidates,
+        },
+    }
+
+
+def _visible_followup_keys(result: JsonObject) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    for packet in _list_value(result.get("followup_packets")):
+        if not isinstance(packet, dict):
+            continue
+        for row in _list_value(packet.get("rows")):
+            if not isinstance(row, dict):
+                continue
+            key = _followup_row_key(row)
+            if key is not None:
+                keys.add(key)
+    return keys
+
+
+def _sync_followup_packet_mirror(packet: JsonObject) -> None:
+    rows = [row for row in _list_value(packet.get("rows")) if isinstance(row, dict)]
+    if not rows:
+        return
+    packet["rows"] = rows
+    answer_packet = packet.get("review_answer_packet")
+    if not isinstance(answer_packet, dict):
+        answer_packet = {"packet_mode": "internal_followup"}
+        packet["review_answer_packet"] = answer_packet
+    answer_packet["top_review_hypotheses"] = [_slim_mirror_hypothesis(row) for row in rows]
+    labels = [
+        str(row.get("label"))
+        for row in rows
+        if isinstance(row.get("label"), str) and row.get("label")
+    ]
+    if labels:
+        answer_packet["attribution_labels"] = {
+            "labels": labels,
+            "instruction": _ATTRIBUTION_LABELS_INSTRUCTION,
+        }
+    else:
+        answer_packet.pop("attribution_labels", None)
+    quality = packet.get("review_quality_status")
+    if isinstance(quality, dict):
+        quality["specific_hypothesis_count"] = len(rows)
+        max_spec = "low"
+        for row in rows:
+            spec = str(row.get("specificity") or "low")
+            if _QUALITY_SPECIFICITY_RANK.get(spec, 0) > _QUALITY_SPECIFICITY_RANK.get(max_spec, 0):
+                max_spec = spec
+        quality["specificity"] = max_spec
+        quality["review_readiness"] = "packet_ready"
+
+
+def _trim_followup_packets_to_combined_cap(
+    result: JsonObject,
+    *,
+    combined_max_chars: int,
+) -> bool:
+    packets = [packet for packet in _list_value(result.get("followup_packets")) if isinstance(packet, dict)]
+    if not packets:
+        result.pop("followup_packets", None)
+        return False
+    result["followup_packets"] = packets
+    truncated = False
+    while _current_chars(result) > combined_max_chars and packets:
+        tail = packets[-1]
+        rows = tail.get("rows")
+        if isinstance(rows, list) and rows:
+            rows.pop()
+            truncated = True
+            if rows:
+                _sync_followup_packet_mirror(tail)
+                continue
+        packets.pop()
+        truncated = True
+    if packets:
+        result["followup_packets"] = packets
+    else:
+        result.pop("followup_packets", None)
+    return truncated
+
+
+def _attach_review_context_followup_packets(
+    result: JsonObject,
+    original_hypotheses: list[JsonObject],
+    *,
+    full_pre_cap_hypotheses: list[JsonObject] | None,
+    parent_max_chars: int,
+    execute_followups: bool,
+) -> None:
+    status = result.get("review_quality_status")
+    if not isinstance(status, dict) or status.get("review_readiness") != "needs_followup":
+        return
+    status["followups_executed"] = 0
+    if not execute_followups:
+        status["followup_execution"] = "disabled_by_request"
+        return
+
+    candidates = _candidate_followup_rows(
+        result,
+        original_hypotheses,
+        full_pre_cap_hypotheses=full_pre_cap_hypotheses,
+    )
+    if not candidates:
+        status["followup_execution"] = "no_truncated_specific_rows"
+        return
+
+    groups: list[list[JsonObject]] = []
+    group_index: dict[tuple[str, str, str, str], int] = {}
+    for row in candidates:
+        key = _followup_scope_key(row)
+        if key in group_index:
+            groups[group_index[key]].append(row)
+            continue
+        if len(groups) >= REVIEW_CONTEXT_FOLLOWUP_PACKET_LIMIT:
+            continue
+        group_index[key] = len(groups)
+        groups.append([row])
+
+    packets = []
+    for index, group in enumerate(groups):
+        if not group:
+            continue
+        packet = _build_review_context_followup_packet(
+            group,
+            followup_index=index + 1,
+            total_candidates=len(candidates),
+        )
+        if packet is not None:
+            packets.append(packet)
+    if not packets:
+        status["followup_execution"] = "no_truncated_specific_rows"
+        return
+
+    result["followup_packets"] = packets
+    budget = result.get("output_budget")
+    if not isinstance(budget, dict):
+        budget = {}
+        result["output_budget"] = budget
+    combined_max_chars = max(parent_max_chars, REVIEW_CONTEXT_FOLLOWUP_COMBINED_MAX_CHARS)
+    budget["followup_parent_max_chars"] = parent_max_chars
+    budget["followup_combined_max_chars"] = combined_max_chars
+    budget["followup_packet_limit"] = REVIEW_CONTEXT_FOLLOWUP_PACKET_LIMIT
+    budget["followup_recursion_guard"] = "single_pass"
+    if _trim_followup_packets_to_combined_cap(result, combined_max_chars=combined_max_chars):
+        budget["truncated_sections"] = sorted(
+            {str(item) for item in _list_value(budget.get("truncated_sections"))}
+            | {"followup_packets"}
+        )
+
+    candidate_keys = {
+        key for key in (_followup_row_key(row) for row in candidates) if key is not None
+    }
+    covered_keys = _visible_followup_keys(result)
+    residual_count = max(0, len(candidate_keys - covered_keys))
+    final_packets = [
+        p
+        for p in _list_value(result.get("followup_packets"))
+        if isinstance(p, dict) and any(isinstance(row, dict) for row in _list_value(p.get("rows")))
+    ]
+    if final_packets:
+        result["followup_packets"] = final_packets
+    else:
+        result.pop("followup_packets", None)
+    status["followups_executed"] = len(final_packets)
+    if final_packets:
+        status["followup_execution"] = "executed"
+    else:
+        status["followup_execution"] = "truncated_by_combined_budget"
+    if residual_count == 0 and final_packets:
+        status["review_readiness"] = "packet_ready"
+        status.pop("inspection_areas", None)
+        status.pop("suggested_followups", None)
+        status.pop("remaining_followup_candidate_count", None)
+    else:
+        status["review_readiness"] = "needs_followup"
+        status["remaining_followup_candidate_count"] = residual_count
+
+
 def _trim_review_quality_status_to_fit(result: JsonObject, *, max_chars: int) -> None:
     """Shrink the C1 review_quality_status affordances until the packet fits the hard cap.
 
@@ -4902,6 +5317,11 @@ def _trim_review_quality_status_to_fit(result: JsonObject, *, max_chars: int) ->
     status = result.get("review_quality_status")
     if not isinstance(status, dict):
         return
+    stats = status.get("semantic_diff_stats")
+    if isinstance(stats, dict) and "parse_failure_samples" in stats and _current_chars(result) > max_chars:
+        stats.pop("parse_failure_samples", None)
+    if isinstance(stats, dict) and "no_claim_response_samples" in stats and _current_chars(result) > max_chars:
+        stats.pop("no_claim_response_samples", None)
     block = status.get("inspection_areas")
     if isinstance(block, dict):
         areas = [a for a in _list_value(block.get("areas")) if isinstance(a, dict)]

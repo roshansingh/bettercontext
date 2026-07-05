@@ -19,6 +19,7 @@ IGNORED_DIRS = {
     ".next",
     ".pytest_cache",
     ".ruff_cache",
+    ".supercontext",
     ".turbo",
     ".vercel",
     ".venv",
@@ -87,16 +88,18 @@ def discover_repo(
     repo_path: str | Path,
     language_files: tuple[LanguageFileMatcher, ...] = REGISTERED_LANGUAGE_FILES,
     owner: str | None = None,
+    name: str | None = None,
 ) -> RepoSnapshot:
     root = Path(repo_path).expanduser().resolve()
     if not root.exists():
         raise FileNotFoundError(f"Repo path does not exist: {root}")
+    repo_name = _repo_name(root, name)
 
     files_by_language = _files_by_language(root, language_files)
     source_files = tuple(path for paths in files_by_language.values() for path in paths)
     return RepoSnapshot(
         root=root,
-        name=root.name,
+        name=repo_name,
         owner=owner or root.parent.name,
         commit_sha=_git_commit_sha(root),
         files_by_language=files_by_language,
@@ -107,6 +110,13 @@ def discover_repo(
             ignored_dirs=frozenset(IGNORED_DIRS),
         ),
     )
+
+
+def _repo_name(root: Path, name: str | None) -> str:
+    value = name.strip() if isinstance(name, str) else root.name
+    if not value:
+        raise ValueError("repo_name_empty")
+    return value
 
 
 def _iter_source_files(root: Path) -> list[Path]:

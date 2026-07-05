@@ -53,7 +53,7 @@ def _claim(**overrides: Any) -> dict:
     set to 'none' to produce a BEHAVIOR-DELTA (medium-specificity) fixture."""
     base = {
         "claim": "Function no longer validates input before processing",
-        "cause_line": 3,
+        "cause_line": 2,
         "consequence": "Callers may pass invalid data without receiving an error.",
         "negative_check": "If validation was intentionally removed and callers are trusted, this risk does not apply.",
         "category": "guard_removal",
@@ -364,6 +364,362 @@ class TestSemanticDiffEndToEnd(unittest.TestCase):
             # cause/consequence are conditional on cause_line being in-range (Problem C fix).
             for field in ("negative_checks", "source_checks", "confidence", "why"):
                 self.assertIn(field, h, f"field {field!r} must be present; keys={list(h.keys())}")
+
+
+class TestSemanticDiffVerification(unittest.TestCase):
+    def _make_high_line_symbol_snap(self, root: Path) -> tuple[KgSnapshot, Path, Path, list[JsonObject]]:
+        from source.kg.core.models import Entity
+
+        entity = Entity(
+            kind="CodeSymbol",
+            identity={
+                "tenant_id": TENANT,
+                "repo": "repo_high_line",
+                "module": "handler",
+                "qualname": "process",
+                "symbol_kind": "function",
+            },
+            properties={"path": "handler.py", "line": 50},
+        )
+        snap_dir = root / "snap_high_line"
+        JsonlKgStore(snap_dir).write(
+            entities=[entity],
+            facts=[],
+            evidence=[],
+            coverage=[],
+            manifest={"version": 1, "tenant_id": TENANT},
+        )
+        snap = KgSnapshot(snap_dir)
+        shared_tail = "\n".join(f"    value_{index} = {index}" for index in range(3, 22))
+        base_body = "def process(data):\n    mode = 'old'\n" + shared_tail + "\n    return mode\n"
+        head_body = "def process(data):\n    mode = 'new'\n" + shared_tail + "\n    return mode\n"
+        padding = "# pad\n" * 49
+        base_dir = root / "base_high_line"
+        head_dir = root / "head_high_line"
+        base_dir.mkdir()
+        head_dir.mkdir()
+        (base_dir / "handler.py").write_text(padding + base_body, encoding="utf-8")
+        (head_dir / "handler.py").write_text(padding + head_body, encoding="utf-8")
+        return snap, base_dir, head_dir, [e for e in snap.entities if e.get("kind") == "CodeSymbol"]
+
+    def test_verified_row_carries_verification_and_stats(self) -> None:
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            base_kg = KgSnapshot(out_base)
+            head_kg = KgSnapshot(out_head)
+            changed = [e for e in head_kg.entities if e.get("kind") == "CodeSymbol"]
+            stats: dict = {}
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=base_kg,
+                head_snapshot=head_kg,
+                base_root=base_checkout,
+                head_root=head_checkout,
+                changed_symbols=changed,
+                client=_FakeClient(),
+                _stats_out=stats,
+            )
+
+        self.assertEqual(status, "active")
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["verification"], "verified")
+        self.assertEqual(rows[0]["specificity"], "high")
+        self.assertEqual(stats["rows_verified"], 1)
+        self.assertEqual(stats["rows_unverified"], 0)
+
+    def test_body_relative_cause_line_verifies_for_high_absolute_span(self) -> None:
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir, changed = self._make_high_line_symbol_snap(root)
+            stats: dict = {}
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=changed,
+                client=_FakeClient(response=[_claim(cause_line=2)]),
+                _stats_out=stats,
+            )
+
+        self.assertEqual(status, "active")
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["verification"], "verified")
+        self.assertEqual(rows[0]["cause"]["line_start"], 51)
+        self.assertEqual(stats["rows_verified"], 1)
+
+    def test_body_relative_cause_line_on_unchanged_window_fails_delta_check(self) -> None:
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir, changed = self._make_high_line_symbol_snap(root)
+            stats: dict = {}
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=changed,
+                client=_FakeClient(response=[_claim(cause_line=15)]),
+                _stats_out=stats,
+            )
+
+        self.assertEqual(status, "active")
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["verification"], "failed:delta_check")
+        self.assertEqual(rows[0]["specificity"], "low")
+        self.assertEqual(stats["rows_unverified"], 1)
+
+    def test_head_only_window_in_grown_symbol_counts_as_delta(self) -> None:
+        from source.kg.core.models import Entity
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            entity = Entity(
+                kind="CodeSymbol",
+                identity={
+                    "tenant_id": TENANT,
+                    "repo": "repo_grown_symbol",
+                    "module": "handler",
+                    "qualname": "expanded",
+                    "symbol_kind": "function",
+                },
+                properties={"path": "handler.py", "line": 10},
+            )
+            snap_dir = root / "snap_grown"
+            JsonlKgStore(snap_dir).write(
+                entities=[entity],
+                facts=[],
+                evidence=[],
+                coverage=[],
+                manifest={"version": 1, "tenant_id": TENANT},
+            )
+            snap = KgSnapshot(snap_dir)
+            base_body = "def expanded():\n    return 'old'\n"
+            head_body = (
+                "def expanded():\n"
+                "    value = 1\n"
+                "    value += 1\n"
+                "    value += 1\n"
+                "    value += 1\n"
+                "    value += 1\n"
+                "    value += 1\n"
+                "    value += 1\n"
+                "    return 'new'\n"
+            )
+            padding = "# pad\n" * 9
+            base_dir = root / "base_grown"
+            head_dir = root / "head_grown"
+            base_dir.mkdir()
+            head_dir.mkdir()
+            (base_dir / "handler.py").write_text(padding + base_body, encoding="utf-8")
+            (head_dir / "handler.py").write_text(padding + head_body, encoding="utf-8")
+            stats: dict = {}
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=[row for row in snap.entities if row.get("kind") == "CodeSymbol"],
+                client=_FakeClient(response=[_claim(cause_line=8)]),
+                _stats_out=stats,
+            )
+
+        self.assertEqual(status, "active")
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["verification"], "verified")
+        self.assertEqual(stats["rows_verified"], 1)
+
+    def test_invalid_cause_line_becomes_low_specificity_unverified_lead(self) -> None:
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            base_kg = KgSnapshot(out_base)
+            head_kg = KgSnapshot(out_head)
+            changed = [e for e in head_kg.entities if e.get("kind") == "CodeSymbol"]
+            stats: dict = {}
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=base_kg,
+                head_snapshot=head_kg,
+                base_root=base_checkout,
+                head_root=head_checkout,
+                changed_symbols=changed,
+                client=_FakeClient(response=[_claim(cause_line=9999)]),
+                _stats_out=stats,
+            )
+
+        self.assertEqual(status, "active")
+        self.assertTrue(rows)
+        row = rows[0]
+        self.assertEqual(row["verification"], "failed:coordinate_check")
+        self.assertEqual(row["specificity"], "low")
+        self.assertTrue(row["postable_claim"].startswith("unverified semantic lead:"))
+        self.assertEqual(stats["rows_verified"], 0)
+        self.assertEqual(stats["rows_unverified"], 1)
+
+    def test_failed_semantic_diff_rows_do_not_reserve_family_seat(self) -> None:
+        from source.kg.product.output_budget import compute_hypothesis_seat_plan
+
+        failed_semantic = {
+            "hypothesis_id": "semantic-failed",
+            "risk_type": "contract_semantic_diff",
+            "verification": "failed:delta_check",
+            "specificity": "low",
+            "derivation": "inferred_llm",
+            "cause": {"path": "handler.py", "line_start": 2},
+        }
+        ordinary = {
+            "hypothesis_id": "ordinary",
+            "risk_type": "ordinary_runtime_risk",
+            "specificity": "high",
+            "derivation": "deterministic_static",
+            "cause": {"path": "handler.py", "line_start": 2},
+        }
+
+        plan = compute_hypothesis_seat_plan(
+            [failed_semantic, ordinary],
+            changed_files=["handler.py"],
+            changed_symbols=None,
+        )
+
+        self.assertNotIn("contract_semantic_diff", plan["ordered_types"])
+        self.assertIn("ordinary_runtime_risk", plan["ordered_types"])
+
+    def test_splice_keeps_unknown_verification_rows_as_unverified_leads(self) -> None:
+        from unittest.mock import patch
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+        from source.kg.product.output_budget import compute_hypothesis_seat_plan
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+            legacy_row = {
+                "hypothesis_id": "legacy-semantic-row",
+                "label": "contract_semantic_diff-legacy",
+                "risk_type": "contract_semantic_diff",
+                "specificity": "low",
+                "derivation": "inferred_llm",
+                "postable_claim": "legacy semantic lead without verification field",
+            }
+
+            with patch(
+                "source.kg.query.semantic_contract_diff.semantic_contract_diff",
+                return_value=([legacy_row], "active"),
+            ):
+                merged, status = _splice_semantic_diff_hypotheses(
+                    base_snapshot_dir=str(out_base),
+                    head_kg=head_kg,
+                    base_checkout=str(base_checkout),
+                    head_checkout=str(head_checkout),
+                    changed_symbols=[{"qualname": "process"}],
+                    review_hypotheses=[],
+                    _client=_FakeClient(),
+                )
+
+        self.assertEqual(status, "active")
+        self.assertEqual([row.get("hypothesis_id") for row in merged], ["legacy-semantic-row"])
+        plan = compute_hypothesis_seat_plan(
+            merged,
+            changed_files=["handler.py"],
+            changed_symbols=None,
+        )
+        self.assertNotIn("contract_semantic_diff", plan["ordered_types"])
+
+    def test_splice_places_verified_semantic_rows_before_unverified_tail(self) -> None:
+        from unittest.mock import patch
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+            existing = [
+                {"hypothesis_id": "det-1", "risk_type": "guard_call_removed_drift", "derivation": "deterministic_static"},
+                {"hypothesis_id": "det-2", "risk_type": "responsibility_moved_drift", "derivation": "deterministic_static"},
+                {"hypothesis_id": "det-3", "risk_type": "test_reference_removed_drift", "derivation": "deterministic_static"},
+                {"hypothesis_id": "generic-1", "risk_type": "generic_runtime_risk"},
+            ]
+            semantic_rows = [
+                {
+                    "hypothesis_id": "semantic-verified",
+                    "label": "contract_semantic_diff-verified",
+                    "risk_type": "contract_semantic_diff",
+                    "verification": "verified",
+                    "specificity": "high",
+                    "derivation": "inferred_llm",
+                },
+                {
+                    "hypothesis_id": "semantic-unverified-1",
+                    "label": "contract_semantic_diff-unverified-1",
+                    "risk_type": "contract_semantic_diff",
+                    "verification": "failed:delta_check",
+                    "specificity": "low",
+                    "derivation": "inferred_llm",
+                },
+                {
+                    "hypothesis_id": "semantic-unverified-2",
+                    "label": "contract_semantic_diff-unverified-2",
+                    "risk_type": "contract_semantic_diff",
+                    "specificity": "low",
+                    "derivation": "inferred_llm",
+                },
+                {
+                    "hypothesis_id": "semantic-unverified-3",
+                    "label": "contract_semantic_diff-unverified-3",
+                    "risk_type": "contract_semantic_diff",
+                    "verification": "failed:coordinate_check",
+                    "specificity": "low",
+                    "derivation": "inferred_llm",
+                },
+            ]
+
+            with patch(
+                "source.kg.query.semantic_contract_diff.semantic_contract_diff",
+                return_value=(semantic_rows, "active"),
+            ):
+                merged, status = _splice_semantic_diff_hypotheses(
+                    base_snapshot_dir=str(out_base),
+                    head_kg=head_kg,
+                    base_checkout=str(base_checkout),
+                    head_checkout=str(head_checkout),
+                    changed_symbols=[{"qualname": "process"}],
+                    review_hypotheses=existing,
+                    _client=_FakeClient(),
+                )
+
+        self.assertEqual(status, "active")
+        self.assertEqual(
+            [row.get("hypothesis_id") for row in merged],
+            [
+                "det-1",
+                "det-2",
+                "semantic-verified",
+                "det-3",
+                "generic-1",
+                "semantic-unverified-1",
+                "semantic-unverified-2",
+            ],
+        )
+        self.assertNotIn(
+            "omitted_semantic_diff_count",
+            merged[2],
+            "verified semantic row should not carry omission count when unverified tail exists",
+        )
+        self.assertEqual(merged[-1]["omitted_semantic_diff_count"], 1)
 
 
 # ---------------------------------------------------------------------------
@@ -2564,6 +2920,7 @@ class TestPromptStrictness(unittest.TestCase):
             sentinel, rendered,
             f"prompt must contain format instruction; template tail: {rendered[-200:]!r}",
         )
+        self.assertIn("1-based AFTER body line", rendered)
         self.assertTrue(
             rendered.endswith(sentinel),
             f"format instruction must be at the end of the prompt; tail: {rendered[-200:]!r}",
@@ -3378,6 +3735,30 @@ class TestSemanticDiffStats(unittest.TestCase):
         fake.completion_cost = _completion_cost
         return fake
 
+    def _inject_fake_litellm_raw(self, raw_content: str):
+        """Return a fake litellm module whose completion text is not JSON."""
+        import types
+
+        class _Message:
+            def __init__(self) -> None:
+                self.content = raw_content
+
+        class _Choice:
+            def __init__(self) -> None:
+                self.message = _Message()
+
+        class _Response:
+            def __init__(self) -> None:
+                self.choices = [_Choice()]
+
+        def _completion_cost(**kwargs):
+            return None
+
+        fake = types.ModuleType("litellm")
+        fake.completion = lambda **kwargs: _Response()
+        fake.completion_cost = _completion_cost
+        return fake
+
     def test_stats_in_final_packet_after_splice_and_budget(self) -> None:
         """semantic_diff_stats present in review_quality_status after full call_tool pipeline.
 
@@ -3456,11 +3837,183 @@ class TestSemanticDiffStats(unittest.TestCase):
             stats.get("cost_usd"),
             "cost_usd must not be None when litellm returns cost",
         )
+        self.assertEqual(
+            stats.get("rows_verified"), calls_attempted,
+            f"rows_verified must equal calls_attempted for the valid fixture; got {stats.get('rows_verified')}",
+        )
+        self.assertEqual(
+            stats.get("rows_unverified"), 0,
+            f"rows_unverified must be 0 for the valid fixture; got {stats.get('rows_unverified')}",
+        )
         # Model field present
         self.assertEqual(
             stats.get("model"), "fake-model",
             f"model must be 'fake-model'; got {stats.get('model')}",
         )
+        self.assertNotIn(
+            "parse_failure_samples", stats,
+            "healthy semantic diff stats must not carry diagnostic raw samples",
+        )
+
+    def test_parse_failure_samples_in_final_packet(self) -> None:
+        """Unparseable real-client responses surface clipped raw samples in final packet stats."""
+        import sys
+        from unittest.mock import patch
+        from source.kg.integrations.semantic_llm import SemanticDiffLlmClient
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses as _real_splice
+
+        raw_completion = "The change removes validation but I will not emit JSON." + ("x" * 2500)
+        fake_litellm = self._inject_fake_litellm_raw(raw_completion)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            with patch.dict(sys.modules, {"litellm": fake_litellm}):
+                real_client = SemanticDiffLlmClient(model="fake-model")
+
+                def _with_real_client(**kw):
+                    return _real_splice(**kw, _client=real_client)
+
+                with patch(
+                    "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
+                    side_effect=lambda **kw: _with_real_client(**kw),
+                ):
+                    result = call_tool(head_kg, "review_context", {
+                        "repo": _SVC2_REPO,
+                        "changed_files": ["handler.py"],
+                        "base_snapshot": str(out_base),
+                        "base_checkout": str(base_checkout),
+                        "head_checkout": str(head_checkout),
+                    })
+
+        rqs = result.get("review_quality_status") or {}
+        self.assertEqual(
+            rqs.get("semantic_diff_status"), "failed:all_responses_unparseable",
+            f"semantic diff status must report the parse failure; got {rqs.get('semantic_diff_status')!r}",
+        )
+        stats = rqs.get("semantic_diff_stats") or {}
+        samples = stats.get("parse_failure_samples")
+        self.assertIsInstance(samples, list, f"parse_failure_samples must be a list; got {samples!r}")
+        self.assertEqual(len(samples), 1, f"expected one raw sample; got {samples!r}")
+        self.assertEqual(
+            samples[0],
+            raw_completion[:2000],
+            "raw diagnostic sample must be clipped to the first 2000 chars",
+        )
+
+    def test_parse_failure_samples_trimmed_before_status_counts(self) -> None:
+        """Budget trimming drops diagnostic raw samples before semantic status/count fields."""
+        from copy import deepcopy
+        from source.kg.core.models import canonical_json
+        from source.kg.product import output_budget as ob
+
+        base_stats = {
+            "model": "fake-model",
+            "calls_attempted": 1,
+            "calls_succeeded": 0,
+            "calls_failed": 0,
+            "parse_misses": 1,
+            "rows_generated": 0,
+            "rows_verified": 0,
+            "rows_unverified": 0,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "cost_usd": None,
+        }
+        result = {
+            "review_quality_status": {
+                "coverage_status": "partial",
+                "specific_hypothesis_count": 0,
+                "generic_hypothesis_count": 0,
+                "specificity": "low",
+                "recommended_action": "use_live_followups_or_plain_review",
+                "reason": "Test packet.",
+                "review_readiness": "plain_review_better",
+                "semantic_diff_status": "failed:all_responses_unparseable",
+                "semantic_diff_stats": {
+                    **base_stats,
+                    "parse_failure_samples": ["x" * 4000],
+                },
+            },
+            "review_hypotheses": [],
+        }
+        without_samples = deepcopy(result)
+        without_samples["review_quality_status"]["semantic_diff_stats"] = dict(base_stats)
+        max_chars = len(canonical_json(without_samples)) + 4
+
+        ob._trim_review_quality_status_to_fit(result, max_chars=max_chars)
+
+        stats = result["review_quality_status"]["semantic_diff_stats"]
+        self.assertNotIn(
+            "parse_failure_samples", stats,
+            "diagnostic raw samples must be the first semantic_diff_stats field trimmed",
+        )
+        self.assertEqual(
+            stats.get("parse_misses"), 1,
+            "parse_misses count must survive diagnostic sample trimming",
+        )
+        self.assertEqual(
+            result["review_quality_status"].get("semantic_diff_status"),
+            "failed:all_responses_unparseable",
+            "semantic_diff_status must survive diagnostic sample trimming",
+        )
+        self.assertLessEqual(
+            len(canonical_json(result)), max_chars,
+            "trimming parse_failure_samples should bring the packet under the configured cap",
+        )
+
+    def test_no_claim_response_samples_trimmed_before_status_counts(self) -> None:
+        """Budget trimming also drops parsed-but-invalid diagnostic samples first."""
+        from copy import deepcopy
+        from source.kg.core.models import canonical_json
+        from source.kg.product import output_budget as ob
+
+        base_stats = {
+            "model": "fake-model",
+            "calls_attempted": 1,
+            "calls_succeeded": 1,
+            "calls_failed": 0,
+            "parse_misses": 0,
+            "rows_generated": 0,
+            "rows_verified": 0,
+            "rows_unverified": 0,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "cost_usd": None,
+        }
+        result = {
+            "review_quality_status": {
+                "coverage_status": "partial",
+                "specific_hypothesis_count": 0,
+                "generic_hypothesis_count": 0,
+                "specificity": "low",
+                "recommended_action": "use_live_followups_or_plain_review",
+                "reason": "Test packet.",
+                "review_readiness": "plain_review_better",
+                "semantic_diff_status": "failed:no_valid_claims",
+                "semantic_diff_stats": {
+                    **base_stats,
+                    "no_claim_response_samples": ["x" * 4000],
+                },
+            },
+            "review_hypotheses": [],
+        }
+        without_samples = deepcopy(result)
+        without_samples["review_quality_status"]["semantic_diff_stats"] = dict(base_stats)
+        max_chars = len(canonical_json(without_samples)) + 4
+
+        ob._trim_review_quality_status_to_fit(result, max_chars=max_chars)
+
+        stats = result["review_quality_status"]["semantic_diff_stats"]
+        self.assertNotIn(
+            "no_claim_response_samples", stats,
+            "parsed-but-invalid diagnostic samples must be trimmed before semantic status fields",
+        )
+        self.assertEqual(stats.get("calls_succeeded"), 1)
+        self.assertEqual(result["review_quality_status"].get("semantic_diff_status"), "failed:no_valid_claims")
+        self.assertLessEqual(len(canonical_json(result)), max_chars)
 
     def test_stats_usage_absent_produces_nulls_not_zeros(self) -> None:
         """When litellm response has no usage, prompt_tokens/completion_tokens/cost_usd must be None.
@@ -3844,6 +4397,87 @@ class TestViolatedInvariantSchema(unittest.TestCase):
             self.assertGreater(len(valid_rows), 0, "valid-schema response must produce rows")
             self.assertEqual(valid_status, "active",
                              f"valid-schema response must be 'active'; got {valid_status!r}")
+
+    def test_no_valid_claim_samples_are_not_labeled_parse_failures(self) -> None:
+        """Parsed-but-invalid responses may include diagnostics, but not as parse failures."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        raw_response = "parsed old schema response" + ("x" * 2100)
+
+        class _RawParsedClient:
+            model = "fake-model"
+
+            def __init__(self) -> None:
+                self.call_count = 0
+
+            def complete_json(self, prompt: str) -> LlmResult:
+                self.call_count += 1
+                return LlmResult.parsed(
+                    [{
+                        "claim": "Guard removed.",
+                        "cause_line": 2,
+                        "consequence": "Callers may pass None.",
+                        "negative_check": "No check.",
+                        "category": "guard_removal",
+                    }],
+                    raw_text=raw_response[:2000],
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+            stats: dict = {}
+            client = _RawParsedClient()
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,  # type: ignore[arg-type]
+                _stats_out=stats,
+            )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(status, "failed:no_valid_claims")
+        self.assertNotIn("parse_failure_samples", stats)
+        self.assertEqual(stats.get("no_claim_response_samples"), [raw_response[:2000]])
+
+    def test_semantic_splice_uses_preloaded_base_snapshot(self) -> None:
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = []
+            for row in snap.entities:
+                if row.get("kind") != "CodeSymbol":
+                    continue
+                identity = row.get("identity") or {}
+                properties = row.get("properties") or {}
+                entity_dicts.append({
+                    "qualname": identity.get("qualname"),
+                    "path": properties.get("path"),
+                })
+
+            merged, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(root / "missing-base-snapshot"),
+                head_kg=snap,
+                base_checkout=str(base_dir),
+                head_checkout=str(head_dir),
+                changed_symbols=entity_dicts,
+                review_hypotheses=[],
+                _client=_FakeClient(response=[_claim()]),
+                _base_snapshot=snap,
+            )
+
+        self.assertEqual(status, "active")
+        self.assertTrue(
+            any(row.get("risk_type") == "contract_semantic_diff" for row in merged),
+            f"preloaded base snapshot should avoid reloading base_snapshot_dir; got {merged!r}",
+        )
 
     def test_parsed_empty_list_is_valid_no_changes_and_stays_active(self) -> None:
         """A parsed EMPTY list ([]) is a valid 'no behavioral contract changes found'

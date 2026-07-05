@@ -19,8 +19,11 @@ def build_kg(
     output_dir: str | Path,
     strict_extractors: bool = False,
     tenant_id: str | None = None,
+    repo_name: str | None = None,
 ) -> JsonObject:
-    repo = discover_repo(repo_path)
+    # Incompatible JSONL/manifest output changes must also bump
+    # review_entry_resolution._SNAPSHOT_STORE_SCHEMA_VERSION.
+    repo = discover_repo(repo_path, name=repo_name)
     resolved_tenant_id = resolve_tenant_id(tenant_id)
     build = extract_repo(repo, strict_extractors=strict_extractors, tenant_id=resolved_tenant_id)
     promotion = prune_uncorroborated_event_channels(build.entities, build.facts)
