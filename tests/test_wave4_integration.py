@@ -233,6 +233,22 @@ class Wave4ReviewEntryResolutionTests(unittest.TestCase):
             self.assertEqual([], leaked_entity_paths)
             self.assertEqual([], leaked_evidence_paths)
 
+    def test_supercontext_exclude_accepts_entry_without_trailing_slash(self) -> None:
+        from source.kg.product.review_entry_resolution import _ensure_supercontext_excluded
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "exclude_repo"
+            repo.mkdir()
+            _run(repo, "git", "init")
+            exclude_path = repo / ".git" / "info" / "exclude"
+            exclude_path.write_text("# local ignores\n.supercontext\n", encoding="utf-8")
+
+            _ensure_supercontext_excluded(repo)
+
+            lines = exclude_path.read_text(encoding="utf-8").splitlines()
+            supercontext_lines = [line.strip() for line in lines if line.strip().startswith(".supercontext")]
+            self.assertEqual([".supercontext"], supercontext_lines)
+
     def test_review_context_non_git_dir_returns_structured_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

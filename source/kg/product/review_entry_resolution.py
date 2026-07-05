@@ -422,7 +422,7 @@ def _ensure_supercontext_excluded(repo_path: Path) -> None:
     try:
         existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
         lines = existing.splitlines()
-        if any(line.strip() == f"{_CACHE_ROOT}/" for line in lines):
+        if any(line.strip() in {_CACHE_ROOT, f"{_CACHE_ROOT}/"} for line in lines):
             return
         exclude_path.parent.mkdir(parents=True, exist_ok=True)
         suffix = "" if not existing or existing.endswith("\n") else "\n"

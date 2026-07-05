@@ -430,7 +430,7 @@ class TestSemanticDiffVerification(unittest.TestCase):
         self.assertEqual(stats["rows_verified"], 1)
         self.assertEqual(stats["rows_unverified"], 0)
 
-    def test_snippet_relative_cause_line_verifies_for_high_absolute_span(self) -> None:
+    def test_body_relative_cause_line_verifies_for_high_absolute_span(self) -> None:
         from source.kg.query.semantic_contract_diff import semantic_contract_diff
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -454,7 +454,7 @@ class TestSemanticDiffVerification(unittest.TestCase):
         self.assertEqual(rows[0]["cause"]["line_start"], 51)
         self.assertEqual(stats["rows_verified"], 1)
 
-    def test_snippet_relative_cause_line_on_unchanged_window_fails_delta_check(self) -> None:
+    def test_body_relative_cause_line_on_unchanged_window_fails_delta_check(self) -> None:
         from source.kg.query.semantic_contract_diff import semantic_contract_diff
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2920,6 +2920,7 @@ class TestPromptStrictness(unittest.TestCase):
             sentinel, rendered,
             f"prompt must contain format instruction; template tail: {rendered[-200:]!r}",
         )
+        self.assertIn("1-based AFTER body line", rendered)
         self.assertTrue(
             rendered.endswith(sentinel),
             f"format instruction must be at the end of the prompt; tail: {rendered[-200:]!r}",

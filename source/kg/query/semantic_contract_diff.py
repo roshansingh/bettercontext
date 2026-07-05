@@ -46,7 +46,8 @@ _PROMPT_BODY_TEMPLATE = (
     "and name the violated_invariant: the caller-side or persisted-state expectation "
     "this change can break. If the change looks intended/benign and violates no "
     'caller-side or persisted-state expectation, set violated_invariant to exactly "none". '
-    'JSON array: [{{"claim": "...", "cause_line": <head line no. int>, '
+    'JSON array: [{{"claim": "...", "cause_line": <absolute head file line int, '
+    "or 1-based AFTER body line int if absolute line is unknown>, "
     '"consequence": "one sentence", "negative_check": "...", "category": "...", '
     '"old_contract": "one sentence", "new_contract": "one sentence", '
     '"violated_invariant": "one sentence or the literal string none"}}]\n\n'
@@ -383,8 +384,9 @@ def _resolve_semantic_cause_line(
 ) -> tuple[int, int] | None:
     """Return (absolute_line, body_index) for model cause_line.
 
-    The prompt shows a body snippet, so models may answer either absolute file lines or
-    snippet-relative lines. Accept both; use the same mapped coordinate for later checks.
+    The prompt shows the symbol body, so models may answer either absolute file
+    lines or 1-based AFTER-body lines. Accept both; use the same mapped
+    coordinate for later checks.
     """
     if raw_cause_line is None or head_line_start is None or derived_end is None:
         return None
