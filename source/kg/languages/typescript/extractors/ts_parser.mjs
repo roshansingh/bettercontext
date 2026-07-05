@@ -2899,7 +2899,16 @@ function collectClientEndpointCalls(sourceFile) {
 
 function symbolFromStatement(statement, sourceFile) {
   if (ts.isFunctionDeclaration(statement) && statement.name) {
-    return { name: statement.name.text, kind: "function", line: lineOf(sourceFile, statement.name.getStart(sourceFile)), end_line: lineOf(sourceFile, statement.end), pos: statement.pos, end: statement.end };
+    return {
+      name: statement.name.text,
+      kind: "function",
+      line: lineOf(sourceFile, statement.name.getStart(sourceFile)),
+      end_line: lineOf(sourceFile, statement.end),
+      pos: statement.pos,
+      end: statement.end,
+      is_async: nodeHasModifier(statement, ts.SyntaxKind.AsyncKeyword),
+      returns_promise_type: isPromiseTypeNode(statement.type),
+    };
   }
   if (ts.isClassDeclaration(statement) && statement.name) {
     return { name: statement.name.text, kind: "class", line: lineOf(sourceFile, statement.name.getStart(sourceFile)), end_line: lineOf(sourceFile, statement.end), pos: statement.pos, end: statement.end };
@@ -2935,12 +2944,22 @@ function collectSymbols(sourceFile) {
             end_line: lineOf(sourceFile, declaration.end),
             pos: declaration.pos,
             end: declaration.end,
+            is_async: Boolean(declaration.initializer && nodeHasModifier(declaration.initializer, ts.SyntaxKind.AsyncKeyword)),
+            returns_promise_type: Boolean(declaration.initializer && isPromiseTypeNode(declaration.initializer.type)),
           });
         }
       }
     }
   }
   return symbols;
+}
+
+function isPromiseTypeNode(typeNode) {
+  if (!typeNode || !ts.isTypeReferenceNode(typeNode)) return false;
+  // Pragmatic TypeScript AST signal: without checker/type-resolution state in this
+  // parser bridge, only the unqualified global Promise annotation is treated as a
+  // Promise-like review lead. Qualified/custom Foo.Promise types fail closed.
+  return ts.isIdentifier(typeNode.typeName) && typeNode.typeName.text === "Promise";
 }
 
 function collectCallsForSymbol(sourceFile, symbol) {
@@ -3401,6 +3420,15 @@ function isAssignedContext(callNode) {
   return false;
 }
 
+function isArgumentContext(callNode) {
+  const { parent, child } = effectiveParentSkippingParens(callNode);
+  if (!parent) return false;
+  if (ts.isCallExpression(parent)) {
+    return parent.arguments.some((arg) => arg === child);
+  }
+  return false;
+}
+
 function isInsidePromiseAll(callNode) {
   // True if the call is nested inside a Promise.all/allSettled/race/any invocation.
   // Walk parent chain; cross array literals, arrow functions, and array-method
@@ -3506,6 +3534,46 @@ function collectAsyncLifecycleSignals(sourceFile, symbols) {
   return applySignalCap(rawSignals);
 }
 
+function collectAsyncResultCaptureUses(sourceFile, symbols) {
+  const rawSignals = [];
+
+  function visit(node) {
+    if (ts.isCallExpression(node) && !isForEachCall(node)) {
+      const context = isAssignedContext(node)
+        ? "assignment"
+        : isReturnedContext(node)
+          ? "return"
+          : isArgumentContext(node)
+            ? "argument"
+            : null;
+      if (
+        !isAwaitedContext(node) &&
+        !isThenCatchChained(node) &&
+        !isInsidePromiseAll(node) &&
+        context != null
+      ) {
+        const name = callName(node.expression, sourceFile);
+        if (name) {
+          const line = lineOf(sourceFile, node.getStart(sourceFile));
+          const qualname = enclosingSymbolName(node, symbols) ?? "<module>";
+          rawSignals.push({
+            signal: "async_result_capture_use",
+            qualname,
+            callee: name,
+            context,
+            line,
+          });
+        }
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+
+  return applySignalCap(rawSignals);
+}
+
 function collectCallResultIdentityComparisonSignals(sourceFile, symbols) {
   const rawSignals = [];
 
@@ -3563,6 +3631,7 @@ for (const relativePath of files) {
       }))
     ),
     async_lifecycle_signals: collectAsyncLifecycleSignals(sourceFile, symbols),
+    async_result_capture_uses: collectAsyncResultCaptureUses(sourceFile, symbols),
     call_result_identity_comparison_signals: collectCallResultIdentityComparisonSignals(sourceFile, symbols),
   };
 }

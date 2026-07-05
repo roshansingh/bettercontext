@@ -214,6 +214,8 @@ class TypeScriptCompilerApiExtractor:
                 "line": line,
                 "end_line": int(row.get("end_line") or line),
                 "language": self._language(file_path),
+                "is_async": bool(row.get("is_async", False)),
+                "returns_promise_type": bool(row.get("returns_promise_type", False)),
             },
         )
         return SymbolDef(entity=entity, qualname=name, symbol_kind=kind, line=line)

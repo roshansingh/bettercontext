@@ -669,6 +669,7 @@ def enforce_review_context_budget(
             parent_max_chars=max_chars,
             execute_followups=execute_followups,
         )
+        _fit_review_context_after_followups(result, max_chars=max_chars)
         return result
     if not include_broad_context:
         # Compact profile over budget: compose hypothesis-first from a scalar skeleton
@@ -693,6 +694,7 @@ def enforce_review_context_budget(
             parent_max_chars=max_chars,
             execute_followups=execute_followups,
         )
+        _fit_review_context_after_followups(compact, max_chars=max_chars)
         return compact
     # P1: Cluster-aware ordering BEFORE the row-limit passes — _compact_review_detail
     # samples rows[:limit] and backfill restores in list order, so the interleaved order
@@ -730,6 +732,7 @@ def enforce_review_context_budget(
                 parent_max_chars=max_chars,
                 execute_followups=execute_followups,
             )
+            _fit_review_context_after_followups(backfilled, max_chars=max_chars)
             return backfilled
     # Even the tightest pass overshot (rare: dominated by non-row content); signal it like
     # the planning path by shrinking the largest low-signal row lists before degrading to a
@@ -747,6 +750,7 @@ def enforce_review_context_budget(
             parent_max_chars=max_chars,
             execute_followups=execute_followups,
         )
+        _fit_review_context_after_followups(compact, max_chars=max_chars)
         return compact
     compact = _review_lead_only_budget_packet(
         compact,
@@ -767,7 +771,41 @@ def enforce_review_context_budget(
         parent_max_chars=max_chars,
         execute_followups=execute_followups,
     )
+    _fit_review_context_after_followups(compact, max_chars=max_chars)
     return compact
+
+
+def _fit_review_context_after_followups(result: JsonObject, *, max_chars: int) -> None:
+    if _current_chars(result) <= max_chars:
+        return
+    status = result.get("review_quality_status")
+    if isinstance(status, dict):
+        status.pop("suggested_followups", None)
+    if _current_chars(result) <= max_chars:
+        return
+    if isinstance(status, dict):
+        followup_status_omitted = "followup_execution" in status or "followups_executed" in status
+        status.pop("followup_execution", None)
+        status.pop("followups_executed", None)
+        if followup_status_omitted:
+            budget = result.setdefault("output_budget", {})
+            if isinstance(budget, dict):
+                budget["followup_status_omitted"] = True
+    if _current_chars(result) <= max_chars:
+        return
+    _trim_review_quality_status_to_fit(result, max_chars=max_chars)
+    if _current_chars(result) > max_chars:
+        answer_packet = result.get("review_answer_packet")
+        if isinstance(answer_packet, dict):
+            if "attribution_labels" in answer_packet:
+                answer_packet.pop("attribution_labels", None)
+                budget = result.setdefault("output_budget", {})
+                if isinstance(budget, dict):
+                    budget["attribution_labels_omitted"] = True
+    if _current_chars(result) > max_chars:
+        budget = result.get("output_budget")
+        if isinstance(budget, dict):
+            budget["exceeded_after_minimization"] = True
 
 
 def _compact_review_detail(result: JsonObject, *, limit: int) -> tuple[JsonObject, set[str]]:
@@ -1082,6 +1120,7 @@ _DIFF_DERIVED_RISK_TYPES: frozenset[str] = frozenset(
     {
         "contract_semantic_diff",
         "abstract_contract_unimplemented",
+        "unawaited_async_result_capture",
         "guard_call_removed_drift",
         "responsibility_moved_drift",
         "test_reference_removed_drift",
@@ -3636,7 +3675,10 @@ def _compact_coordinate(row: JsonObject) -> JsonObject:
 def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
     compact: JsonObject = {}
     for key in ("hypothesis_id", "label", "risk_type", "confidence", "why", "concrete_invariant",
-                "specificity", "postable_claim", "cause", "consequence", "derivation", "verification"):
+                "specificity", "postable_claim", "cause", "consequence", "derivation", "verification",
+                "use_context", "subject_urn", "subject_qualname", "subject_path",
+                "consumer_breadth_skipped", "consumer_breadth_skip_reason",
+                "consumer_breadth_enumeration_cap"):
         if key in row:
             compact[key] = row[key]
     evidence_refs = row.get("evidence_refs")
@@ -3654,6 +3696,37 @@ def _compact_review_hypothesis(row: JsonObject) -> JsonObject:
     supporting_lead_ids = row.get("supporting_lead_ids")
     if isinstance(supporting_lead_ids, list):
         compact["supporting_lead_ids"] = supporting_lead_ids[:5]
+    consumer_breadth = row.get("consumer_breadth")
+    if isinstance(consumer_breadth, dict):
+        compact["consumer_breadth"] = _compact_consumer_breadth(consumer_breadth)
+    return compact
+
+
+def _compact_consumer_breadth(value: JsonObject) -> JsonObject:
+    compact: JsonObject = {}
+    for key in (
+        "total_consumers",
+        "consumer_unit",
+        "in_diff_count",
+        "out_of_diff_count",
+        "enumeration_status",
+        "enumerated_limit",
+        "raw_fact_limit",
+        "unknown_coordinate_count",
+    ):
+        if key in value:
+            compact[key] = value[key]
+    top = value.get("top_out_of_diff")
+    if isinstance(top, list):
+        compact["top_out_of_diff"] = [
+            {
+                coord_key: coord[coord_key]
+                for coord_key in ("path", "line", "qualname")
+                if isinstance(coord, dict) and coord_key in coord
+            }
+            for coord in top[:1]
+            if isinstance(coord, dict)
+        ]
     return compact
 
 
@@ -4771,6 +4844,7 @@ def _sync_review_quality_status_from_packet(
         "semantic_diff_status",
         "semantic_diff_stats",
         "abstract_contract_status",
+        "async_result_capture_status",
     ):
         if _s1_key in status:
             synced[_s1_key] = status[_s1_key]
@@ -5243,6 +5317,11 @@ def _trim_review_quality_status_to_fit(result: JsonObject, *, max_chars: int) ->
     status = result.get("review_quality_status")
     if not isinstance(status, dict):
         return
+    stats = status.get("semantic_diff_stats")
+    if isinstance(stats, dict) and "parse_failure_samples" in stats and _current_chars(result) > max_chars:
+        stats.pop("parse_failure_samples", None)
+    if isinstance(stats, dict) and "no_claim_response_samples" in stats and _current_chars(result) > max_chars:
+        stats.pop("no_claim_response_samples", None)
     block = status.get("inspection_areas")
     if isinstance(block, dict):
         areas = [a for a in _list_value(block.get("areas")) if isinstance(a, dict)]

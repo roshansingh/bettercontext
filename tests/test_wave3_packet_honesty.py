@@ -206,6 +206,31 @@ class TestC1ReadinessHonesty(unittest.TestCase):
         # Even under trimming, readiness stays downgraded — the honesty signal is not lost.
         self.assertEqual(result["review_quality_status"]["review_readiness"], "needs_followup")
 
+    def test_post_followup_fit_drops_attribution_labels_then_marks_overflow(self) -> None:
+        result = {
+            "review_quality_status": {
+                "suggested_followups": [{"tool": "review_context", "why": "x" * 200}],
+                "followup_execution": {"status": "ran", "detail": "y" * 200},
+                "followups_executed": [{"tool": "find_callers"}],
+                "inspection_areas": {"areas": [{"risk_type": "x", "why": "z" * 200}], "omitted_count": 0},
+            },
+            "review_answer_packet": {
+                "attribution_labels": ["contract_semantic_diff-0001", "guard_call_removed_drift-0001"],
+            },
+            "review_hypotheses": [{"postable_claim": "still too large" * 100}],
+            "output_budget": {},
+        }
+
+        ob._fit_review_context_after_followups(result, max_chars=80)
+
+        self.assertNotIn("suggested_followups", result["review_quality_status"])
+        self.assertNotIn("followup_execution", result["review_quality_status"])
+        self.assertNotIn("followups_executed", result["review_quality_status"])
+        self.assertNotIn("attribution_labels", result["review_answer_packet"])
+        self.assertTrue(result["output_budget"].get("followup_status_omitted"))
+        self.assertTrue(result["output_budget"].get("attribution_labels_omitted"))
+        self.assertTrue(result["output_budget"].get("exceeded_after_minimization"))
+
 
 # ---------------------------------------------------------------------------
 # C1 + C2 through the real call_tool pipeline (no-truncation control geometry)

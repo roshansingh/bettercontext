@@ -9,6 +9,7 @@ from typing import Any
 # API key fail honestly as llm_error / no_api_key — do not change without
 # owner sign-off.
 DEFAULT_SEMANTIC_DIFF_MODEL = "gpt-5.4-mini"
+PARSE_FAILURE_RAW_SAMPLE_CHARS = 2000
 
 _LITELLM_UNAVAILABLE: Exception | None = None
 
@@ -34,22 +35,23 @@ class LlmResult:
       cost_usd          — float or None (never 0.0 as a default — that would silently undercount)
     """
 
-    __slots__ = ("kind", "_value", "prompt_tokens", "completion_tokens", "cost_usd")
+    __slots__ = ("kind", "_value", "prompt_tokens", "completion_tokens", "cost_usd", "raw_text")
 
-    def __init__(self, kind: str, value: Any = _MISSING) -> None:
+    def __init__(self, kind: str, value: Any = _MISSING, *, raw_text: str | None = None) -> None:
         self.kind = kind
         self._value = value
         self.prompt_tokens: int | None = None
         self.completion_tokens: int | None = None
         self.cost_usd: float | None = None
+        self.raw_text = raw_text
 
     @classmethod
-    def parsed(cls, value: Any) -> "LlmResult":
-        return cls("", value)
+    def parsed(cls, value: Any, *, raw_text: str | None = None) -> "LlmResult":
+        return cls("", value, raw_text=raw_text)
 
     @classmethod
-    def parse_miss(cls) -> "LlmResult":
-        return cls("parse_miss")
+    def parse_miss(cls, *, raw_text: str | None = None) -> "LlmResult":
+        return cls("parse_miss", raw_text=raw_text)
 
     @classmethod
     def call_failure(cls, kind: str) -> "LlmResult":
@@ -106,10 +108,11 @@ class SemanticDiffLlmClient:
             return LlmResult.call_failure("llm_error")
 
         value = _extract_json(raw)
+        raw_sample = raw[:PARSE_FAILURE_RAW_SAMPLE_CHARS] if raw else None
         if value is None:
-            result = LlmResult.parse_miss()
+            result = LlmResult.parse_miss(raw_text=raw_sample)
         else:
-            result = LlmResult.parsed(value)
+            result = LlmResult.parsed(value, raw_text=raw_sample)
 
         # Capture usage from the response (None when provider omits usage).
         usage = getattr(response, "usage", None)

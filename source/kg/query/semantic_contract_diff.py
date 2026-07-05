@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from source.kg.core.models import JsonObject
+from source.kg.integrations.semantic_llm import PARSE_FAILURE_RAW_SAMPLE_CHARS
 
 if TYPE_CHECKING:
     from source.kg.query.snapshot import KgSnapshot
@@ -35,6 +36,7 @@ _BODY_CHAR_LIMIT = 6000
 _MAX_SYMBOLS = 12
 _MAX_HYPS_PER_SYMBOL = 2
 _BASE_BODY_CHAR_LIMIT = 2500  # per resolved base class body
+_PARSE_FAILURE_SAMPLE_LIMIT = 2
 
 _PROMPT_FORMAT_INSTRUCTION = "Respond with ONLY a JSON array, no markdown fences, no prose."
 
@@ -334,10 +336,19 @@ def _cluster_rank(
     return combined[:max_symbols]
 
 
-def _empty_diff_stats(client: "SemanticDiffLlmClient") -> dict:
+def _empty_diff_stats(
+    client: "SemanticDiffLlmClient",
+    *,
+    candidate_symbols: int = 0,
+    paired_symbols: int = 0,
+) -> dict:
     """Return a zero-call stats dict (no LLM calls made)."""
     return {
         "model": getattr(client, "model", None),
+        "cross_snapshot_pairing": {
+            "candidate_symbols": candidate_symbols,
+            "paired_symbols": paired_symbols,
+        },
         "calls_attempted": 0,
         "calls_succeeded": 0,
         "calls_failed": 0,
@@ -466,6 +477,8 @@ def semantic_contract_diff(
 
     # Build URN → entity for both snapshots
     base_by_urn: dict[str, JsonObject] = {e["urn"]: e for e in base_snapshot.entities}
+    candidate_symbols = len(changed_symbols)
+    paired_symbols = 0
 
     # Problem C fix: prefilter (read bodies, keep only differing) BEFORE cap
     differing: list[tuple[JsonObject, str, str]] = []  # (entity, base_body, head_body)
@@ -478,6 +491,7 @@ def semantic_contract_diff(
         base_entity = base_by_urn.get(urn)
         if base_entity is None:
             continue
+        paired_symbols += 1
 
         head_props = head_entity.get("properties") or {}
         base_props = base_entity.get("properties") or {}
@@ -511,10 +525,22 @@ def semantic_contract_diff(
     if not differing:
         if calls_attempted_prefilter > 0 and read_failures == calls_attempted_prefilter:
             if _stats_out is not None:
-                _stats_out.update(_empty_diff_stats(client))
+                _stats_out.update(
+                    _empty_diff_stats(
+                        client,
+                        candidate_symbols=candidate_symbols,
+                        paired_symbols=paired_symbols,
+                    )
+                )
             return [], "failed:unreadable_sources"
         if _stats_out is not None:
-            _stats_out.update(_empty_diff_stats(client))
+            _stats_out.update(
+                _empty_diff_stats(
+                    client,
+                    candidate_symbols=candidate_symbols,
+                    paired_symbols=paired_symbols,
+                )
+            )
         return [], "active"
 
     # Apply cap AFTER prefilter — only differing symbols count against the slot budget
@@ -535,6 +561,8 @@ def semantic_contract_diff(
     total_cost_usd: float | None = None
     rows_verified = 0
     rows_unverified = 0
+    parse_failure_samples: list[str] = []
+    no_valid_claim_samples: list[str] = []
     head_urns = {
         str(entity.get("urn"))
         for entity in head_snapshot.entities
@@ -595,6 +623,12 @@ def semantic_contract_diff(
         if cu is not None:
             total_cost_usd = (total_cost_usd or 0.0) + cu
 
+        raw_sample = getattr(result, "raw_text", None)
+        if isinstance(raw_sample, str) and raw_sample:
+            raw_sample = raw_sample[:PARSE_FAILURE_RAW_SAMPLE_CHARS]
+        else:
+            raw_sample = None
+
         # Map typed result to status tracking
         if result.kind == "no_api_key":
             auth_error_seen = True
@@ -606,6 +640,8 @@ def semantic_contract_diff(
         # parse_miss: call completed but no valid JSON → not a failure, just no rows
         if result.kind == "parse_miss":
             parse_miss_count += 1
+            if raw_sample and len(parse_failure_samples) < _PARSE_FAILURE_SAMPLE_LIMIT:
+                parse_failure_samples.append(raw_sample)
             continue
 
         parsed = result.value
@@ -613,6 +649,8 @@ def semantic_contract_diff(
             # Parsed to a non-list (unexpected shape) — unusable as claims; count as
             # a parse miss so the honesty statuses below see it.
             parse_miss_count += 1
+            if raw_sample and len(parse_failure_samples) < _PARSE_FAILURE_SAMPLE_LIMIT:
+                parse_failure_samples.append(raw_sample)
             continue
         parsed_ok_count += 1
         parsed_item_count += len(parsed)
@@ -817,6 +855,9 @@ def semantic_contract_diff(
                 "old_contract": old_contract,
                 "new_contract": new_contract,
                 "violated_invariant": violated_invariant,
+                "subject_urn": urn,
+                "subject_qualname": qualname,
+                "subject_path": head_path,
                 "source_spans": source_spans,
                 "evidence_refs": source_spans,
                 "supporting_lead_ids": [],
@@ -830,6 +871,8 @@ def semantic_contract_diff(
                 row["consequence"] = consequence
             rows.append(row)
             hyps_from_symbol += 1
+        if hyps_from_symbol == 0 and raw_sample and len(no_valid_claim_samples) < _PARSE_FAILURE_SAMPLE_LIMIT:
+            no_valid_claim_samples.append(raw_sample)
 
     # Compute status — partial (rows non-empty + any failure) takes precedence over
     # the failure kind so successful rows are never discarded.  "no_api_key" is
@@ -883,8 +926,12 @@ def semantic_contract_diff(
         status = f"{status} ({parse_miss_count} of {calls_attempted} responses unparseable)"
 
     if _stats_out is not None:
-        _stats_out.update({
+        stats: JsonObject = {
             "model": getattr(client, "model", None),
+            "cross_snapshot_pairing": {
+                "candidate_symbols": candidate_symbols,
+                "paired_symbols": paired_symbols,
+            },
             "calls_attempted": calls_attempted,
             "calls_succeeded": parsed_ok_count,
             "calls_failed": calls_failed,
@@ -895,6 +942,11 @@ def semantic_contract_diff(
             "prompt_tokens": total_prompt_tokens,
             "completion_tokens": total_completion_tokens,
             "cost_usd": total_cost_usd,
-        })
+        }
+        if status == "failed:all_responses_unparseable" and parse_failure_samples:
+            stats["parse_failure_samples"] = parse_failure_samples[:_PARSE_FAILURE_SAMPLE_LIMIT]
+        elif status == "failed:no_valid_claims" and no_valid_claim_samples:
+            stats["no_claim_response_samples"] = no_valid_claim_samples[:_PARSE_FAILURE_SAMPLE_LIMIT]
+        _stats_out.update(stats)
 
     return rows, status

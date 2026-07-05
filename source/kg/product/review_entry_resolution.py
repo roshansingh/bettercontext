@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 import os
 import json
 from json import JSONDecodeError
@@ -25,6 +26,17 @@ _SNAPSHOT_FILES = ("entities.jsonl", "facts.jsonl", "evidence.jsonl", "coverage.
 _GIT_COMMAND_TIMEOUT_SECONDS = 60
 _CACHE_LOCK_TIMEOUT_SECONDS = 60
 _CACHE_LOCK_POLL_SECONDS = 0.1
+_SNAPSHOT_STORE_ENV = "SUPERCONTEXT_SNAPSHOT_STORE"
+# Shared stores are long-lived across runs/clones. Any incompatible KG JSONL output
+# or builder-contract change must bump this directory version to avoid stale hits.
+_SNAPSHOT_STORE_SCHEMA_VERSION = "kg-jsonl-v2-wave5-review-context"
+
+
+class SnapshotPairIdentityMismatch(RuntimeError):
+    def __init__(self, *, base_repo_name: str | None, head_repo_name: str | None) -> None:
+        super().__init__("base_head_repo_identity_mismatch")
+        self.base_repo_name = base_repo_name
+        self.head_repo_name = head_repo_name
 
 
 @dataclass(frozen=True)
@@ -44,6 +56,10 @@ def resolve_review_context_entry(kg: KgSnapshot, arguments: JsonObject) -> Resol
 
     repo_path_arg = _optional_string(arguments.get("repo_path"))
     base_ref_arg = _optional_string(arguments.get("base_ref"))
+    snapshot_store_arg = (
+        _optional_string(arguments.get("snapshot_store"))
+        or _optional_string(os.getenv(_SNAPSHOT_STORE_ENV))
+    )
     has_explicit_review_args = any(
         key in arguments
         for key in ("repo", "changed_files", "changed_ranges", "base_snapshot", "base_checkout", "head_checkout")
@@ -188,6 +204,17 @@ def resolve_review_context_entry(kg: KgSnapshot, arguments: JsonObject) -> Resol
     binary_skipped = 0
     derivation_warnings: list[str] = []
     try:
+        derived_repo_name = _derived_snapshot_repo_name(repo_path)
+        snapshot_store = Path(snapshot_store_arg).expanduser().resolve() if snapshot_store_arg else None
+        snapshot_store_identity = (
+            _snapshot_store_repo_identity(
+                repo_path,
+                manifest_repo_name=_optional_string(kg.manifest.get("repo_name")),
+                manifest_tenant_id=_optional_string(kg.manifest.get("tenant_id")),
+            )
+            if snapshot_store is not None
+            else None
+        )
         with _cache_lock(repo_path):
             locked_head_sha = _git_stdout(repo_path, "rev-parse", "--verify", "HEAD^{commit}")
             if locked_head_sha != head_sha:
@@ -204,11 +231,35 @@ def resolve_review_context_entry(kg: KgSnapshot, arguments: JsonObject) -> Resol
             if derived_files:
                 _ensure_supercontext_excluded(repo_path)
                 base_checkout, base_worktree_reused, base_worktree_recreated = _ensure_base_worktree(repo_path, base_sha)
-                base_snapshot, base_snapshot_reused = _ensure_snapshot(base_checkout, base_sha, cache_root=repo_path)
-                head_snapshot, head_snapshot_reused = _ensure_snapshot(repo_path, head_sha, cache_root=repo_path)
-                _prune_snapshot_cache(repo_path, keep={base_snapshot, head_snapshot})
+                base_snapshot, base_snapshot_reused, base_snapshot_store_hit = _ensure_snapshot(
+                    base_checkout,
+                    base_sha,
+                    cache_root=repo_path,
+                    snapshot_store=snapshot_store,
+                    repo_identity=snapshot_store_identity,
+                    repo_name=derived_repo_name,
+                )
+                head_snapshot, head_snapshot_reused, head_snapshot_store_hit = _ensure_snapshot(
+                    repo_path,
+                    head_sha,
+                    cache_root=repo_path,
+                    snapshot_store=snapshot_store,
+                    repo_identity=snapshot_store_identity,
+                    repo_name=derived_repo_name,
+                )
+                _validate_snapshot_pair_repo_identity(base_snapshot, head_snapshot)
+                if snapshot_store is None:
+                    _prune_snapshot_cache(repo_path, keep={base_snapshot, head_snapshot})
                 resolved_kg = KgSnapshot(head_snapshot)
     except RuntimeError as exc:
+        snapshot_repo_names = (
+            {
+                "base_repo_name": exc.base_repo_name,
+                "head_repo_name": exc.head_repo_name,
+            }
+            if isinstance(exc, SnapshotPairIdentityMismatch)
+            else None
+        )
         entry_resolution = _entry_resolution(
             mode="derived",
             status="failed",
@@ -216,6 +267,7 @@ def resolve_review_context_entry(kg: KgSnapshot, arguments: JsonObject) -> Resol
             base_sha=base_sha,
             head_sha=head_sha,
             derivation_failures=[_failure_reason(exc)],
+            snapshot_repo_names=snapshot_repo_names,
         )
         return ResolvedReviewContextEntry(
             kg=kg,
@@ -233,6 +285,11 @@ def resolve_review_context_entry(kg: KgSnapshot, arguments: JsonObject) -> Resol
             "head_snapshot": str(head_snapshot),
             "base_snapshot_reused": base_snapshot_reused,
             "head_snapshot_reused": head_snapshot_reused,
+            "base_snapshot_store_hit": base_snapshot_store_hit,
+            "head_snapshot_store_hit": head_snapshot_store_hit,
+            "snapshot_store_schema_version": _SNAPSHOT_STORE_SCHEMA_VERSION if snapshot_store else None,
+            "base_repo_name": _snapshot_repo_name(base_snapshot),
+            "head_repo_name": _snapshot_repo_name(head_snapshot),
             "base_worktree": str(base_checkout),
             "base_worktree_reused": base_worktree_reused,
             "base_worktree_recreated": base_worktree_recreated,
@@ -318,6 +375,7 @@ def _entry_resolution(
     derivation_failures: list[str] | None = None,
     derivation_warnings: list[str] | None = None,
     snapshots: JsonObject | None = None,
+    snapshot_repo_names: JsonObject | None = None,
 ) -> JsonObject:
     resolution: JsonObject = {
         "mode": mode,
@@ -342,6 +400,8 @@ def _entry_resolution(
         resolution["derivation_warnings"] = list(derivation_warnings)
     if snapshots:
         resolution["snapshots"] = snapshots
+    if snapshot_repo_names:
+        resolution["snapshot_repo_names"] = snapshot_repo_names
     return resolution
 
 
@@ -712,14 +772,113 @@ def _prune_worktree_cache(repo_path: Path, *, keep: set[Path]) -> None:
             _safe_remove_cache_dir(stale, root=root)
 
 
-def _ensure_snapshot(repo_path: Path, commit_sha: str, *, cache_root: Path) -> tuple[Path, bool]:
+def _ensure_snapshot(
+    repo_path: Path,
+    commit_sha: str,
+    *,
+    cache_root: Path,
+    snapshot_store: Path | None = None,
+    repo_identity: str | None = None,
+    repo_name: str | None = None,
+) -> tuple[Path, bool, bool]:
+    if snapshot_store is not None and repo_identity:
+        repo_store_root = snapshot_store / repo_identity / _SNAPSHOT_STORE_SCHEMA_VERSION
+        target = repo_store_root / commit_sha
+        if _snapshot_matches(target, commit_sha, expected_repo_name=repo_name):
+            return target, True, True
+        with _snapshot_store_lock(repo_store_root, commit_sha):
+            if _snapshot_matches(target, commit_sha, expected_repo_name=repo_name):
+                return target, True, True
+            _build_snapshot_atomically(repo_path, target, commit_sha, root=repo_store_root, repo_name=repo_name)
+            return target, False, False
+
     target = cache_root / _CACHE_ROOT / _KG_CACHE_DIR / commit_sha
-    if _snapshot_matches(target, commit_sha):
-        return target, True
-    kg_pipeline.build_kg(repo_path, target)
-    if not _snapshot_matches(target, commit_sha):
+    if _snapshot_matches(target, commit_sha, expected_repo_name=repo_name):
+        return target, True, False
+    kg_pipeline.build_kg(repo_path, target, repo_name=repo_name)
+    if not _snapshot_matches(target, commit_sha, expected_repo_name=repo_name):
         raise RuntimeError("snapshot_manifest_sha_mismatch")
-    return target, False
+    return target, False, False
+
+
+def _derived_snapshot_repo_name(repo_path: Path) -> str:
+    repo_name = repo_path.name.strip()
+    if not repo_name:
+        raise RuntimeError("repo_name_empty")
+    return repo_name
+
+
+def _snapshot_store_repo_identity(
+    repo_path: Path,
+    *,
+    manifest_repo_name: str | None,
+    manifest_tenant_id: str | None,
+) -> str:
+    tenant = manifest_tenant_id or "default"
+    try:
+        origin_url = _git_stdout(repo_path, "config", "--get", "remote.origin.url")
+    except RuntimeError:
+        origin_url = ""
+    if origin_url:
+        source = f"origin:{tenant}:{repo_path.name}:{origin_url}"
+        return "origin-" + hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+    if manifest_repo_name:
+        source = f"manifest:{tenant}:{manifest_repo_name}"
+        return "manifest-" + hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+    local_root = _git_stdout(repo_path, "rev-parse", "--show-toplevel")
+    source = f"local:{tenant}:{local_root}"
+    return "local-" + hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+
+
+@contextmanager
+def _snapshot_store_lock(repo_store_root: Path, commit_sha: str):
+    repo_store_root.mkdir(parents=True, exist_ok=True)
+    lock_path = repo_store_root / f"{commit_sha}.lock"
+    deadline = time.monotonic() + _CACHE_LOCK_TIMEOUT_SECONDS
+    fd: int | None = None
+    while fd is None:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if _reclaim_stale_cache_lock(lock_path):
+                continue
+            if time.monotonic() >= deadline:
+                raise RuntimeError("snapshot_store_lock_timeout")
+            time.sleep(_CACHE_LOCK_POLL_SECONDS)
+    try:
+        os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+        yield
+    finally:
+        os.close(fd)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _build_snapshot_atomically(
+    repo_path: Path,
+    target: Path,
+    commit_sha: str,
+    *,
+    root: Path,
+    repo_name: str | None = None,
+) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = root / f".{commit_sha}.tmp-{os.getpid()}-{time.monotonic_ns()}"
+    if tmp.exists():
+        _safe_remove_cache_dir(tmp, root=root)
+    try:
+        kg_pipeline.build_kg(repo_path, tmp, repo_name=repo_name)
+        if not _snapshot_matches(tmp, commit_sha, expected_repo_name=repo_name):
+            raise RuntimeError("snapshot_manifest_sha_mismatch")
+        if target.exists():
+            _safe_remove_cache_dir(target, root=root)
+        tmp.rename(target)
+    except Exception:
+        if tmp.exists():
+            _safe_remove_cache_dir(tmp, root=root)
+        raise
 
 
 def _prune_snapshot_cache(cache_root: Path, *, keep: set[Path]) -> None:
@@ -758,17 +917,45 @@ def _safe_remove_cache_dir(path: Path, *, root: Path) -> None:
     shutil.rmtree(path)
 
 
-def _snapshot_matches(path: Path, commit_sha: str) -> bool:
+def _snapshot_matches(path: Path, commit_sha: str, *, expected_repo_name: str | None = None) -> bool:
     if not path.is_dir():
         return False
     if any(not (path / filename).exists() for filename in _SNAPSHOT_FILES):
         return False
-    manifest_path = path / "manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, JSONDecodeError):
+    manifest = _read_snapshot_manifest(path)
+    if not isinstance(manifest, dict):
         return False
-    return isinstance(manifest, dict) and manifest.get("commit_sha") == commit_sha
+    repo_name = _optional_string(manifest.get("repo_name"))
+    if repo_name == commit_sha:
+        return False
+    if expected_repo_name is not None and repo_name != expected_repo_name:
+        return False
+    return manifest.get("commit_sha") == commit_sha
+
+
+def _read_snapshot_manifest(path: Path) -> JsonObject | None:
+    try:
+        manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, JSONDecodeError):
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def _snapshot_repo_name(path: Path) -> str | None:
+    manifest = _read_snapshot_manifest(path)
+    if not isinstance(manifest, dict):
+        return None
+    return _optional_string(manifest.get("repo_name"))
+
+
+def _validate_snapshot_pair_repo_identity(base_snapshot: Path, head_snapshot: Path) -> None:
+    base_repo_name = _snapshot_repo_name(base_snapshot)
+    head_repo_name = _snapshot_repo_name(head_snapshot)
+    if base_repo_name != head_repo_name:
+        raise SnapshotPairIdentityMismatch(
+            base_repo_name=base_repo_name,
+            head_repo_name=head_repo_name,
+        )
 
 
 def _git_stdout(repo_path: Path, *args: str) -> str:

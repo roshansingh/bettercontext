@@ -17,6 +17,7 @@ from source.kg.product.output_budget import (
     enforce_review_context_budget,
 )
 from source.kg.query.snapshot import KgSnapshot
+from source.kg.integrations.semantic_llm import LlmResult
 
 
 def _run(cwd: Path, *args: str) -> str:
@@ -79,6 +80,30 @@ def _no_semantic_splice(**kwargs):
     if isinstance(stats, dict):
         stats.update({"rows_generated": 0, "rows_verified": 0, "rows_unverified": 0})
     return kwargs["review_hypotheses"], "active"
+
+
+def _semantic_claim() -> dict:
+    return {
+        "claim": "widget no longer preserves the old fallback branch",
+        "cause_line": 2,
+        "consequence": "Callers that relied on fallback behavior may now receive the new value unconditionally.",
+        "negative_check": "Verify whether all callers were updated to expect the unconditional return.",
+        "category": "contract_change",
+        "old_contract": "widget returned fallback when ready was false.",
+        "new_contract": "widget returns the new value unconditionally.",
+        "violated_invariant": "Callers relied on widget preserving the ready/fallback contract.",
+    }
+
+
+class _Wave5FakeSemanticClient:
+    model = "fake-wave5"
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def complete_json(self, prompt: str) -> LlmResult:
+        self.call_count += 1
+        return LlmResult.parsed([_semantic_claim()])
 
 
 def _wave4_hyp(index: int, *, label: str | None = None) -> dict:
@@ -158,10 +183,12 @@ class Wave4ReviewEntryResolutionTests(unittest.TestCase):
         properties = review["inputSchema"]["properties"]
         self.assertIn("repo_path", properties)
         self.assertIn("base_ref", properties)
+        self.assertIn("snapshot_store", properties)
         self.assertEqual(review["inputSchema"].get("required"), [])
         self.assertIn("Call this FIRST", review["description"])
         self.assertIn("repo_path plus base_ref", review["description"])
         self.assertIn("repo_path/.supercontext", review["description"])
+        self.assertIn("snapshot_store", review["description"])
         self.assertIn(".git/info/exclude", review["description"])
         self.assertIn("combined response may use up to 20K chars", review["description"])
 
@@ -232,6 +259,400 @@ class Wave4ReviewEntryResolutionTests(unittest.TestCase):
             )
             self.assertEqual([], leaked_entity_paths)
             self.assertEqual([], leaked_evidence_paths)
+
+    def test_derived_snapshots_share_repo_identity_and_semantic_pairs_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            placeholder = root / "placeholder"
+            build_kg(repo, placeholder)
+            kg = KgSnapshot(placeholder)
+            fake_client = _Wave5FakeSemanticClient()
+
+            with patch(
+                "source.kg.integrations.semantic_llm.SemanticDiffLlmClient",
+                return_value=fake_client,
+            ):
+                result = call_tool(kg, "review_context", {"repo_path": str(repo), "base_ref": "HEAD~1"})
+
+            snapshots = result["entry_resolution"]["snapshots"]
+            base_snapshot = Path(snapshots["base_snapshot"])
+            head_snapshot = Path(snapshots["head_snapshot"])
+            base_manifest = json.loads((base_snapshot / "manifest.json").read_text(encoding="utf-8"))
+            head_manifest = json.loads((head_snapshot / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(base_manifest["repo_name"], "generic_repo")
+            self.assertEqual(head_manifest["repo_name"], "generic_repo")
+            self.assertNotEqual(base_manifest["repo_name"], result["entry_resolution"]["base_sha"])
+            self.assertNotEqual(head_manifest["repo_name"], result["entry_resolution"]["head_sha"])
+            stats = (result.get("review_quality_status") or {}).get("semantic_diff_stats") or {}
+            pairing = stats.get("cross_snapshot_pairing") or {}
+            self.assertGreater(fake_client.call_count, 0)
+            self.assertGreater(stats.get("calls_attempted", 0), 0, stats)
+            self.assertGreater(pairing.get("candidate_symbols", 0), 0, stats)
+            self.assertGreater(pairing.get("paired_symbols", 0), 0, stats)
+            self.assertNotEqual(
+                (result.get("review_quality_status") or {}).get("semantic_diff_status"),
+                "active:no_cross_snapshot_pairs",
+            )
+
+    def test_derived_compact_plain_review_better_preserves_entry_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "text_only_repo"
+            repo.mkdir()
+            _run(repo, "git", "init")
+            _run(repo, "git", "config", "user.email", "wave5@example.invalid")
+            _run(repo, "git", "config", "user.name", "Wave Five")
+            (repo / "styles.css").write_text(".button { color: red; }\n", encoding="utf-8")
+            _commit_all(repo, "base")
+            (repo / "styles.css").write_text(".button { color: blue; }\n", encoding="utf-8")
+            _commit_all(repo, "head")
+            placeholder = root / "placeholder"
+            build_kg(repo, placeholder)
+            kg = KgSnapshot(placeholder)
+
+            result = call_tool(kg, "review_context", {"repo_path": str(repo), "base_ref": "HEAD~1"})
+
+            self.assertEqual((result.get("review_quality_status") or {}).get("review_readiness"), "plain_review_better")
+            self.assertEqual((result.get("review_answer_packet") or {}).get("packet_mode"), "diff_anchor_only")
+            self.assertEqual((result.get("entry_resolution") or {}).get("mode"), "derived")
+            self.assertEqual(
+                ((result.get("review_answer_packet") or {}).get("entry_resolution") or {}).get("mode"),
+                "derived",
+            )
+            self.assertIn("snapshots", result.get("entry_resolution") or {})
+
+    def test_semantic_diff_status_exposes_zero_cross_snapshot_pairs(self) -> None:
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "generic_repo"
+            repo.mkdir()
+            (repo / "pkg").mkdir()
+            (repo / "pkg" / "core.py").write_text(
+                "def widget():\n"
+                "    if True:\n"
+                "        return 'old'\n",
+                encoding="utf-8",
+            )
+            base_snapshot = root / "base-kg"
+            build_kg(repo, base_snapshot, repo_name="old_repo")
+            (repo / "pkg" / "core.py").write_text(
+                "def widget():\n"
+                "    return 'new'\n",
+                encoding="utf-8",
+            )
+            head_snapshot = root / "head-kg"
+            build_kg(repo, head_snapshot, repo_name="generic_repo")
+            base_manifest = json.loads((base_snapshot / "manifest.json").read_text(encoding="utf-8"))
+            head_manifest = json.loads((head_snapshot / "manifest.json").read_text(encoding="utf-8"))
+            self.assertNotEqual(base_manifest["repo_name"], head_manifest["repo_name"])
+            base_checkout = root / "base-checkout"
+            head_checkout = root / "head-checkout"
+            (base_checkout / "pkg").mkdir(parents=True)
+            (head_checkout / "pkg").mkdir(parents=True)
+            (base_checkout / "pkg" / "core.py").write_text(
+                "def widget():\n"
+                "    if True:\n"
+                "        return 'old'\n",
+                encoding="utf-8",
+            )
+            (head_checkout / "pkg" / "core.py").write_text(
+                "def widget():\n"
+                "    return 'new'\n",
+                encoding="utf-8",
+            )
+            stats: dict = {}
+            fake_client = _Wave5FakeSemanticClient()
+
+            merged, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(base_snapshot),
+                head_kg=KgSnapshot(head_snapshot),
+                base_checkout=str(base_checkout),
+                head_checkout=str(head_checkout),
+                changed_symbols=[{"path": "pkg/core.py", "qualname": "widget"}],
+                review_hypotheses=[],
+                _client=fake_client,
+                _stats_out=stats,
+            )
+
+            self.assertEqual(merged, [])
+            self.assertEqual(status, "active:no_cross_snapshot_pairs")
+            self.assertEqual(fake_client.call_count, 0)
+            self.assertEqual((stats.get("cross_snapshot_pairing") or {}).get("candidate_symbols"), 1)
+            self.assertEqual((stats.get("cross_snapshot_pairing") or {}).get("paired_symbols"), 0)
+            self.assertEqual(stats.get("calls_attempted"), 0)
+
+    def test_review_context_snapshot_store_reuses_snapshots_across_run_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            origin = root / "origin.git"
+            _run(root, "git", "init", "--bare", str(origin))
+            _run(repo, "git", "remote", "add", "origin", str(origin))
+            _run(repo, "git", "push", "-u", "origin", "HEAD")
+            clone_parent = root / "run2"
+            clone_parent.mkdir()
+            clone = clone_parent / repo.name
+            _run(root, "git", "clone", str(origin), str(clone))
+
+            placeholder = root / "placeholder"
+            build_kg(repo, placeholder)
+            kg = KgSnapshot(placeholder)
+            store = root / "shared-snapshots"
+
+            from source.kg.product import review_entry_resolution
+
+            real_build = review_entry_resolution.kg_pipeline.build_kg
+            build_calls: list[tuple[str, str]] = []
+
+            def counted_build(repo_path, output_dir, *args, **kwargs):
+                build_calls.append((str(repo_path), str(output_dir)))
+                return real_build(repo_path, output_dir, *args, **kwargs)
+
+            args = {"base_ref": "HEAD~1", "snapshot_store": str(store)}
+            with patch(
+                "source.kg.product.review_entry_resolution.kg_pipeline.build_kg",
+                side_effect=counted_build,
+            ), patch(
+                "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
+                side_effect=_no_semantic_splice,
+            ):
+                first = call_tool(kg, "review_context", {"repo_path": str(repo), **args})
+                first_builds = len(build_calls)
+                second = call_tool(kg, "review_context", {"repo_path": str(clone), **args})
+
+            self.assertEqual(first["entry_resolution"]["status"], "active")
+            self.assertEqual(second["entry_resolution"]["status"], "active")
+            self.assertEqual(first.get("repo"), "generic_repo")
+            self.assertEqual(second.get("repo"), "generic_repo")
+            self.assertEqual((second.get("repo_resolution") or {}).get("effective_repo"), "generic_repo")
+            self.assertEqual(first_builds, 2, f"first run should build base+head once; calls={build_calls!r}")
+            self.assertEqual(
+                len(build_calls), first_builds,
+                f"second run with same origin+commits must reuse store snapshots; calls={build_calls!r}",
+            )
+            first_snapshots = first["entry_resolution"]["snapshots"]
+            second_snapshots = second["entry_resolution"]["snapshots"]
+            self.assertFalse(first_snapshots["base_snapshot_store_hit"])
+            self.assertFalse(first_snapshots["head_snapshot_store_hit"])
+            self.assertTrue(second_snapshots["base_snapshot_store_hit"])
+            self.assertTrue(second_snapshots["head_snapshot_store_hit"])
+            self.assertIn(str(store), second_snapshots["head_snapshot"])
+            self.assertEqual(
+                Path(second_snapshots["head_snapshot"]).parent.name,
+                review_entry_resolution._SNAPSHOT_STORE_SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                second_snapshots["snapshot_store_schema_version"],
+                review_entry_resolution._SNAPSHOT_STORE_SCHEMA_VERSION,
+            )
+
+    def test_review_context_snapshot_store_can_come_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            placeholder = root / "placeholder"
+            build_kg(repo, placeholder)
+            kg = KgSnapshot(placeholder)
+            store = root / "env-shared-snapshots"
+
+            from source.kg.product import review_entry_resolution
+
+            with patch.dict("os.environ", {"SUPERCONTEXT_SNAPSHOT_STORE": str(store)}), patch(
+                "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
+                side_effect=_no_semantic_splice,
+            ):
+                result = call_tool(kg, "review_context", {"repo_path": str(repo), "base_ref": "HEAD~1"})
+
+            snapshots = result["entry_resolution"]["snapshots"]
+            self.assertEqual(result["entry_resolution"]["status"], "active")
+            self.assertIn(str(store), snapshots["base_snapshot"])
+            self.assertIn(str(store), snapshots["head_snapshot"])
+            self.assertEqual(
+                snapshots["snapshot_store_schema_version"],
+                review_entry_resolution._SNAPSHOT_STORE_SCHEMA_VERSION,
+            )
+
+    def test_snapshot_store_rejects_repo_name_equal_to_commit_sha(self) -> None:
+        from source.kg.product import review_entry_resolution
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            head_sha = _run(repo, "git", "rev-parse", "HEAD")
+            store = root / "shared-snapshots"
+            repo_identity = "repo-identity"
+            target = (
+                store
+                / repo_identity
+                / review_entry_resolution._SNAPSHOT_STORE_SCHEMA_VERSION
+                / head_sha
+            )
+            target.mkdir(parents=True)
+            for filename in ("entities.jsonl", "facts.jsonl", "evidence.jsonl", "coverage.jsonl"):
+                (target / filename).write_text("", encoding="utf-8")
+            (target / "manifest.json").write_text(
+                json.dumps({"commit_sha": head_sha, "repo_name": head_sha}),
+                encoding="utf-8",
+            )
+
+            snapshot, reused, store_hit = review_entry_resolution._ensure_snapshot(
+                repo,
+                head_sha,
+                cache_root=repo,
+                snapshot_store=store,
+                repo_identity=repo_identity,
+                repo_name=repo.name,
+            )
+
+            self.assertEqual(snapshot, target)
+            self.assertFalse(reused)
+            self.assertFalse(store_hit)
+            rebuilt_manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(rebuilt_manifest["commit_sha"], head_sha)
+            self.assertEqual(rebuilt_manifest["repo_name"], repo.name)
+
+    def test_snapshot_store_identity_separates_tenants_for_same_origin(self) -> None:
+        from source.kg.product.review_entry_resolution import _snapshot_store_repo_identity
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            origin = root / "origin.git"
+            _run(root, "git", "init", "--bare", str(origin))
+            _run(repo, "git", "remote", "add", "origin", str(origin))
+
+            tenant_a = _snapshot_store_repo_identity(
+                repo,
+                manifest_repo_name="generic_repo",
+                manifest_tenant_id="tenant-a",
+            )
+            tenant_b = _snapshot_store_repo_identity(
+                repo,
+                manifest_repo_name="generic_repo",
+                manifest_tenant_id="tenant-b",
+            )
+
+        self.assertNotEqual(tenant_a, tenant_b)
+
+    def test_snapshot_store_identity_separates_checkout_names_for_same_origin(self) -> None:
+        from source.kg.product.review_entry_resolution import _snapshot_store_repo_identity
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            origin = root / "origin.git"
+            _run(root, "git", "init", "--bare", str(origin))
+            _run(repo, "git", "remote", "add", "origin", str(origin))
+            _run(repo, "git", "push", "-u", "origin", "HEAD")
+            differently_named = root / "run2"
+            _run(root, "git", "clone", str(origin), str(differently_named))
+
+            canonical = _snapshot_store_repo_identity(
+                repo,
+                manifest_repo_name="generic_repo",
+                manifest_tenant_id="default",
+            )
+            alias = _snapshot_store_repo_identity(
+                differently_named,
+                manifest_repo_name="generic_repo",
+                manifest_tenant_id="default",
+            )
+
+        self.assertNotEqual(canonical, alias)
+
+    def test_review_context_snapshot_store_does_not_prune_local_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            placeholder = root / "placeholder"
+            build_kg(repo, placeholder)
+            kg = KgSnapshot(placeholder)
+            local_cache = repo / ".supercontext" / "kg"
+            for index in range(6):
+                stale = local_cache / f"stale-{index}"
+                stale.mkdir(parents=True)
+                (stale / "manifest.json").write_text("{}", encoding="utf-8")
+
+            with patch(
+                "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
+                side_effect=_no_semantic_splice,
+            ):
+                result = call_tool(
+                    kg,
+                    "review_context",
+                    {"repo_path": str(repo), "base_ref": "HEAD~1", "snapshot_store": str(root / "store")},
+                )
+
+            self.assertEqual(result["entry_resolution"]["status"], "active")
+            self.assertEqual(
+                sorted(path.name for path in local_cache.iterdir() if path.is_dir()),
+                [f"stale-{index}" for index in range(6)],
+                "shared snapshot_store mode must not prune repo-local cache entries",
+            )
+
+    def test_review_context_snapshot_store_miss_builds_different_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            origin = root / "origin.git"
+            _run(root, "git", "init", "--bare", str(origin))
+            _run(repo, "git", "remote", "add", "origin", str(origin))
+            _run(repo, "git", "push", "-u", "origin", "HEAD")
+
+            placeholder = root / "placeholder"
+            build_kg(repo, placeholder)
+            kg = KgSnapshot(placeholder)
+            store = root / "shared-snapshots"
+
+            from source.kg.product import review_entry_resolution
+
+            real_build = review_entry_resolution.kg_pipeline.build_kg
+            build_calls: list[tuple[str, str]] = []
+
+            def counted_build(repo_path, output_dir, *args, **kwargs):
+                build_calls.append((str(repo_path), str(output_dir)))
+                return real_build(repo_path, output_dir, *args, **kwargs)
+
+            with patch(
+                "source.kg.product.review_entry_resolution.kg_pipeline.build_kg",
+                side_effect=counted_build,
+            ), patch(
+                "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
+                side_effect=_no_semantic_splice,
+            ):
+                first = call_tool(
+                    kg,
+                    "review_context",
+                    {"repo_path": str(repo), "base_ref": "HEAD~1", "snapshot_store": str(store)},
+                )
+                first_builds = len(build_calls)
+                (repo / "pkg" / "core.py").write_text(
+                    "def ready():\n"
+                    "    return True\n\n"
+                    "def widget():\n"
+                    "    return 'newer'\n",
+                    encoding="utf-8",
+                )
+                _commit_all(repo, "new head")
+                second = call_tool(
+                    kg,
+                    "review_context",
+                    {"repo_path": str(repo), "base_ref": "HEAD~1", "snapshot_store": str(store)},
+                )
+
+            self.assertEqual(first["entry_resolution"]["status"], "active")
+            self.assertEqual(second["entry_resolution"]["status"], "active")
+            self.assertEqual(first_builds, 2, f"first run should build base+head once; calls={build_calls!r}")
+            self.assertGreater(
+                len(build_calls), first_builds,
+                "a new head commit must miss the store and build a new snapshot",
+            )
+            snapshots = second["entry_resolution"]["snapshots"]
+            self.assertTrue(snapshots["base_snapshot_store_hit"])
+            self.assertFalse(snapshots["head_snapshot_store_hit"])
 
     def test_supercontext_exclude_accepts_entry_without_trailing_slash(self) -> None:
         from source.kg.product.review_entry_resolution import _ensure_supercontext_excluded

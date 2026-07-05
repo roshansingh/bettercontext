@@ -2326,6 +2326,9 @@ def _review_context_properties() -> JsonObject:
         "base_ref": _string_schema(
             "Git ref or SHA for the PR base. With repo_path, review_context derives the legacy review arguments automatically."
         ),
+        "snapshot_store": _string_schema(
+            "Optional persistent KG snapshot store for derived repo_path/base_ref mode; also configurable with SUPERCONTEXT_SNAPSHOT_STORE."
+        ),
         "changed_files": {
             "type": "array",
             "items": {"type": "string"},
@@ -3092,6 +3095,26 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
             changed_symbols=changed_symbols,
             review_hypotheses=review_hypotheses,
         )
+    analysis_base_snapshot: KgSnapshot | None = None
+    analysis_base_snapshot_error: Exception | None = None
+    if base_snapshot_dir and base_checkout and head_checkout:
+        try:
+            analysis_base_snapshot = KgSnapshot(base_snapshot_dir)
+        except Exception as exc:  # noqa: BLE001
+            analysis_base_snapshot_error = exc
+    async_result_capture_status: str | None = None
+    if base_snapshot_dir and base_checkout and head_checkout:
+        async_changed_symbols = _review_context_dedupe_rows([*changed_symbols, *changed_file_symbols])
+        review_hypotheses, async_result_capture_status = _splice_unawaited_async_result_hypotheses(
+            base_snapshot_dir=base_snapshot_dir,
+            head_kg=kg,
+            base_checkout=base_checkout,
+            head_checkout=head_checkout,
+            changed_symbols=async_changed_symbols,
+            review_hypotheses=review_hypotheses,
+            _base_snapshot=analysis_base_snapshot,
+            _base_snapshot_error=analysis_base_snapshot_error,
+        )
     semantic_diff_status: str | None = None
     semantic_diff_stats: "JsonObject | None" = None
     if base_snapshot_dir and base_checkout and head_checkout:
@@ -3104,6 +3127,8 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
             changed_symbols=changed_symbols,
             review_hypotheses=review_hypotheses,
             _stats_out=_splice_stats,
+            _base_snapshot=analysis_base_snapshot,
+            _base_snapshot_error=analysis_base_snapshot_error,
         )
         if _splice_stats:
             semantic_diff_stats = _splice_stats
@@ -3112,6 +3137,11 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
     elif base_checkout or head_checkout:
         # Minor 11: checkouts provided without a base_snapshot — note the missing dependency.
         semantic_diff_status = "missing_base_snapshot"
+    review_hypotheses = _attach_consumer_breadth_to_hypotheses(
+        head_kg=kg,
+        changed_files=changed_files,
+        review_hypotheses=review_hypotheses,
+    )
     # Cap the top-level list to PLANNING_CONTEXT_SECTION_LIMIT (5). The splice inserts
     # high-specificity rows at the front so the specifics-first partition is already
     # correct; the reservation cap preserves that order while guaranteeing at least one
@@ -3167,6 +3197,7 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         semantic_diff_status=semantic_diff_status,
         semantic_diff_stats=semantic_diff_stats,
         abstract_contract_status=abstract_contract_status,
+        async_result_capture_status=async_result_capture_status,
         changed_ranges=changed_ranges,
         changed_symbols=changed_symbols_in_scope,
     )
@@ -3273,6 +3304,7 @@ def _build_review_quality_status(
     semantic_diff_status: str | None = None,
     semantic_diff_stats: "JsonObject | None" = None,
     abstract_contract_status: str | None = None,
+    async_result_capture_status: str | None = None,
     changed_ranges: list[JsonObject] | None = None,
     changed_symbols: list[JsonObject] | None = None,
 ) -> JsonObject:
@@ -3371,6 +3403,8 @@ def _build_review_quality_status(
         status["semantic_diff_stats"] = semantic_diff_stats
     if abstract_contract_status is not None:
         status["abstract_contract_status"] = abstract_contract_status
+    if async_result_capture_status is not None:
+        status["async_result_capture_status"] = async_result_capture_status
     if contract_diff_note is not None:
         status["contract_diff_note"] = contract_diff_note
 
@@ -3436,10 +3470,27 @@ _CONTRACT_DIFF_SPECIFICITY: dict[str, str] = {
 }
 # Maximum contract-diff hypotheses to splice per family (avoid packet explosion).
 _CONTRACT_DIFF_SPLICE_CAP = 3
+_CONSUMER_BREADTH_RISK_TYPES = frozenset(
+    {
+        "contract_semantic_diff",
+        "guard_call_removed_drift",
+        "responsibility_moved_drift",
+        "abstract_contract_unimplemented",
+    }
+)
+_CONSUMER_BREADTH_ABSENCE_CHECK_RISK_TYPES = frozenset(
+    {
+        "contract_semantic_diff",
+        "guard_call_removed_drift",
+        "responsibility_moved_drift",
+    }
+)
+_CONSUMER_BREADTH_ENUMERATION_CAP = 10
 
 # Abstract-contract detector: deterministic_static family (reparent → abstract base
 # with unimplemented abstract members). Spliced alongside the other deterministic rows.
 _ABSTRACT_CONTRACT_SPLICE_CAP = 3
+_UNAWAITED_ASYNC_RESULT_SPLICE_CAP = 3
 
 
 def _generated_hypothesis_counts(review_hypotheses: list[JsonObject]) -> JsonObject:
@@ -3601,6 +3652,209 @@ def _resolve_changed_head_entities(
     return head_entities
 
 
+def _attach_consumer_breadth_to_hypotheses(
+    *,
+    head_kg: KgSnapshot,
+    changed_files: list[str],
+    review_hypotheses: list[JsonObject],
+) -> list[JsonObject]:
+    try:
+        from source.kg.query.caller_breadth import compute_consumer_breadth
+    except ImportError:
+        return review_hypotheses
+
+    enriched: list[JsonObject] = []
+    enumerations = 0
+    for row in review_hypotheses:
+        if not isinstance(row, dict):
+            enriched.append(row)
+            continue
+        risk_type = str(row.get("risk_type") or "")
+        if risk_type not in _CONSUMER_BREADTH_RISK_TYPES or "consumer_breadth" in row:
+            enriched.append(row)
+            continue
+        subject = _consumer_breadth_subject(row)
+        if subject is None:
+            enriched.append(row)
+            continue
+        if enumerations >= _CONSUMER_BREADTH_ENUMERATION_CAP:
+            capped_row = dict(row)
+            capped_row["consumer_breadth_skipped"] = True
+            capped_row["consumer_breadth_skip_reason"] = "enumeration_cap"
+            capped_row["consumer_breadth_enumeration_cap"] = _CONSUMER_BREADTH_ENUMERATION_CAP
+            enriched.append(capped_row)
+            continue
+        try:
+            breadth = compute_consumer_breadth(
+                head_kg,
+                symbol_urn=subject.get("urn"),
+                qualname=subject.get("qualname"),
+                path=subject.get("path"),
+                changed_files=changed_files,
+            ).to_json()
+        except Exception:  # noqa: BLE001
+            enriched.append(row)
+            continue
+        enumerations += 1
+        enriched.append(_row_with_consumer_breadth(row, breadth))
+    return enriched
+
+
+def _consumer_breadth_subject(row: JsonObject) -> JsonObject | None:
+    urn = row.get("subject_urn")
+    qualname = row.get("subject_qualname")
+    path = row.get("subject_path")
+    if any(isinstance(value, str) and value for value in (urn, qualname, path)):
+        subject: JsonObject = {}
+        if isinstance(urn, str) and urn:
+            subject["urn"] = urn
+        if isinstance(qualname, str) and qualname:
+            subject["qualname"] = qualname
+        if isinstance(path, str) and path:
+            subject["path"] = path
+        return subject
+    return None
+
+
+def _row_with_consumer_breadth(row: JsonObject, breadth: JsonObject) -> JsonObject:
+    updated = dict(row)
+    updated["consumer_breadth"] = breadth
+    status = str(breadth.get("enumeration_status") or "")
+    risk_type = str(row.get("risk_type") or "")
+    total = _safe_int(breadth.get("total_consumers"))
+    in_diff = _safe_int(breadth.get("in_diff_count"))
+    out_of_diff = _safe_int(breadth.get("out_of_diff_count"))
+    unknown_coords = _safe_int(breadth.get("unknown_coordinate_count"))
+    checks = [str(check) for check in (updated.get("source_checks") or []) if isinstance(check, str)]
+    if status in {"complete", "capped", "fact_capped", "partial"} and out_of_diff > 0:
+        sample = _consumer_breadth_sample(breadth)
+        lower_bound = "at least " if status in {"capped", "fact_capped", "partial"} else ""
+        if status == "fact_capped":
+            suffix = (
+                f"{lower_bound}{total} known static consumer files enumerated before the raw fact scan limit, "
+                f"{in_diff} updated in this diff, {out_of_diff} outside it"
+            )
+        elif status == "partial":
+            suffix = (
+                f"{lower_bound}{total} coordinate-bearing static consumer files, {in_diff} updated in this diff, "
+                f"{out_of_diff} outside it; {unknown_coords} additional consumers lacked source coordinates"
+            )
+        else:
+            suffix = (
+                f"{lower_bound}{total} known static consumer files repo-wide, {in_diff} updated in this diff, "
+                f"{out_of_diff} outside it"
+            )
+        if sample:
+            suffix += f" (e.g. {sample})"
+        original_postable_claim = updated.get("postable_claim")
+        updated["postable_claim"] = _append_consumer_breadth_suffix(
+            original_postable_claim or updated.get("concrete_invariant"),
+            suffix,
+        )
+        concrete_invariant = updated.get("concrete_invariant")
+        if (
+            isinstance(original_postable_claim, str)
+            and original_postable_claim.strip()
+            and isinstance(concrete_invariant, str)
+            and concrete_invariant.strip()
+        ):
+            updated["concrete_invariant"] = _append_consumer_breadth_suffix(
+                concrete_invariant,
+                suffix,
+            )
+        if status == "capped":
+            checks.insert(
+                0,
+                "Consumer breadth hit the static enumeration limit; counts are lower bounds and omitted consumers may exist."
+            )
+        elif status == "fact_capped":
+            checks.insert(
+                0,
+                "Consumer breadth hit the raw CALLS/IMPORTS fact scan limit before proving all distinct consumer files; counts are lower bounds."
+            )
+        elif status == "partial":
+            checks.insert(
+                0,
+                "Some static consumers lacked source coordinates; coordinate-bearing counts are lower bounds and cannot prove full breadth."
+            )
+        checks.insert(
+            0,
+            "Verify known static consumer files outside this diff before posting; "
+            "consumer_breadth is limited to static CALLS/IMPORTS facts."
+        )
+    elif status == "complete" and total > 0:
+        checks.insert(
+            0,
+            "Known static consumers from CALLS/IMPORTS are all in changed files "
+            f"({in_diff} in diff, 0 outside); treat as exculpatory breadth evidence."
+        )
+    elif status == "no_facts" and risk_type in _CONSUMER_BREADTH_ABSENCE_CHECK_RISK_TYPES:
+        checks.insert(
+            0,
+            "No known static consumers were found in CALLS/IMPORTS facts; do not infer broad downstream impact from breadth."
+        )
+    elif status == "unresolved" and risk_type in _CONSUMER_BREADTH_ABSENCE_CHECK_RISK_TYPES:
+        checks.insert(
+            0,
+            "Consumer breadth could not resolve this symbol unambiguously; inspect direct callers/importers before making absence or impact claims."
+        )
+    elif status == "capped":
+        checks.insert(
+            0,
+            "Consumer breadth hit the static enumeration limit; counts are lower bounds and cannot prove all consumers are in this diff."
+        )
+    elif status == "fact_capped":
+        checks.insert(
+            0,
+            "Consumer breadth hit the raw CALLS/IMPORTS fact scan limit; distinct consumer-file counts are lower bounds."
+        )
+    elif status == "partial":
+        checks.insert(
+            0,
+            "Some static consumers lacked source coordinates; do not treat in-diff/out-of-diff counts as complete or exculpatory."
+        )
+    if checks:
+        updated["source_checks"] = checks
+    return updated
+
+
+def _consumer_breadth_sample(breadth: JsonObject) -> str | None:
+    rows = breadth.get("top_out_of_diff")
+    if not isinstance(rows, list) or not rows:
+        return None
+    first = rows[0]
+    if not isinstance(first, dict):
+        return None
+    path = first.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    line = first.get("line")
+    if isinstance(line, int):
+        return f"{path}:{line}"
+    return path
+
+
+def _append_consumer_breadth_suffix(value: object, suffix: str) -> str:
+    text = str(value or "").rstrip().rstrip(".!?").rstrip()
+    return f"{text}; {suffix}." if text else suffix + "."
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _paired_symbols_from_stats(stats: object) -> tuple[int, int] | None:
+    if not isinstance(stats, dict):
+        return None
+    pairing = stats.get("cross_snapshot_pairing")
+    if not isinstance(pairing, dict):
+        return None
+    return _safe_int(pairing.get("candidate_symbols")), _safe_int(pairing.get("paired_symbols"))
+
+
 def _splice_abstract_contract_hypotheses(
     *,
     base_snapshot_dir: str,
@@ -3685,6 +3939,86 @@ def _splice_abstract_contract_hypotheses(
 
     # Front-splice: deterministic_static rows rank ahead of generic families.
     return spliced + review_hypotheses, "active"
+
+
+def _splice_unawaited_async_result_hypotheses(
+    *,
+    base_snapshot_dir: str,
+    head_kg: KgSnapshot,
+    base_checkout: str,
+    head_checkout: str,
+    changed_symbols: list[JsonObject],
+    review_hypotheses: list[JsonObject],
+    _base_snapshot: KgSnapshot | None = None,
+    _base_snapshot_error: Exception | None = None,
+) -> tuple[list[JsonObject], str]:
+    from pathlib import Path
+
+    try:
+        from source.kg.query.async_result_capture import unawaited_async_result_capture
+        from source.kg.query.snapshot import KgSnapshot as _KgSnap
+    except ImportError as exc:
+        return review_hypotheses, f"unavailable:{exc}"
+
+    base_checkout_path = Path(base_checkout)
+    head_checkout_path = Path(head_checkout)
+    if not base_checkout_path.is_dir():
+        return review_hypotheses, "failed:invalid_base_checkout"
+    if not head_checkout_path.is_dir():
+        return review_hypotheses, "failed:invalid_head_checkout"
+
+    try:
+        if _base_snapshot_error is not None:
+            raise _base_snapshot_error
+        base_snap = _base_snapshot if _base_snapshot is not None else _KgSnap(base_snapshot_dir)
+        raw_rows, stats = unawaited_async_result_capture(
+            base_snapshot=base_snap,
+            head_snapshot=head_kg,
+            base_root=base_checkout_path,
+            head_root=head_checkout_path,
+            changed_symbols=changed_symbols,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return review_hypotheses, f"failed:{exc}"
+
+    ts_parse_errors = _safe_int(stats.get("typescript_parse_error_count")) if isinstance(stats, dict) else 0
+    status = "partial:typescript_parse_error" if ts_parse_errors > 0 and raw_rows else "active"
+    if ts_parse_errors > 0 and not raw_rows:
+        status = "failed:typescript_parse_error"
+    pairing = _paired_symbols_from_stats(stats)
+    if (
+        not raw_rows
+        and status == "active"
+        and pairing is not None
+        and pairing[0] > 0
+        and pairing[1] == 0
+    ):
+        status = "active:no_cross_snapshot_pairs"
+
+    if not raw_rows:
+        return review_hypotheses, status
+
+    eligible_rows = [
+        row for row in raw_rows
+        if isinstance(row, dict) and row.get("hypothesis_id")
+    ]
+    spliced: list[JsonObject] = []
+    for row in eligible_rows:
+        if len(spliced) >= _UNAWAITED_ASYNC_RESULT_SPLICE_CAP:
+            break
+        hypothesis_id = str(row["hypothesis_id"])
+        spliced_row = dict(row)
+        spliced_row["label"] = hypothesis_label(str(row.get("risk_type") or ""), hypothesis_id)
+        spliced_row.setdefault("supporting_lead_ids", [])
+        spliced.append(spliced_row)
+
+    if not spliced:
+        return review_hypotheses, status
+
+    omitted_count = max(0, len(eligible_rows) - len(spliced))
+    if omitted_count > 0:
+        spliced[-1] = dict(spliced[-1], omitted_unawaited_async_result_count=omitted_count)
+    return spliced + review_hypotheses, status
 
 
 def _splice_contract_diff_hypotheses(
@@ -3801,9 +4135,14 @@ def _splice_contract_diff_hypotheses(
         if risk_type == "guard_call_removed_drift":
             target_ref = h.get("removed_callee") if isinstance(h.get("removed_callee"), dict) else None
             callee_ref = target_ref
+            subject_ref = h.get("subject") if isinstance(h.get("subject"), dict) else None
         elif risk_type == "responsibility_moved_drift":
             target_ref = h.get("moved_to") if isinstance(h.get("moved_to"), dict) else None
             callee_ref = h.get("shared_callee") if isinstance(h.get("shared_callee"), dict) else None
+            # Consumer breadth for moved rows describes the move destination's current static consumers.
+            subject_ref = target_ref
+        else:
+            subject_ref = None
         spliced_row: JsonObject = {
             "hypothesis_id": hypothesis_id,
             "label": hypothesis_label(risk_type, hypothesis_id),
@@ -3819,6 +4158,16 @@ def _splice_contract_diff_hypotheses(
             "evidence_refs": source_spans,
             "source_spans": source_spans,
         }
+        if subject_ref is not None:
+            subject_bytes_ref = subject_ref.get("bytes_ref") if isinstance(subject_ref.get("bytes_ref"), dict) else {}
+            if subject_ref.get("urn"):
+                spliced_row["subject_urn"] = str(subject_ref["urn"])
+            if subject_ref.get("qualname"):
+                spliced_row["subject_qualname"] = str(subject_ref["qualname"])
+            if subject_ref.get("path"):
+                spliced_row["subject_path"] = str(subject_ref["path"])
+            elif subject_bytes_ref.get("path"):
+                spliced_row["subject_path"] = str(subject_bytes_ref["path"])
         if target_ref is not None:
             if target_ref.get("kind"):
                 spliced_row["target_entity_kind"] = str(target_ref["kind"])
@@ -3887,6 +4236,8 @@ def _splice_semantic_diff_hypotheses(
     review_hypotheses: list[JsonObject],
     _client: "SemanticDiffLlmClient | None" = None,  # injection seam for tests
     _stats_out: "dict | None" = None,  # filled with SemanticDiffStats fields when provided
+    _base_snapshot: KgSnapshot | None = None,
+    _base_snapshot_error: Exception | None = None,
 ) -> tuple[list[JsonObject], str]:
     """Run semantic_contract_diff and splice inferred_llm hypothesis rows.
 
@@ -3929,7 +4280,9 @@ def _splice_semantic_diff_hypotheses(
         return review_hypotheses, "failed:invalid_head_checkout"
 
     try:
-        base_snap = _KgSnap(base_snapshot_dir)
+        if _base_snapshot_error is not None:
+            raise _base_snapshot_error
+        base_snap = _base_snapshot if _base_snapshot is not None else _KgSnap(base_snapshot_dir)
         client = _client if _client is not None else SemanticDiffLlmClient()
         raw_rows, inner_status = semantic_contract_diff(
             base_snapshot=base_snap,
@@ -3958,6 +4311,15 @@ def _splice_semantic_diff_hypotheses(
     # Normalize partial:auth → partial for the outer status reported to callers.
     if inner_status == "partial:auth":
         inner_status = "partial"
+    pairing = _paired_symbols_from_stats(_stats_out)
+    if (
+        not raw_rows
+        and inner_status == "active"
+        and pairing is not None
+        and pairing[0] > 0
+        and pairing[1] == 0
+    ):
+        inner_status = "active:no_cross_snapshot_pairs"
 
     # For "partial", "no_api_key" (with rows), or "active": splice available rows
     if not raw_rows:
@@ -4147,6 +4509,9 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
         "top_direct_callees": [],
         "top_transitive_callers": [],
     }
+    entry_resolution = result.get("entry_resolution")
+    if isinstance(entry_resolution, dict) and entry_resolution:
+        compact_packet["entry_resolution"] = entry_resolution
     next_actions = [
         *[str(action) for action in result.get("next_actions", []) if str(action).strip()],
         (
@@ -4221,6 +4586,8 @@ def _review_context_compact_unanchored_result(result: JsonObject) -> JsonObject:
         },
         "next_actions": _dedupe_strings(next_actions),
     }
+    if isinstance(entry_resolution, dict) and entry_resolution:
+        compact_result["entry_resolution"] = entry_resolution
     return compact_result
 
 
@@ -7682,7 +8049,7 @@ _TOOLS: dict[str, McpTool] = {
         name="review_context",
         description=(
             "Call this FIRST when reviewing a PR or local diff: pass repo_path plus base_ref, or the legacy explicit repo/changed_files/changed_ranges/base_snapshot/base_checkout/head_checkout fields. "
-            "Derived repo_path/base_ref mode writes reusable KG/worktree caches under repo_path/.supercontext, adds .supercontext/ to the repo-local .git/info/exclude, and ignores that cache for dirty-worktree checks. "
+            "Derived repo_path/base_ref mode writes reusable KG/worktree caches under repo_path/.supercontext, or KG snapshots under snapshot_store/SUPERCONTEXT_SNAPSHOT_STORE when configured; it adds .supercontext/ to the repo-local .git/info/exclude and ignores that cache for dirty-worktree checks. "
             "Default compact packets keep the parent review_context under 15K chars; when internal follow-up packets attach, the combined response may use up to 20K chars. "
             "It returns ranked review_hypotheses with source coordinates, attribution labels to cite when used, entry_resolution derivation status, and review_quality_status follow-up guidance when the bounded packet is incomplete. "
             "Use review_answer_packet.packet_mode, review_quality_status.base_diff_status, requested_surfaces, and surface_status to distinguish diff-anchor-only context, missing base snapshots, requested impact categories, inventory context, unlinked leads, and missing evidence. "

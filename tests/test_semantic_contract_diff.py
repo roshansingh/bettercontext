@@ -3735,6 +3735,30 @@ class TestSemanticDiffStats(unittest.TestCase):
         fake.completion_cost = _completion_cost
         return fake
 
+    def _inject_fake_litellm_raw(self, raw_content: str):
+        """Return a fake litellm module whose completion text is not JSON."""
+        import types
+
+        class _Message:
+            def __init__(self) -> None:
+                self.content = raw_content
+
+        class _Choice:
+            def __init__(self) -> None:
+                self.message = _Message()
+
+        class _Response:
+            def __init__(self) -> None:
+                self.choices = [_Choice()]
+
+        def _completion_cost(**kwargs):
+            return None
+
+        fake = types.ModuleType("litellm")
+        fake.completion = lambda **kwargs: _Response()
+        fake.completion_cost = _completion_cost
+        return fake
+
     def test_stats_in_final_packet_after_splice_and_budget(self) -> None:
         """semantic_diff_stats present in review_quality_status after full call_tool pipeline.
 
@@ -3826,6 +3850,170 @@ class TestSemanticDiffStats(unittest.TestCase):
             stats.get("model"), "fake-model",
             f"model must be 'fake-model'; got {stats.get('model')}",
         )
+        self.assertNotIn(
+            "parse_failure_samples", stats,
+            "healthy semantic diff stats must not carry diagnostic raw samples",
+        )
+
+    def test_parse_failure_samples_in_final_packet(self) -> None:
+        """Unparseable real-client responses surface clipped raw samples in final packet stats."""
+        import sys
+        from unittest.mock import patch
+        from source.kg.integrations.semantic_llm import SemanticDiffLlmClient
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses as _real_splice
+
+        raw_completion = "The change removes validation but I will not emit JSON." + ("x" * 2500)
+        fake_litellm = self._inject_fake_litellm_raw(raw_completion)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            out_base, out_head, base_checkout, head_checkout = _build_two_snapshot_pair(root)
+            head_kg = KgSnapshot(out_head)
+
+            with patch.dict(sys.modules, {"litellm": fake_litellm}):
+                real_client = SemanticDiffLlmClient(model="fake-model")
+
+                def _with_real_client(**kw):
+                    return _real_splice(**kw, _client=real_client)
+
+                with patch(
+                    "source.kg.product.mcp_tools._splice_semantic_diff_hypotheses",
+                    side_effect=lambda **kw: _with_real_client(**kw),
+                ):
+                    result = call_tool(head_kg, "review_context", {
+                        "repo": _SVC2_REPO,
+                        "changed_files": ["handler.py"],
+                        "base_snapshot": str(out_base),
+                        "base_checkout": str(base_checkout),
+                        "head_checkout": str(head_checkout),
+                    })
+
+        rqs = result.get("review_quality_status") or {}
+        self.assertEqual(
+            rqs.get("semantic_diff_status"), "failed:all_responses_unparseable",
+            f"semantic diff status must report the parse failure; got {rqs.get('semantic_diff_status')!r}",
+        )
+        stats = rqs.get("semantic_diff_stats") or {}
+        samples = stats.get("parse_failure_samples")
+        self.assertIsInstance(samples, list, f"parse_failure_samples must be a list; got {samples!r}")
+        self.assertEqual(len(samples), 1, f"expected one raw sample; got {samples!r}")
+        self.assertEqual(
+            samples[0],
+            raw_completion[:2000],
+            "raw diagnostic sample must be clipped to the first 2000 chars",
+        )
+
+    def test_parse_failure_samples_trimmed_before_status_counts(self) -> None:
+        """Budget trimming drops diagnostic raw samples before semantic status/count fields."""
+        from copy import deepcopy
+        from source.kg.core.models import canonical_json
+        from source.kg.product import output_budget as ob
+
+        base_stats = {
+            "model": "fake-model",
+            "calls_attempted": 1,
+            "calls_succeeded": 0,
+            "calls_failed": 0,
+            "parse_misses": 1,
+            "rows_generated": 0,
+            "rows_verified": 0,
+            "rows_unverified": 0,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "cost_usd": None,
+        }
+        result = {
+            "review_quality_status": {
+                "coverage_status": "partial",
+                "specific_hypothesis_count": 0,
+                "generic_hypothesis_count": 0,
+                "specificity": "low",
+                "recommended_action": "use_live_followups_or_plain_review",
+                "reason": "Test packet.",
+                "review_readiness": "plain_review_better",
+                "semantic_diff_status": "failed:all_responses_unparseable",
+                "semantic_diff_stats": {
+                    **base_stats,
+                    "parse_failure_samples": ["x" * 4000],
+                },
+            },
+            "review_hypotheses": [],
+        }
+        without_samples = deepcopy(result)
+        without_samples["review_quality_status"]["semantic_diff_stats"] = dict(base_stats)
+        max_chars = len(canonical_json(without_samples)) + 4
+
+        ob._trim_review_quality_status_to_fit(result, max_chars=max_chars)
+
+        stats = result["review_quality_status"]["semantic_diff_stats"]
+        self.assertNotIn(
+            "parse_failure_samples", stats,
+            "diagnostic raw samples must be the first semantic_diff_stats field trimmed",
+        )
+        self.assertEqual(
+            stats.get("parse_misses"), 1,
+            "parse_misses count must survive diagnostic sample trimming",
+        )
+        self.assertEqual(
+            result["review_quality_status"].get("semantic_diff_status"),
+            "failed:all_responses_unparseable",
+            "semantic_diff_status must survive diagnostic sample trimming",
+        )
+        self.assertLessEqual(
+            len(canonical_json(result)), max_chars,
+            "trimming parse_failure_samples should bring the packet under the configured cap",
+        )
+
+    def test_no_claim_response_samples_trimmed_before_status_counts(self) -> None:
+        """Budget trimming also drops parsed-but-invalid diagnostic samples first."""
+        from copy import deepcopy
+        from source.kg.core.models import canonical_json
+        from source.kg.product import output_budget as ob
+
+        base_stats = {
+            "model": "fake-model",
+            "calls_attempted": 1,
+            "calls_succeeded": 1,
+            "calls_failed": 0,
+            "parse_misses": 0,
+            "rows_generated": 0,
+            "rows_verified": 0,
+            "rows_unverified": 0,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "cost_usd": None,
+        }
+        result = {
+            "review_quality_status": {
+                "coverage_status": "partial",
+                "specific_hypothesis_count": 0,
+                "generic_hypothesis_count": 0,
+                "specificity": "low",
+                "recommended_action": "use_live_followups_or_plain_review",
+                "reason": "Test packet.",
+                "review_readiness": "plain_review_better",
+                "semantic_diff_status": "failed:no_valid_claims",
+                "semantic_diff_stats": {
+                    **base_stats,
+                    "no_claim_response_samples": ["x" * 4000],
+                },
+            },
+            "review_hypotheses": [],
+        }
+        without_samples = deepcopy(result)
+        without_samples["review_quality_status"]["semantic_diff_stats"] = dict(base_stats)
+        max_chars = len(canonical_json(without_samples)) + 4
+
+        ob._trim_review_quality_status_to_fit(result, max_chars=max_chars)
+
+        stats = result["review_quality_status"]["semantic_diff_stats"]
+        self.assertNotIn(
+            "no_claim_response_samples", stats,
+            "parsed-but-invalid diagnostic samples must be trimmed before semantic status fields",
+        )
+        self.assertEqual(stats.get("calls_succeeded"), 1)
+        self.assertEqual(result["review_quality_status"].get("semantic_diff_status"), "failed:no_valid_claims")
+        self.assertLessEqual(len(canonical_json(result)), max_chars)
 
     def test_stats_usage_absent_produces_nulls_not_zeros(self) -> None:
         """When litellm response has no usage, prompt_tokens/completion_tokens/cost_usd must be None.
@@ -4209,6 +4397,87 @@ class TestViolatedInvariantSchema(unittest.TestCase):
             self.assertGreater(len(valid_rows), 0, "valid-schema response must produce rows")
             self.assertEqual(valid_status, "active",
                              f"valid-schema response must be 'active'; got {valid_status!r}")
+
+    def test_no_valid_claim_samples_are_not_labeled_parse_failures(self) -> None:
+        """Parsed-but-invalid responses may include diagnostics, but not as parse failures."""
+        from source.kg.query.semantic_contract_diff import semantic_contract_diff
+
+        raw_response = "parsed old schema response" + ("x" * 2100)
+
+        class _RawParsedClient:
+            model = "fake-model"
+
+            def __init__(self) -> None:
+                self.call_count = 0
+
+            def complete_json(self, prompt: str) -> LlmResult:
+                self.call_count += 1
+                return LlmResult.parsed(
+                    [{
+                        "claim": "Guard removed.",
+                        "cause_line": 2,
+                        "consequence": "Callers may pass None.",
+                        "negative_check": "No check.",
+                        "category": "guard_removal",
+                    }],
+                    raw_text=raw_response[:2000],
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = [d for d in snap.entities if d.get("kind") == "CodeSymbol"]
+            stats: dict = {}
+            client = _RawParsedClient()
+
+            rows, status = semantic_contract_diff(
+                base_snapshot=snap,
+                head_snapshot=snap,
+                base_root=base_dir,
+                head_root=head_dir,
+                changed_symbols=entity_dicts,
+                client=client,  # type: ignore[arg-type]
+                _stats_out=stats,
+            )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(status, "failed:no_valid_claims")
+        self.assertNotIn("parse_failure_samples", stats)
+        self.assertEqual(stats.get("no_claim_response_samples"), [raw_response[:2000]])
+
+    def test_semantic_splice_uses_preloaded_base_snapshot(self) -> None:
+        from source.kg.product.mcp_tools import _splice_semantic_diff_hypotheses
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snap, base_dir, head_dir = self._make_single_symbol_snap(root)
+            entity_dicts = []
+            for row in snap.entities:
+                if row.get("kind") != "CodeSymbol":
+                    continue
+                identity = row.get("identity") or {}
+                properties = row.get("properties") or {}
+                entity_dicts.append({
+                    "qualname": identity.get("qualname"),
+                    "path": properties.get("path"),
+                })
+
+            merged, status = _splice_semantic_diff_hypotheses(
+                base_snapshot_dir=str(root / "missing-base-snapshot"),
+                head_kg=snap,
+                base_checkout=str(base_dir),
+                head_checkout=str(head_dir),
+                changed_symbols=entity_dicts,
+                review_hypotheses=[],
+                _client=_FakeClient(response=[_claim()]),
+                _base_snapshot=snap,
+            )
+
+        self.assertEqual(status, "active")
+        self.assertTrue(
+            any(row.get("risk_type") == "contract_semantic_diff" for row in merged),
+            f"preloaded base snapshot should avoid reloading base_snapshot_dir; got {merged!r}",
+        )
 
     def test_parsed_empty_list_is_valid_no_changes_and_stays_active(self) -> None:
         """A parsed EMPTY list ([]) is a valid 'no behavioral contract changes found'
