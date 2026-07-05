@@ -483,6 +483,28 @@ class Wave4ReviewEntryResolutionTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "git_timeout"):
                     _git_stdout(Path(tmp), "status")
 
+    def test_git_stdout_oserror_returns_structured_runtime_error(self) -> None:
+        from source.kg.product.review_entry_resolution import _git_stdout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "source.kg.product.review_entry_resolution.subprocess.run",
+                side_effect=FileNotFoundError("git"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "git_os_error:FileNotFoundError"):
+                    _git_stdout(Path(tmp), "status")
+
+    def test_git_bytes_oserror_returns_structured_runtime_error(self) -> None:
+        from source.kg.product.review_entry_resolution import _git_bytes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "source.kg.product.review_entry_resolution.subprocess.run",
+                side_effect=OSError("argument list too long"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "git_os_error:OSError"):
+                    _git_bytes(Path(tmp), "diff", "--numstat")
+
     def test_dirty_worktree_git_failure_returns_structured_entry_resolution_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -740,7 +762,7 @@ class Wave4ReviewEntryResolutionTests(unittest.TestCase):
             root = Path(tmp)
             repo = _init_repo(root)
             base_sha = _run(repo, "git", "rev-parse", "HEAD~1")
-            stale = repo / ".supercontext" / "worktrees" / base_sha[:12]
+            stale = repo / ".supercontext" / "worktrees" / base_sha
             stale.mkdir(parents=True)
             (stale / "stale.txt").write_text("not a worktree", encoding="utf-8")
 
@@ -748,7 +770,22 @@ class Wave4ReviewEntryResolutionTests(unittest.TestCase):
 
             self.assertFalse(reused)
             self.assertTrue(recreated)
+            self.assertEqual(worktree.name, base_sha)
             self.assertEqual(_run(worktree, "git", "rev-parse", "HEAD"), base_sha)
+
+    def test_base_worktree_cache_uses_full_sha_directory(self) -> None:
+        from source.kg.product.review_entry_resolution import _ensure_base_worktree
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _init_repo(root)
+            base_sha = _run(repo, "git", "rev-parse", "HEAD~1")
+
+            worktree, _reused, _recreated = _ensure_base_worktree(repo, base_sha)
+
+            self.assertEqual(worktree.name, base_sha)
+            self.assertTrue((repo / ".supercontext" / "worktrees" / base_sha).is_dir())
+            self.assertFalse((repo / ".supercontext" / "worktrees" / base_sha[:12]).exists())
 
     def test_base_worktree_prunes_stale_registration_after_cache_dir_deleted(self) -> None:
         import shutil

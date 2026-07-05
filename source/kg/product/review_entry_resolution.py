@@ -652,7 +652,7 @@ def _parse_hunk_added_range(line: str) -> tuple[int, int] | None:
 def _ensure_base_worktree(repo_path: Path, base_sha: str) -> tuple[Path, bool, bool]:
     root = repo_path / _CACHE_ROOT / _WORKTREE_CACHE_DIR
     root.mkdir(parents=True, exist_ok=True)
-    target = root / base_sha[:12]
+    target = root / base_sha
     recreated = False
     if target.exists():
         try:
@@ -682,6 +682,8 @@ def _remove_cached_worktree(repo_path: Path, target: Path) -> None:
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("git_timeout") from exc
+    except OSError as exc:
+        raise _git_os_runtime_error(exc) from exc
     if target.exists():
         _safe_remove_cache_dir(target, root=repo_path / _CACHE_ROOT / _WORKTREE_CACHE_DIR)
 
@@ -704,6 +706,8 @@ def _prune_worktree_cache(repo_path: Path, *, keep: set[Path]) -> None:
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("git_timeout") from exc
+        except OSError as exc:
+            raise _git_os_runtime_error(exc) from exc
         if stale.exists():
             _safe_remove_cache_dir(stale, root=root)
 
@@ -779,6 +783,8 @@ def _git_stdout(repo_path: Path, *args: str) -> str:
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("git_timeout") from exc
+    except OSError as exc:
+        raise _git_os_runtime_error(exc) from exc
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git_command_failed")
     return result.stdout.strip()
@@ -795,10 +801,16 @@ def _git_bytes(repo_path: Path, *args: str) -> bytes:
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("git_timeout") from exc
+    except OSError as exc:
+        raise _git_os_runtime_error(exc) from exc
     if result.returncode != 0:
         message = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(message or "git_command_failed")
     return result.stdout
+
+
+def _git_os_runtime_error(exc: OSError) -> RuntimeError:
+    return RuntimeError(f"git_os_error:{exc.__class__.__name__}")
 
 
 def _failure_reason(exc: RuntimeError) -> str:
