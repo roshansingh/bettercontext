@@ -36,6 +36,7 @@ from source.kg.product.review_hypotheses import (
     apply_structural_noise_downranking,
     review_hypotheses_for_context,
 )
+from source.kg.product.review_entry_resolution import resolve_review_context_entry
 from source.kg.product.runtime_architecture import ENDPOINT_PATH_SHAPE_MATCH_BASIS, runtime_architecture_packet
 from source.kg.query.call_site import call_site_from_qualifier
 from source.kg.query.snapshot import KgSnapshot
@@ -264,7 +265,12 @@ def call_tool(kg: KgSnapshot, name: str, arguments: JsonObject | None = None) ->
     if name == "review_context":
         payload.setdefault("output_budget", {})["engine_version"] = engine_version()
         include_broad = _optional_bool(arguments, "include_broad_context", default=False)
-        return enforce_review_context_budget(payload, include_broad_context=include_broad)
+        execute_followups = _optional_bool(arguments, "execute_followups", default=True)
+        return enforce_review_context_budget(
+            payload,
+            include_broad_context=include_broad,
+            execute_followups=execute_followups,
+        )
     if name == "reverse_impact":
         return enforce_reverse_impact_budget(payload)
     if name == "get_service_brief":
@@ -2313,12 +2319,17 @@ def _changed_range_schema() -> JsonObject:
 
 def _review_context_properties() -> JsonObject:
     return {
-        "repo": _string_schema("Repository identifier for the review target."),
+        "repo": _string_schema("Repository identifier for the review target. Optional when repo_path/base_ref are provided."),
+        "repo_path": _string_schema(
+            "Path to the head git checkout. With base_ref, review_context derives changed files/ranges and cached snapshots."
+        ),
+        "base_ref": _string_schema(
+            "Git ref or SHA for the PR base. With repo_path, review_context derives the legacy review arguments automatically."
+        ),
         "changed_files": {
             "type": "array",
             "items": {"type": "string"},
-            "minItems": 1,
-            "description": "Changed file paths to review.",
+            "description": "Changed file paths to review. Optional when repo_path/base_ref are provided.",
         },
         "changed_ranges": {
             "type": "array",
@@ -2357,6 +2368,11 @@ def _review_context_properties() -> JsonObject:
                 f"{REVIEW_CONTEXT_BROAD_MAX_CHARS} chars (legacy behavior). "
                 "By default (false), broad sections are suppressed and the cap is 15,000 chars for a hypothesis-first compact packet."
             ),
+        },
+        "execute_followups": {
+            "type": "boolean",
+            "default": True,
+            "description": "When true, review_context may attach bounded internal follow-up packets from already-generated hypotheses for needs_followup packets.",
         },
         "base_snapshot": {
             "type": "string",
@@ -2738,6 +2754,12 @@ def _review_context_snapshot_paths(kg: KgSnapshot) -> set[str]:
 
 
 def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
+    resolved_entry = resolve_review_context_entry(kg, arguments)
+    if resolved_entry.terminal_payload is not None:
+        return resolved_entry.terminal_payload
+    kg = resolved_entry.kg
+    arguments = resolved_entry.arguments
+    entry_resolution = resolved_entry.entry_resolution
     requested_repo = _required_string(arguments, "repo")
     changed_files = _required_string_list(arguments, "changed_files")
     repo_resolution = _review_context_repo_resolution(kg, requested_repo=requested_repo, changed_files=changed_files)
@@ -3033,6 +3055,8 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         source_coordinates=source_coordinates,
     )
     review_answer_packet["repo_resolution"] = repo_resolution
+    if entry_resolution:
+        review_answer_packet["entry_resolution"] = entry_resolution
     review_answer_packet["review_lead_status"] = review_lead_packet["review_lead_status"]
     review_hypotheses = review_hypotheses_for_context(
         changed_files=changed_files,
@@ -3220,6 +3244,8 @@ def _review_context(kg: KgSnapshot, arguments: JsonObject) -> JsonObject:
         # layer to build inspection_areas for truncated high/medium rows).
         "_full_pre_cap_hypotheses": full_pre_cap_hypotheses,
     }
+    if entry_resolution:
+        result["entry_resolution"] = entry_resolution
     if _review_context_should_compact_unanchored(
         changed_ranges=changed_ranges,
         include_unlinked_leads=include_unlinked_leads,
@@ -3937,19 +3963,36 @@ def _splice_semantic_diff_hypotheses(
     if not raw_rows:
         return review_hypotheses, inner_status
 
-    # Cap and splice — mirror the contract-diff round-robin pattern (single family here)
+    # Cap and splice — verified semantic rows keep the old high-priority semantic slot.
+    # Failed verification rows are still useful source leads, but they are low-specificity
+    # and must not claim the semantic diff-derived family reservation.
+    verified_rows = [
+        row for row in raw_rows
+        if isinstance(row, dict) and row.get("verification") == "verified"
+    ]
+    unverified_rows = [
+        row for row in raw_rows
+        if isinstance(row, dict) and row.get("verification") != "verified"
+    ]
     spliced: list[JsonObject] = []
-    for row in raw_rows:
+    for row in verified_rows:
         if len(spliced) >= _SEMANTIC_DIFF_SPLICE_CAP:
             break
-        if not isinstance(row, dict):
-            continue
         hypothesis_id = row.get("hypothesis_id")
         if not hypothesis_id:
             continue
         spliced.append(row)
 
-    if not spliced:
+    unverified_spliced: list[JsonObject] = []
+    for row in unverified_rows:
+        if len(spliced) + len(unverified_spliced) >= _SEMANTIC_DIFF_SPLICE_CAP:
+            break
+        hypothesis_id = row.get("hypothesis_id")
+        if not hypothesis_id:
+            continue
+        unverified_spliced.append(row)
+
+    if not spliced and not unverified_spliced:
         return review_hypotheses, inner_status
 
     # Problem A fix: trust-tier ordering — deterministic_static rows before inferred_llm rows.
@@ -3969,11 +4012,19 @@ def _splice_semantic_diff_hypotheses(
     rest_rows = [h for h in review_hypotheses if h.get("derivation") != "deterministic_static"]
 
     # Record omitted count (mirrors omitted_contract_diff_family_count pattern in contract splice).
-    omitted_count = max(0, len(raw_rows) - _SEMANTIC_DIFF_SPLICE_CAP)
-    if omitted_count > 0 and spliced:
-        spliced[-1] = dict(spliced[-1], omitted_semantic_diff_count=omitted_count)
+    emitted_count = len(spliced) + len(unverified_spliced)
+    semantic_row_count = len(verified_rows) + len(unverified_rows)
+    omitted_count = max(0, semantic_row_count - emitted_count)
+    if omitted_count > 0 and emitted_count > 0:
+        if unverified_spliced:
+            unverified_spliced[-1] = dict(
+                unverified_spliced[-1],
+                omitted_semantic_diff_count=omitted_count,
+            )
+        elif spliced:
+            spliced[-1] = dict(spliced[-1], omitted_semantic_diff_count=omitted_count)
 
-    return det_rows[:2] + spliced + det_rows[2:] + rest_rows, inner_status
+    return det_rows[:2] + spliced + det_rows[2:] + rest_rows + unverified_spliced, inner_status
 
 
 def _review_context_lead_packet(
@@ -7630,29 +7681,15 @@ _TOOLS: dict[str, McpTool] = {
     "review_context": McpTool(
         name="review_context",
         description=(
-            "Returns bounded review context for one repo plus a changed-file set by composing review_lead_status, review_leads, review_answer_packet, diff_anchors, changed_surface, changed_file_symbols, exact changed_symbols, direct callers/callees, transitive_callers, runtime_surfaces, framework_impact, application_impact, source_coordinates, and answerability metadata. "
-            "Read review_lead_status first as the PR-review usage gate: coverage_status=useful means the compact packet has symbol-anchor, changed-symbol, or impact evidence, while low_coverage means fall back to direct source review and use review_leads/diff_anchors as coordinates only. "
-            "Read review_answer_packet.top_diff_anchors / diff_anchors first as the PR changed-range/file anchors; detailed review rows are capped by summary.detail_limit even when a larger limit is requested. "
-            "Read repo_resolution before interpreting missing anchors; single-repo checkout snapshots may safely resolve owner/repo arguments to a local snapshot repo identity when changed files overlap the snapshot, while ambiguous or no-overlap cases fail closed. "
-            "review_answer_packet.top_changed_symbols contains range-overlap symbols only, while review_answer_packet.changed_file_symbol_inventory carries file inventory when no ranges are supplied. "
-            "When changed_ranges are omitted, top-level changed_symbols and review_answer_packet.top_changed_symbols are empty and the changed-file symbol inventory is exposed via changed_file_symbols; that inventory is source-inspection context, not proof every symbol changed. Inspect the diff before saying a function was touched. "
-            "When changed ranges produce only file anchors and no changed symbols or direct impact edges, review_answer_packet.packet_mode is diff_anchor_only and broad app/runtime/framework sections plus verbose contracts/evidence are omitted by default; pass include_unlinked_leads=true only when broad unlinked namespace/name leads are worth the extra context. "
-            "When the prompt names impact categories, pass requested_surfaces such as ui_screens, scheduled_jobs, sqs_consumers, delivery_workers, tracking_paths, schemas, or contracts so surface_status can separate inventory_context, unlinked_lead, and missing evidence. "
-            "Broad categories such as services and deployables are covered by other review packet sections; owner/maintainer requests are reported as ownership_context coverage gaps pointing to planning_context.ownership_context. "
-            "Top-level direct_callers, direct_callees, and repo_dependencies remain available for compatibility. "
-            "runtime_surfaces includes bounded path-shape-matched endpoint_consumers for endpoints exposed by the review repo when static CALLS_ENDPOINT facts exist. "
-            "framework_impact includes parser-backed support facts for Django/Celery model fields, model relations, serializers, view/model bindings, tasks, and bounded model relationship paths when present. "
-            "authz_surface is available from planning_context/get_service_brief for endpoint-to-handler permission evidence; use source inspection for dynamic middleware or framework defaults not represented in the packet. "
-            "application_impact groups changed app/package namespace surfaces into API/model/serializer/worker/scheduled-job sections, app-scoped runtime facts, and unlinked cross-repo name leads that require separate verification when those sections are present or explicitly requested. "
-            "review_hypotheses contains hypothesis_id-tagged candidates with risk_type, confidence, and evidence_refs. "
-            "Use it when you know the changed files and need deterministic static review context before drilling into narrower MCP tools. "
-            "Large packets are bounded: when output_budget is present the detail rows were compacted to a coordinate-bearing head start, so inspect source coordinates or call narrower changed_ranges/exact tools for omitted detail. "
-            "Does not infer deploy blockers unless explicitly requested, summarize diffs with an LLM, or invent cross-repo and runtime-only impact. "
-            "Read review_hypotheses as candidate source-inspection leads, not proven bugs. Every finding derived from a SuperContext hypothesis must state either: hypothesis_id=<id> and label=<label> (use the hypothesis.label field, e.g. 'async_side_effect_lifecycle_drift-5745'), or no_supercontext_hypothesis_used=true. This attribution is required for recall measurement; omitting it loses the causal link. "
-            "review_quality_status.review_readiness is the harness routing field: packet_ready means forced packet review is safe; needs_followup means call suggested_followups first; plain_review_better means do normal PR review; base_snapshot_required means build base snapshot and retry before spending model. "
-            "review_quality_status.base_diff_status is 'missing' when no base_snapshot was provided but changed_ranges are present (contract-diff families are disabled); 'active' when base_snapshot loaded successfully; 'failed' when it could not be loaded. Build and pass base_snapshot when base_diff_status is missing to enable ownership/guard/provenance change detection."
+            "Call this FIRST when reviewing a PR or local diff: pass repo_path plus base_ref, or the legacy explicit repo/changed_files/changed_ranges/base_snapshot/base_checkout/head_checkout fields. "
+            "Derived repo_path/base_ref mode writes reusable KG/worktree caches under repo_path/.supercontext, adds .supercontext/ to the repo-local .git/info/exclude, and ignores that cache for dirty-worktree checks. "
+            "Default compact packets keep the parent review_context under 15K chars; when internal follow-up packets attach, the combined response may use up to 20K chars. "
+            "It returns ranked review_hypotheses with source coordinates, attribution labels to cite when used, entry_resolution derivation status, and review_quality_status follow-up guidance when the bounded packet is incomplete. "
+            "Use review_answer_packet.packet_mode, review_quality_status.base_diff_status, requested_surfaces, and surface_status to distinguish diff-anchor-only context, missing base snapshots, requested impact categories, inventory context, unlinked leads, and missing evidence. "
+            "changed_symbols and changed-file inventory are source-inspection context, not proof that each listed symbol changed. "
+            "Treat hypotheses and semantic rows as investigation leads until source inspection verifies them; every finding must cite a returned hypothesis_id/label or explicitly state no_supercontext_hypothesis_used."
         ),
-        input_schema=_object_schema(_review_context_properties(), required=["repo", "changed_files"]),
+        input_schema=_object_schema(_review_context_properties()),
         handler=_review_context,
     ),
 }

@@ -353,6 +353,9 @@ def _build_over_generation_semantic_pair(root: Path, *, nfiles: int = 20):
         "base_snapshot": str(out_base),
         "base_checkout": str(base_ck),
         "head_checkout": str(head_ck),
+        # Wave 3 honesty tests assert the pre-follow-up needs_followup affordances.
+        # Wave 4 has separate coverage for the default internal follow-up execution path.
+        "execute_followups": False,
     }
     return head_kg, call_args, fake_client
 
@@ -390,6 +393,12 @@ class TestPacketHonestySurvivesBudgetCompaction(unittest.TestCase):
         returned = len(result.get("review_hypotheses") or [])
         self.assertIsInstance(gen, int, "high families must have been truncated (generated>returned)")
         self.assertGreater(gen, returned, "fixture must truncate at least one high family")
+        stats = rqs.get("semantic_diff_stats") or {}
+        self.assertGreater(
+            stats.get("rows_verified", 0),
+            0,
+            f"semantic verifier must not reject every over-generation row; stats={stats}",
+        )
 
     def test_attribution_labels_survive_in_final_packet(self) -> None:
         """C2 regression: attribution_labels must be in the FINAL answer packet after

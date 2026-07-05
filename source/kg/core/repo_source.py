@@ -19,6 +19,7 @@ IGNORED_DIRS = {
     ".next",
     ".pytest_cache",
     ".ruff_cache",
+    ".supercontext",
     ".turbo",
     ".vercel",
     ".venv",

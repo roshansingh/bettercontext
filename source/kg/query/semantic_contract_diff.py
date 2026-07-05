@@ -20,6 +20,7 @@ Cost bounds (owner constraints):
 
 import hashlib
 import json
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -341,10 +342,84 @@ def _empty_diff_stats(client: "SemanticDiffLlmClient") -> dict:
         "calls_failed": 0,
         "parse_misses": 0,
         "rows_generated": 0,
+        "rows_verified": 0,
+        "rows_unverified": 0,
         "prompt_tokens": None,
         "completion_tokens": None,
         "cost_usd": None,
     }
+
+
+def _body_line_window(body: str, center_index: int, *, radius: int = 5) -> list[str]:
+    lines = body.splitlines()
+    if center_index < 0 or center_index >= len(lines):
+        return []
+    start = max(0, center_index - radius)
+    end = min(len(lines), center_index + radius + 1)
+    return lines[start:end]
+
+
+def _window_has_delta(base_window: list[str], head_window: list[str]) -> bool:
+    if not base_window and not head_window:
+        return False
+    if not base_window or not head_window:
+        return True
+    matcher = SequenceMatcher(a=base_window, b=head_window, autojunk=False)
+    return any(tag != "equal" for tag, _i1, _i2, _j1, _j2 in matcher.get_opcodes())
+
+
+def _semantic_subject_exists(head_urns: set[str], urn: str) -> bool:
+    if not urn:
+        return False
+    return urn in head_urns
+
+
+def _resolve_semantic_cause_line(
+    *,
+    raw_cause_line: int | None,
+    head_line_start: int | None,
+    derived_end: int | None,
+    head_body: str,
+) -> tuple[int, int] | None:
+    """Return (absolute_line, body_index) for model cause_line.
+
+    The prompt shows a body snippet, so models may answer either absolute file lines or
+    snippet-relative lines. Accept both; use the same mapped coordinate for later checks.
+    """
+    if raw_cause_line is None or head_line_start is None or derived_end is None:
+        return None
+    if head_line_start <= raw_cause_line <= derived_end:
+        return raw_cause_line, raw_cause_line - head_line_start
+    body_line_count = len(head_body.splitlines())
+    if 1 <= raw_cause_line <= body_line_count:
+        mapped = head_line_start + raw_cause_line - 1
+        if head_line_start <= mapped <= derived_end:
+            return mapped, raw_cause_line - 1
+    return None
+
+
+def _semantic_row_verification_failure(
+    *,
+    head_urns: set[str],
+    urn: str,
+    resolved_cause_line: tuple[int, int] | None,
+    base_body: str,
+    head_body: str,
+) -> str | None:
+    if resolved_cause_line is None:
+        return "coordinate_check"
+    if not _semantic_subject_exists(head_urns, urn):
+        return "anchor_check"
+
+    _absolute_line, relative_index = resolved_cause_line
+    # The base body may have grown or shrunk above the cited head line, so this
+    # relative-index window is a conservative heuristic for row verification, not
+    # proof that the exact logical statement changed.
+    base_window = _body_line_window(base_body, relative_index)
+    head_window = _body_line_window(head_body, relative_index)
+    if not _window_has_delta(base_window, head_window):
+        return "delta_check"
+    return None
 
 
 def semantic_contract_diff(
@@ -456,6 +531,13 @@ def semantic_contract_diff(
     total_prompt_tokens: int | None = None
     total_completion_tokens: int | None = None
     total_cost_usd: float | None = None
+    rows_verified = 0
+    rows_unverified = 0
+    head_urns = {
+        str(entity.get("urn"))
+        for entity in head_snapshot.entities
+        if entity.get("urn")
+    }
 
     for head_entity in ranked_differing:
         urn = head_entity.get("urn", "")
@@ -601,9 +683,14 @@ def semantic_contract_diff(
             # Validate and clamp cause_line to symbol span
             raw_line = item.get("cause_line")
             try:
-                cause_line = int(raw_line)
+                raw_cause_line: int | None = int(raw_line)
             except (TypeError, ValueError):
-                cause_line = int(head_line_start) if head_line_start is not None else 1
+                raw_cause_line = None
+            cause_line = (
+                raw_cause_line
+                if raw_cause_line is not None
+                else int(head_line_start) if head_line_start is not None else 1
+            )
 
             # Problem C fix: compute body-derived upper bound when end_line absent.
             # head_body is available in scope (read during prefilter, stored in differing_by_urn).
@@ -615,7 +702,29 @@ def semantic_contract_diff(
             else:
                 derived_end = None
 
-            if head_line_start is not None and derived_end is not None:
+            resolved_cause_line = _resolve_semantic_cause_line(
+                raw_cause_line=raw_cause_line,
+                head_line_start=int(head_line_start) if head_line_start is not None else None,
+                derived_end=derived_end,
+                head_body=head_body,
+            )
+            verification_failure = _semantic_row_verification_failure(
+                head_urns=head_urns,
+                urn=urn,
+                resolved_cause_line=resolved_cause_line,
+                base_body=base_body,
+                head_body=head_body,
+            )
+            verification = "verified" if verification_failure is None else f"failed:{verification_failure}"
+            if verification == "verified":
+                rows_verified += 1
+            else:
+                rows_unverified += 1
+                specificity = "low"
+
+            if resolved_cause_line is not None:
+                cause_line = resolved_cause_line[0]
+            elif head_line_start is not None and derived_end is not None:
                 cause_line = max(int(head_line_start), min(cause_line, derived_end))
             elif head_line_start is not None:
                 cause_line = max(int(head_line_start), cause_line)
@@ -662,6 +771,12 @@ def semantic_contract_diff(
                 concrete_invariant = (
                     f"Inferred candidate (requires source verification): {claim}"
                 )
+            if verification != "verified":
+                postable_claim = f"unverified semantic lead: {postable_claim}"
+                concrete_invariant = (
+                    "Unverified semantic lead (requires source inspection before posting): "
+                    f"{concrete_invariant}"
+                )
 
             # Thread old/new contract into source_checks so the reviewer verifies the
             # old contract in the base checkout and the new contract in the head.
@@ -671,6 +786,11 @@ def semantic_contract_diff(
                 f"Verify old contract holds in base: {old_contract}",
                 f"Verify new contract holds in head: {new_contract}",
             ]
+            if verification != "verified":
+                source_checks.insert(
+                    0,
+                    f"Semantic diff verification {verification}; inspect source before treating this as a review finding.",
+                )
 
             row: JsonObject = {
                 "hypothesis_id": hyp_id,
@@ -679,6 +799,7 @@ def semantic_contract_diff(
                 "specificity": specificity,
                 "confidence": "medium",
                 "derivation": "inferred_llm",
+                "verification": verification,
                 "postable_claim": postable_claim,
                 "concrete_invariant": concrete_invariant,
                 "why": (
@@ -767,6 +888,8 @@ def semantic_contract_diff(
             "calls_failed": calls_failed,
             "parse_misses": parse_miss_count,
             "rows_generated": len(rows),
+            "rows_verified": rows_verified,
+            "rows_unverified": rows_unverified,
             "prompt_tokens": total_prompt_tokens,
             "completion_tokens": total_completion_tokens,
             "cost_usd": total_cost_usd,

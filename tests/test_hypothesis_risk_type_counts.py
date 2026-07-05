@@ -79,6 +79,8 @@ def _make_hyp(risk_type: str, idx: int, lead_ids: list[str] | None = None, deriv
     }
     if derivation is not None:
         h["derivation"] = derivation
+    if risk_type == "contract_semantic_diff":
+        h["verification"] = "verified"
     return h
 
 
@@ -679,6 +681,8 @@ def _cap_hyp(risk_type: str, idx: int, derivation: str | None) -> dict:
     }
     if derivation is not None:
         h["derivation"] = derivation
+    if risk_type == "contract_semantic_diff":
+        h["verification"] = "verified"
     return h
 
 
@@ -1019,6 +1023,7 @@ class TestScoreDrivenSeatAllocation(unittest.TestCase):
         mid_inferred = {
             "risk_type": "contract_semantic_diff",
             "derivation": "inferred_llm",
+            "verification": "verified",
             "cause": {"path": "src/core.py", "line_start": 3},  # changed prod file → +2
         }
         next_best = {  # neutral non-diff family, score 0
@@ -1072,6 +1077,7 @@ class TestScoreDrivenSeatAllocation(unittest.TestCase):
         semantic = {  # inferred_llm diff row, changed production-file cause → +2
             "risk_type": "contract_semantic_diff",
             "derivation": "inferred_llm",
+            "verification": "verified",
             "cause": {"path": "src/core.py", "line_start": 9},
         }
         # Noisy diff families FIRST so a derivation-first / carve-out policy keeps them.
