@@ -1,0 +1,105 @@
+[
+  {
+    "cat": "A reverse-dep (unique)",
+    "q": "who calls _grep_for_query",
+    "mcp_status": "found",
+    "mcp_callers": 1,
+    "gt": 1,
+    "correct": false,
+    "mcp_ms": 2.6172909999999936,
+    "grep_lines": 2,
+    "grep_ms": 125.40454199999995,
+    "note": "grep line-count includes def + dup lines; MCP returns unique callers"
+  },
+  {
+    "cat": "A2 reverse-dep (ambiguous name, no path)",
+    "q": "who calls _read_jsonl",
+    "mcp_status": "found",
+    "mcp_conf": "exact_unique",
+    "mcp_cands": 1,
+    "mcp_callers": 1,
+    "gt_total_edges": 13,
+    "mcp_ms": 2.3185420000000345,
+    "note": "4 defs share the name; MCP picks ONE def -> undercounts vs 13 total edges"
+  },
+  {
+    "cat": "A3 reverse-dep (path-disambiguated)",
+    "q": "who calls corpus._read_jsonl",
+    "mcp_status": "not_found",
+    "mcp_conf": "not_found",
+    "mcp_callers": null,
+    "mcp_ms": 0.8714579999999916,
+    "note": "path qualifier resolves the ambiguity cleanly -> MCP's edge over grep"
+  },
+  {
+    "cat": "A4 reverse-dep (extreme ambiguity)",
+    "q": "who calls main()",
+    "mcp_status": "ambiguous",
+    "mcp_conf": "exact_multiple",
+    "mcp_cands": 30,
+    "mcp_ms": 2.467791999999913,
+    "grep_lines": 140,
+    "grep_ms": 122.65429100000014,
+    "note": "MCP flags ambiguity instead of guessing; grep dumps everything"
+  },
+  {
+    "cat": "B blast-radius d=2",
+    "q": "downstream closure of _grep_for_query",
+    "mcp_status": "found",
+    "mcp_edges": 8,
+    "mcp_ms": 2.5580829999998222,
+    "grep_lines": "N/A",
+    "grep_ms": null,
+    "note": "no single grep; agent must read+AST-walk recursively (many tool calls)"
+  },
+  {
+    "cat": "C service-discovery",
+    "q": "what services exist",
+    "mcp_status": "found",
+    "mcp_services": 1,
+    "mcp_ms": 0.45966700000010796,
+    "grep_files": 8,
+    "grep_ms": 121.03862499999974,
+    "note": "MCP authoritative from pyproject; grep guesses via framework strings"
+  },
+  {
+    "cat": "D event-topology",
+    "q": "producers/consumers of orders-created",
+    "mcp_prod": 0,
+    "mcp_cons": 2,
+    "mcp_status": "not_found/found",
+    "mcp_ms": 1.3570829999998146,
+    "grep_lines": 110,
+    "grep_ms": 127.5312500000001,
+    "note": "grep finds string hits, cannot classify produce vs consume direction"
+  },
+  {
+    "cat": "E semantic-concept",
+    "q": "where is auth/oauth handled",
+    "mcp_status": "not_found",
+    "mcp_hits": 0,
+    "mcp_ms": 0.42674999999992025,
+    "grep_files": 0,
+    "grep_ms": 129.4640829999998,
+    "note": "no typed node for concept -> MCP not_found; grep is the only tool"
+  },
+  {
+    "cat": "E semantic-concept",
+    "q": "where are retries/backoff",
+    "mcp_status": "not_found",
+    "mcp_hits": 0,
+    "mcp_ms": 0.4583329999996444,
+    "grep_files": 1,
+    "grep_ms": 137.681959,
+    "note": "no typed node for concept -> MCP not_found; grep is the only tool"
+  },
+  {
+    "cat": "F text-content",
+    "q": "find all TODO/FIXME",
+    "mcp_status": "no tool indexes comments",
+    "mcp_ms": null,
+    "grep_lines": 1,
+    "grep_ms": 131.11591599999971,
+    "note": "graph models structure not prose; grep only option"
+  }
+]

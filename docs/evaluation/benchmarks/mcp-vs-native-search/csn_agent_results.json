@@ -1,0 +1,667 @@
+{
+  "queries": 40,
+  "approaches": {
+    "claude_alone": {
+      "n": 40,
+      "mean_ndcg_within": 0.7069,
+      "mean_ndcg_all": 0.7044,
+      "mean_ms": 50039.9,
+      "status_counts": {
+        "ok": 40
+      },
+      "rows": [
+        {
+          "query": "get executable path",
+          "n_pred": 10,
+          "pos_hits": 8,
+          "ndcg_within": 0.8429,
+          "status": "ok",
+          "ms": 44933
+        },
+        {
+          "query": "sending binary data over a serial connection",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.7877,
+          "status": "ok",
+          "ms": 37411
+        },
+        {
+          "query": "set working directory",
+          "n_pred": 10,
+          "pos_hits": 8,
+          "ndcg_within": 0.862,
+          "status": "ok",
+          "ms": 46070
+        },
+        {
+          "query": "convert a utc time to epoch",
+          "n_pred": 10,
+          "pos_hits": 8,
+          "ndcg_within": 0.7238,
+          "status": "ok",
+          "ms": 44428
+        },
+        {
+          "query": "convert decimal to hex",
+          "n_pred": 8,
+          "pos_hits": 7,
+          "ndcg_within": 0.9289,
+          "status": "ok",
+          "ms": 62816
+        },
+        {
+          "query": "how to get current date",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.8638,
+          "status": "ok",
+          "ms": 57535
+        },
+        {
+          "query": "heatmap from 3d coordinates",
+          "n_pred": 8,
+          "pos_hits": 8,
+          "ndcg_within": 0.7545,
+          "status": "ok",
+          "ms": 67260
+        },
+        {
+          "query": "all permutations of a list",
+          "n_pred": 8,
+          "pos_hits": 7,
+          "ndcg_within": 0.7629,
+          "status": "ok",
+          "ms": 46944
+        },
+        {
+          "query": "confusion matrix",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.5967,
+          "status": "ok",
+          "ms": 54130
+        },
+        {
+          "query": "linear regression",
+          "n_pred": 9,
+          "pos_hits": 7,
+          "ndcg_within": 0.8262,
+          "status": "ok",
+          "ms": 51478
+        },
+        {
+          "query": "extract latitude and longitude from given input",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.4622,
+          "status": "ok",
+          "ms": 62918
+        },
+        {
+          "query": "k means clustering",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.8131,
+          "status": "ok",
+          "ms": 38501
+        },
+        {
+          "query": "get the description of a http status code",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.6127,
+          "status": "ok",
+          "ms": 60893
+        },
+        {
+          "query": "converting uint8 array to image",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.503,
+          "status": "ok",
+          "ms": 37043
+        },
+        {
+          "query": "html entities replace",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.8609,
+          "status": "ok",
+          "ms": 53719
+        },
+        {
+          "query": "postgresql connection",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.8995,
+          "status": "ok",
+          "ms": 45859
+        },
+        {
+          "query": "string similarity levenshtein",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.8639,
+          "status": "ok",
+          "ms": 51129
+        },
+        {
+          "query": "concatenate several file remove header lines",
+          "n_pred": 9,
+          "pos_hits": 6,
+          "ndcg_within": 0.8114,
+          "status": "ok",
+          "ms": 39566
+        },
+        {
+          "query": "convert html to pdf",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.7142,
+          "status": "ok",
+          "ms": 43607
+        },
+        {
+          "query": "randomly extract x items from a list",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.9887,
+          "status": "ok",
+          "ms": 60036
+        },
+        {
+          "query": "convert json to csv",
+          "n_pred": 4,
+          "pos_hits": 0,
+          "ndcg_within": 0.0,
+          "status": "ok",
+          "ms": 22782
+        },
+        {
+          "query": "get current ip address",
+          "n_pred": 7,
+          "pos_hits": 6,
+          "ndcg_within": 0.7066,
+          "status": "ok",
+          "ms": 53841
+        },
+        {
+          "query": "unzipping large files",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.7206,
+          "status": "ok",
+          "ms": 73376
+        },
+        {
+          "query": "export to excel",
+          "n_pred": 6,
+          "pos_hits": 6,
+          "ndcg_within": 0.6099,
+          "status": "ok",
+          "ms": 26750
+        },
+        {
+          "query": "extracting data from a text file",
+          "n_pred": 9,
+          "pos_hits": 5,
+          "ndcg_within": 0.7794,
+          "status": "ok",
+          "ms": 39426
+        },
+        {
+          "query": "get inner html",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.9021,
+          "status": "ok",
+          "ms": 69359
+        },
+        {
+          "query": "convert a date string into yyyymmdd",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.4769,
+          "status": "ok",
+          "ms": 35497
+        },
+        {
+          "query": "scatter plot",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.6743,
+          "status": "ok",
+          "ms": 49356
+        },
+        {
+          "query": "deducting the median from each column",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.7671,
+          "status": "ok",
+          "ms": 46417
+        },
+        {
+          "query": "copy to clipboard",
+          "n_pred": 7,
+          "pos_hits": 6,
+          "ndcg_within": 0.5435,
+          "status": "ok",
+          "ms": 43307
+        },
+        {
+          "query": "normal distribution",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.7743,
+          "status": "ok",
+          "ms": 64401
+        },
+        {
+          "query": "reading element from html - <td>",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.8037,
+          "status": "ok",
+          "ms": 100056
+        },
+        {
+          "query": "regex case insensitive",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.7219,
+          "status": "ok",
+          "ms": 57549
+        },
+        {
+          "query": "how to determine a string is a valid word",
+          "n_pred": 10,
+          "pos_hits": 4,
+          "ndcg_within": 0.3661,
+          "status": "ok",
+          "ms": 63441
+        },
+        {
+          "query": "parse query string in url",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.62,
+          "status": "ok",
+          "ms": 40275
+        },
+        {
+          "query": "how to randomly pick a number",
+          "n_pred": 10,
+          "pos_hits": 4,
+          "ndcg_within": 0.7135,
+          "status": "ok",
+          "ms": 37463
+        },
+        {
+          "query": "aes encryption",
+          "n_pred": 8,
+          "pos_hits": 5,
+          "ndcg_within": 0.7164,
+          "status": "ok",
+          "ms": 55961
+        },
+        {
+          "query": "get name of enumerated value",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.5393,
+          "status": "ok",
+          "ms": 50676
+        },
+        {
+          "query": "write csv",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.5549,
+          "status": "ok",
+          "ms": 31588
+        },
+        {
+          "query": "binomial distribution",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.8074,
+          "status": "ok",
+          "ms": 33800
+        }
+      ]
+    },
+    "claude_mcp": {
+      "n": 40,
+      "mean_ndcg_within": 0.7403,
+      "mean_ndcg_all": 0.7358,
+      "mean_ms": 52061.0,
+      "status_counts": {
+        "ok": 40
+      },
+      "rows": [
+        {
+          "query": "get executable path",
+          "n_pred": 10,
+          "pos_hits": 9,
+          "ndcg_within": 0.8722,
+          "status": "ok",
+          "ms": 62268
+        },
+        {
+          "query": "sending binary data over a serial connection",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.8084,
+          "status": "ok",
+          "ms": 59159
+        },
+        {
+          "query": "set working directory",
+          "n_pred": 10,
+          "pos_hits": 9,
+          "ndcg_within": 0.8781,
+          "status": "ok",
+          "ms": 31975
+        },
+        {
+          "query": "convert a utc time to epoch",
+          "n_pred": 10,
+          "pos_hits": 8,
+          "ndcg_within": 0.7425,
+          "status": "ok",
+          "ms": 46461
+        },
+        {
+          "query": "convert decimal to hex",
+          "n_pred": 10,
+          "pos_hits": 8,
+          "ndcg_within": 0.9465,
+          "status": "ok",
+          "ms": 43506
+        },
+        {
+          "query": "how to get current date",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.8228,
+          "status": "ok",
+          "ms": 38886
+        },
+        {
+          "query": "heatmap from 3d coordinates",
+          "n_pred": 10,
+          "pos_hits": 8,
+          "ndcg_within": 0.8258,
+          "status": "ok",
+          "ms": 72435
+        },
+        {
+          "query": "all permutations of a list",
+          "n_pred": 9,
+          "pos_hits": 7,
+          "ndcg_within": 0.7629,
+          "status": "ok",
+          "ms": 47526
+        },
+        {
+          "query": "confusion matrix",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.6251,
+          "status": "ok",
+          "ms": 54542
+        },
+        {
+          "query": "linear regression",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.8122,
+          "status": "ok",
+          "ms": 68871
+        },
+        {
+          "query": "extract latitude and longitude from given input",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.4511,
+          "status": "ok",
+          "ms": 39434
+        },
+        {
+          "query": "k means clustering",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.7855,
+          "status": "ok",
+          "ms": 42613
+        },
+        {
+          "query": "get the description of a http status code",
+          "n_pred": 8,
+          "pos_hits": 6,
+          "ndcg_within": 0.7294,
+          "status": "ok",
+          "ms": 64056
+        },
+        {
+          "query": "converting uint8 array to image",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.4125,
+          "status": "ok",
+          "ms": 76402
+        },
+        {
+          "query": "html entities replace",
+          "n_pred": 8,
+          "pos_hits": 7,
+          "ndcg_within": 0.854,
+          "status": "ok",
+          "ms": 31665
+        },
+        {
+          "query": "postgresql connection",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.9047,
+          "status": "ok",
+          "ms": 45458
+        },
+        {
+          "query": "string similarity levenshtein",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.8618,
+          "status": "ok",
+          "ms": 56645
+        },
+        {
+          "query": "concatenate several file remove header lines",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.8637,
+          "status": "ok",
+          "ms": 57828
+        },
+        {
+          "query": "convert html to pdf",
+          "n_pred": 10,
+          "pos_hits": 7,
+          "ndcg_within": 0.7142,
+          "status": "ok",
+          "ms": 35972
+        },
+        {
+          "query": "randomly extract x items from a list",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.9887,
+          "status": "ok",
+          "ms": 51357
+        },
+        {
+          "query": "convert json to csv",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.9664,
+          "status": "ok",
+          "ms": 69089
+        },
+        {
+          "query": "get current ip address",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.8677,
+          "status": "ok",
+          "ms": 38893
+        },
+        {
+          "query": "unzipping large files",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.7206,
+          "status": "ok",
+          "ms": 44619
+        },
+        {
+          "query": "export to excel",
+          "n_pred": 6,
+          "pos_hits": 6,
+          "ndcg_within": 0.6324,
+          "status": "ok",
+          "ms": 30146
+        },
+        {
+          "query": "extracting data from a text file",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.752,
+          "status": "ok",
+          "ms": 45301
+        },
+        {
+          "query": "get inner html",
+          "n_pred": 10,
+          "pos_hits": 4,
+          "ndcg_within": 0.8472,
+          "status": "ok",
+          "ms": 59724
+        },
+        {
+          "query": "convert a date string into yyyymmdd",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.4769,
+          "status": "ok",
+          "ms": 95034
+        },
+        {
+          "query": "scatter plot",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.6577,
+          "status": "ok",
+          "ms": 48674
+        },
+        {
+          "query": "deducting the median from each column",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.7484,
+          "status": "ok",
+          "ms": 51269
+        },
+        {
+          "query": "copy to clipboard",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.6296,
+          "status": "ok",
+          "ms": 67483
+        },
+        {
+          "query": "normal distribution",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.7454,
+          "status": "ok",
+          "ms": 52168
+        },
+        {
+          "query": "reading element from html - <td>",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.8234,
+          "status": "ok",
+          "ms": 66976
+        },
+        {
+          "query": "regex case insensitive",
+          "n_pred": 10,
+          "pos_hits": 6,
+          "ndcg_within": 0.7292,
+          "status": "ok",
+          "ms": 73922
+        },
+        {
+          "query": "how to determine a string is a valid word",
+          "n_pred": 10,
+          "pos_hits": 4,
+          "ndcg_within": 0.3661,
+          "status": "ok",
+          "ms": 39850
+        },
+        {
+          "query": "parse query string in url",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.6199,
+          "status": "ok",
+          "ms": 33724
+        },
+        {
+          "query": "how to randomly pick a number",
+          "n_pred": 10,
+          "pos_hits": 4,
+          "ndcg_within": 0.7135,
+          "status": "ok",
+          "ms": 40179
+        },
+        {
+          "query": "aes encryption",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.7164,
+          "status": "ok",
+          "ms": 62749
+        },
+        {
+          "query": "get name of enumerated value",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.5393,
+          "status": "ok",
+          "ms": 33612
+        },
+        {
+          "query": "write csv",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.5923,
+          "status": "ok",
+          "ms": 47694
+        },
+        {
+          "query": "binomial distribution",
+          "n_pred": 10,
+          "pos_hits": 5,
+          "ndcg_within": 0.8074,
+          "status": "ok",
+          "ms": 54276
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "corpus_size": 457461,
+  "queries_scored": 99,
+  "approaches": {
+    "bm25": {
+      "ndcg_within": 0.3444,
+      "ndcg_all": 0.186,
+      "coverage": 0.2902,
+      "coverage_pos": 0.3015,
+      "mean_ms": 110.7
+    },
+    "tfidf": {
+      "ndcg_within": 0.2487,
+      "ndcg_all": 0.111,
+      "coverage": 0.1982,
+      "coverage_pos": 0.2093,
+      "mean_ms": 100.2
+    },
+    "mcp": {
+      "ndcg_within": 0.0,
+      "ndcg_all": 0.0,
+      "coverage": 0.0,
+      "coverage_pos": 0.0,
+      "mean_ms": 4.3
+    }
+  }
+}
